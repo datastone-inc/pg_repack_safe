@@ -1,0 +1,4 @@
+# pg_repack_safe extension
+comment = 'pg_repack_safe (description to come)'
+default_version = '1.0.0'
+relocatable = true
