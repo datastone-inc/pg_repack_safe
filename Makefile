@@ -6,6 +6,14 @@ DATA = pg_repack_safe--1.0.0.sql
 # doc_examples: validates SQL examples from README.md and doc/*.md
 REGRESS = doc_examples
 
+# Concurrency cases: specs/*.spec, expected/*.out. These need a server with
+# wal_level = replica or higher, which REPACK (CONCURRENTLY) requires.
+ISOLATION = repack_concurrently_snapshot repack_concurrently_cursor
+
+# t/*.pl: cases that need separate client programs (pg_dump). Each test
+# creates its own temporary cluster from the installed binaries.
+TAP_TESTS = 1
+
 # Build configuration
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

@@ -1,0 +1,33 @@
+Parsed test spec with 2 sessions
+
+starting permutation: c_declare p_repack c_fetchall c_commit
+step c_declare: BEGIN; DECLARE c CURSOR FOR SELECT o.id, customer_name(o.customer_id) AS name FROM orders o ORDER BY o.id;
+step p_repack: REPACK (CONCURRENTLY) customers USING INDEX customers_pkey;
+step c_fetchall: FETCH ALL FROM c;
+id|name
+--+----
+ 1|    
+ 2|    
+ 3|    
+(3 rows)
+
+step c_commit: COMMIT;
+
+starting permutation: c_declare c_fetch1 p_repack c_fetchall c_commit
+step c_declare: BEGIN; DECLARE c CURSOR FOR SELECT o.id, customer_name(o.customer_id) AS name FROM orders o ORDER BY o.id;
+step c_fetch1: FETCH 1 FROM c;
+id|name      
+--+----------
+ 1|customer 1
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) customers USING INDEX customers_pkey; <waiting ...>
+step c_fetchall: FETCH ALL FROM c;
+id|name      
+--+----------
+ 2|customer 2
+ 3|customer 3
+(2 rows)
+
+step c_commit: COMMIT;
+step p_repack: <... completed>

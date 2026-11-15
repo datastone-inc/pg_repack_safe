@@ -1,0 +1,52 @@
+Parsed test spec with 2 sessions
+
+starting permutation: r_begin p_repack r_read r_commit p_check
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM audit_log;
+count
+-----
+    0
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) accounts USING INDEX accounts_pkey;
+step r_read: SELECT count(*), sum(balance) FROM accounts;
+count|sum
+-----+---
+    0|   
+(1 row)
+
+step r_commit: COMMIT;
+step p_check: SELECT count(*), sum(balance) FROM accounts;
+count|sum
+-----+---
+    5|500
+(1 row)
+
+
+starting permutation: r_begin r_touch p_repack r_read r_commit p_check
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM audit_log;
+count
+-----
+    0
+(1 row)
+
+step r_touch: SELECT count(*) FROM accounts;
+count
+-----
+    5
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) accounts USING INDEX accounts_pkey; <waiting ...>
+step r_read: SELECT count(*), sum(balance) FROM accounts;
+count|sum
+-----+---
+    5|500
+(1 row)
+
+step r_commit: COMMIT;
+step p_repack: <... completed>
+step p_check: SELECT count(*), sum(balance) FROM accounts;
+count|sum
+-----+---
+    5|500
+(1 row)
+

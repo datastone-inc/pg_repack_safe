@@ -27,5 +27,21 @@ make installcheck
 
 A failing run leaves `regression.diffs` in the repository root.
 
+`make installcheck` runs three suites:
+
+- `sql/` + `expected/` (`REGRESS`): single-session tests.
+- `specs/*.spec` + `expected/*.out` (`ISOLATION`): concurrency
+  interleavings, run against the configured server, which must have
+  `wal_level = replica` or higher for `REPACK (CONCURRENTLY)`. A failing run
+  leaves its diffs under `output_iso/`.
+- `t/*.pl` (`TAP_TESTS`): cases that drive separate client programs such as
+  `pg_dump`. Each creates its own temporary cluster under `tmp_check/`.
+
+`pg_config` on `PATH` (or `PG_CONFIG`) must point at PostgreSQL 19:
+
+```bash
+make PG_CONFIG=/path/to/pg19/bin/pg_config install installcheck
+```
+
 Every SQL example in the documentation has a matching test in
 `sql/doc_examples.sql` (see `project_template.md`).

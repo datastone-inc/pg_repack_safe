@@ -9,6 +9,9 @@
 /regression.diffs
 /regression.out
 /results/
+/output_iso/
+/tmp_check/
+/log/
 
 # Test Output
 /sql/regression.out
