@@ -19,8 +19,18 @@ PostgreSQL extension (description to come)
 
 ## Overview
 
-The extension is at the skeleton stage: it installs and creates, and defines
-no objects yet.
+The extension is at the skeleton stage. **It does not yet prevent any wrong
+result**: `REPACK (CONCURRENTLY)` behaves exactly as in stock PostgreSQL 19.
+
+What exists so far:
+
+- a loadable library whose hooks detect when a table's storage is replaced
+  and whether `REPACK (CONCURRENTLY)` did it;
+- an empty record table, `pg_repack_safe_rewrites`, that the guard will use.
+  Nothing writes to it yet. With the library loaded, queries are refused if
+  it is ever non-empty, because the check that would read it is not written.
+
+The design is in [doc/research/fix-design.md](doc/research/fix-design.md).
 
 ## Installation
 
