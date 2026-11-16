@@ -702,9 +702,28 @@ order unless noted.
   the record. Before the record existed, the standby without the library
   never stopped. Open question 17 is a known gap (developer decision,
   2026-11-16), see the question.
-- [ ] **11. Advisory pre-check.** Refuse REPACK (CONCURRENTLY), under a
+- [x] **11. Advisory pre-check.** Refuse REPACK (CONCURRENTLY), under a
   setting, when a snapshot older than a threshold exists. Check: regression
   and isolation tests; documented as best-effort.
+  Done (developer decisions, 2026-11-16). Its purpose is availability: the
+  reader check already turns every hazard into a 40001, and the pre-check
+  spares long transactions that error by refusing the REPACK. Setting
+  `pg_repack_safe.precheck_snapshot_age` (ms, -1 off by default, 0 any age).
+  Checked at the start and again at the swap. A client session in this
+  database counts if it holds a snapshot (`backend_xmin`), the snapshot
+  outlives a statement (idle in transaction, or `xact_start` before the
+  current statement's start), it holds no lock on the table (REPACK waits
+  for those; at the swap none can), and its transaction is at least that
+  old. Single statements are not counted: they lock their plan's relations
+  when they start. pg_dump locks every dumped table right after its
+  snapshot (`pg_dump.c:~7725-7745`), so it is waited for, not counted.
+  Over-refusal, documented: later statements of a READ COMMITTED
+  transaction count, since the isolation level is not visible. Not seen:
+  standbys, background workers, snapshots after the check.
+  `specs/precheck.spec` (start, held lock, swap, threshold, off) and
+  `t/011_precheck.pl` (a single long statement not counted, a later
+  statement counted, the threshold); removing the spans-a-statement rule
+  makes `t/011` fail.
 - [ ] **12. Known gaps and Group B.** A reproducer and a README entry for
   each: TRUNCATE, rewriting ALTER TABLE, readers that bypass the executor
   and COPY, and open questions 1-4, 6 and 16.

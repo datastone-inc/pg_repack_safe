@@ -58,6 +58,9 @@
 #include "nodes/parsenodes.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
+#include "storage/lock.h"
+#include "utils/backend_status.h"
+#include "utils/timestamp.h"
 #include "tcop/utility.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
@@ -116,6 +119,13 @@ static bool traceStorageChanges = false;
  * extension while the record table holds records.
  */
 static bool allowUnprotectedDrop = false;
+
+/*
+ * GUC: refuse REPACK (CONCURRENTLY) while a session holds a snapshot of at
+ * least this age, in milliseconds, that could later read the table (see
+ * precheckOldSnapshots). -1 turns the check off; 0 counts any age.
+ */
+static int  precheckSnapshotAge = -1;
 
 /*
  * While the innermost utility statement is REPACK (CONCURRENTLY): the record
@@ -248,6 +258,113 @@ insertRecord(Oid relid)
      */
     CacheInvalidateRelcache(rel);
     table_close(rel, NoLock);
+}
+
+/**
+ * @brief List the processes holding a lock on a relation
+ * @param relid Relation in the current database
+ * @return PIDs (int List) of the holders and of their lock group leaders
+ */
+static List *
+pidsLockingRelation(Oid relid)
+{
+    LockData   *lockData = GetLockStatusData();
+    List       *pids = NIL;
+
+    for (int i = 0; i < lockData->nelements; i++)
+    {
+        LockInstanceData *instance = &lockData->locks[i];
+
+        if (instance->holdMask == 0 ||
+            instance->locktag.locktag_type != LOCKTAG_RELATION ||
+            instance->locktag.locktag_field1 != MyDatabaseId ||
+            instance->locktag.locktag_field2 != relid)
+            continue;
+        pids = list_append_unique_int(pids, instance->pid);
+        pids = list_append_unique_int(pids, instance->leaderPid);
+    }
+    return pids;
+}
+
+/**
+ * @brief Advisory pre-check: refuse REPACK (CONCURRENTLY) while a session
+ *        could later read the table with an older snapshot
+ * @param relid The table, or InvalidOid if it could not be resolved
+ * @param atSwap True at the swap, where this backend holds
+ *        AccessExclusiveLock on the table
+ *
+ * Best-effort and not part of the guarantee: the reader check refuses such a
+ * read either way. This spares long transactions the serialization failure
+ * by refusing the REPACK instead. A client session in this database counts
+ * if all of these hold:
+ * - it holds a snapshot (backend_xmin is set);
+ * - the snapshot outlives a statement: the session is idle in a
+ *   transaction, or its transaction started before its current statement.
+ *   A single statement locks every relation of its plan when it starts, so
+ *   if it holds no lock on the table it does not read it (except through a
+ *   function that locks lazily). A READ COMMITTED transaction between
+ *   statements holds no snapshot. A READ COMMITTED statement after the
+ *   first of its transaction counts although its next statement takes a
+ *   new snapshot: the isolation level is not visible here, so the check
+ *   errs towards refusing;
+ * - it holds no lock on the table: REPACK waits for such a session at the
+ *   swap, so it cannot be hurt. At the swap no other session holds one;
+ * - its transaction started at least pg_repack_safe.precheck_snapshot_age
+ *   ago. A snapshot is never older than its transaction.
+ * Not seen: sessions on standbys, background workers, and snapshots taken
+ * after the check.
+ */
+static void
+precheckOldSnapshots(Oid relid, bool atSwap)
+{
+    TimestampTz cutoff;
+    List       *lockingPids = NIL;
+    int         nbackends;
+
+    if (precheckSnapshotAge < 0)
+        return;
+
+    cutoff = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+                                         -precheckSnapshotAge);
+    if (!atSwap && OidIsValid(relid))
+        lockingPids = pidsLockingRelation(relid);
+
+    pgstat_clear_backend_activity_snapshot();
+    nbackends = pgstat_fetch_stat_numbackends();
+    for (int i = 1; i <= nbackends; i++)
+    {
+        LocalPgBackendStatus *local = pgstat_get_local_beentry_by_index(i);
+        PgBackendStatus *status = &local->backendStatus;
+        bool        spansStatements;
+
+        if (status->st_procpid <= 0 || status->st_procpid == MyProcPid ||
+            status->st_backendType != B_BACKEND ||
+            status->st_databaseid != MyDatabaseId ||
+            !TransactionIdIsValid(local->backend_xmin) ||
+            status->st_xact_start_timestamp == 0)
+            continue;
+
+        spansStatements =
+            status->st_state == STATE_IDLEINTRANSACTION ||
+            status->st_state == STATE_IDLEINTRANSACTION_ABORTED ||
+            status->st_xact_start_timestamp <
+            status->st_activity_start_timestamp;
+        if (!spansStatements ||
+            status->st_xact_start_timestamp > cutoff ||
+            list_member_int(lockingPids, status->st_procpid))
+            continue;
+
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_IN_USE),
+                 errmsg("REPACK (CONCURRENTLY) refused: another session holds a snapshot that has not read table \"%s\"",
+                        OidIsValid(relid) ? get_rel_name(relid) : "?"),
+                 errdetail("Process %d, whose transaction started at %s, would get a serialization failure if it read the table after the REPACK. Checked %s.",
+                           status->st_procpid,
+                           timestamptz_to_str(status->st_xact_start_timestamp),
+                           atSwap ? "at the swap" : "before the REPACK started"),
+                 errhint("Wait for that transaction to end, or set pg_repack_safe.precheck_snapshot_age to -1 to skip this check.")));
+    }
+    list_free(lockingPids);
 }
 
 /**
@@ -445,6 +562,7 @@ noteRelationAltered(Oid relid)
 
     if (OidIsValid(rewriterRecordTable) && oldBlocks > 0)
     {
+        precheckOldSnapshots(relid, true);
         logUnsafeRewrite(relid);
         insertRecord(relid);
         if (OidIsValid(newToastRelid))
@@ -804,7 +922,17 @@ processUtilityHook(PlannedStmt *pstmt, const char *queryString,
      * so that an error leaves it unchanged.
      */
     if (unsafeRewriter)
+    {
+        RepackStmt *repack = (RepackStmt *) pstmt->utilityStmt;
+
         recordTable = lockRecordTableForWriter();
+        precheckOldSnapshots(repack->relation != NULL &&
+                             repack->relation->relation != NULL ?
+                             RangeVarGetRelid(repack->relation->relation,
+                                              NoLock, true) :
+                             InvalidOid,
+                             false);
+    }
 
     /* COPY relation TO reads outside the executor; check it here. */
     if (IsA(pstmt->utilityStmt, CopyStmt) &&
@@ -1481,6 +1609,16 @@ _PG_init(void)
                              PGC_SUSET,
                              0,
                              NULL, NULL, NULL);
+    DefineCustomIntVariable("pg_repack_safe.precheck_snapshot_age",
+                            "Refuses REPACK (CONCURRENTLY) while a session holds a snapshot this old that has not read the table.",
+                            "-1 turns the check off; 0 counts a snapshot of any age. Best-effort: the reader check protects such sessions either way.",
+                            &precheckSnapshotAge,
+                            -1,
+                            -1,
+                            INT_MAX,
+                            PGC_USERSET,
+                            GUC_UNIT_MS,
+                            NULL, NULL, NULL);
     MarkGUCPrefixReserved("pg_repack_safe");
 
     /*

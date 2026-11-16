@@ -7,6 +7,11 @@ SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_repack_safe';
 
 DROP EXTENSION pg_repack_safe;
 
+-- README.md, Optional pre-check
+SET pg_repack_safe.precheck_snapshot_age = '10min';
+SHOW pg_repack_safe.precheck_snapshot_age;
+RESET pg_repack_safe.precheck_snapshot_age;
+
 -- README.md, Removing the extension
 CREATE EXTENSION pg_repack_safe;
 CREATE TABLE de_t (id int PRIMARY KEY);

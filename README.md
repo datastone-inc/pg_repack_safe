@@ -100,6 +100,32 @@ See [doc/installation.md](doc/installation.md).
 CREATE EXTENSION pg_repack_safe;
 ```
 
+## Optional pre-check
+
+The reader guard turns a wrong result into an error, which a long report or
+transaction may still not want: it fails, and its work is lost. With
+`pg_repack_safe.precheck_snapshot_age` set (off by default, `-1`),
+`REPACK (CONCURRENTLY)` instead refuses to run, at its start and again just
+before it swaps the table, while a session in the same database could later
+read the table with an older snapshot:
+
+```sql
+SET pg_repack_safe.precheck_snapshot_age = '10min';
+```
+
+A session counts when it holds a snapshot that outlives a statement (idle
+in a transaction, or past the first statement of its transaction), holds no
+lock on the table (`REPACK` waits for those), and its transaction has been
+open at least that long (`0`: any age). A single statement, however long,
+does not count: it locked every table it reads when it started.
+`pg_dump` locks every table it dumps right after taking its snapshot, so a
+running dump is waited for, not counted.
+
+This check is best-effort, not part of the guarantee. It does not see
+standbys, background workers, or snapshots taken after it runs, and since
+it cannot see a session's isolation level, it also counts later statements
+of a `READ COMMITTED` transaction, which would not have been hurt.
+
 ## Removing the extension
 
 Records protect snapshots taken before a `REPACK (CONCURRENTLY)`, on the

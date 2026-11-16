@@ -33,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   made by hand, invalidate it.
 - `REPACK (CONCURRENTLY)` is refused unless the library was loaded through
   `shared_preload_libraries`.
+- Optional pre-check, `pg_repack_safe.precheck_snapshot_age` (off by
+  default): `REPACK (CONCURRENTLY)` refuses to run, at its start and at the
+  swap, while a session in the database holds a snapshot that outlives a
+  statement, has not locked the table, and is at least that old.
 - Custom WAL resource manager (`RM_EXPERIMENTAL_ID` for now): each
   `REPACK (CONCURRENTLY)` logs a record before its commit, so a standby
   without the library stops replay instead of serving the repacked table to
@@ -63,4 +67,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `t/006_record_xid8.pl` (records across an XID epoch) and
   `t/007_standby_reader.pl` (the guard on a hot standby) and
   `t/008_copy_guard.pl` (COPY ... TO), `protection` regression test,
-  `t/009_not_preloaded.pl` and `t/010_standby_wal_record.pl`.
+  `t/009_not_preloaded.pl`, `t/010_standby_wal_record.pl`, `precheck`
+  isolation spec and `t/011_precheck.pl`.

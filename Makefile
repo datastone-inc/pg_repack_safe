@@ -17,7 +17,7 @@ REGRESS_OPTS = --temp-instance=./tmp_check_regress \
 # Concurrency cases: specs/*.spec, expected/*.out. They run on a temporary
 # instance set up like the REGRESS one (test/temp_instance.conf).
 ISOLATION = repack_concurrently_snapshot repack_concurrently_cursor \
-            reader_guard_edges reader_cache
+            reader_guard_edges reader_cache precheck
 ISOLATION_OPTS = --temp-instance=./tmp_check_iso \
                  --temp-config=$(srcdir)/test/temp_instance.conf
 
