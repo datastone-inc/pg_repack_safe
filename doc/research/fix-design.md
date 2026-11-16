@@ -622,9 +622,24 @@ order unless noted.
   is empty, holds records for another table, or holds records for the table
   read; without it (HEAD), 11,280 tps with records for the table read, about
   4.6 us more per query.
-- [ ] **8. COPY guard.** ProcessUtility locks the relation and its partitions
+- [x] **8. COPY guard.** ProcessUtility locks the relation and its partitions
   before checking. Check: interleaving 8, plus a partitioned table, and
   `t/001_repack_pg_dump.pl` passes.
+  Done. For `COPY relation TO` the ProcessUtility hook resolves the
+  relation, takes the AccessShareLock DoCopy takes (`copy.c:126`) on it and,
+  for a partitioned table, on every partition (as `copyto.c:863` does), and
+  checks each against the active snapshot, which CopyRelationTo scans with
+  (`copyto.c:1396`). It then passes DoCopy a schema-qualified name for the
+  relation it checked; the lock keeps that name from being dropped or
+  renamed. `COPY (query) TO` and COPY of a relation under row-level
+  security run a query and are checked in ExecutorStart. `t/001` passes.
+  `t/008_copy_guard.pl`: interleaving 8 for each spelling (plain, column
+  list, qualified with options, partitioned parent, `COPY (query)`,
+  row-level security), a table without a record, and a READ COMMITTED COPY
+  whose statement snapshot predates a REPACK it then waits behind for its
+  lock. With the COPY check removed, every relation-COPY case fails, and the
+  READ COMMITTED COPY returns no rows and no error, the stock wrong result;
+  `COPY (query)` and row-level security still pass through ExecutorStart.
 - [ ] **9. Refusals.** REPACK (CONCURRENTLY) refused when the library is not
   preloaded (the refusals for a missing extension, a missing record table
   and a redefined record table exist, step 3 and §6b); DROP, TRUNCATE and

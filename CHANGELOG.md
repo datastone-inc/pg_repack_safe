@@ -26,7 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reader check: a query whose snapshot does not see a committed
   `REPACK (CONCURRENTLY)` of a table it reads fails with SQLSTATE 40001,
   "cannot read table ... with this snapshot", instead of reading the table
-  as empty. Checked in the executor; `COPY ... TO` is not covered yet.
+  as empty. Checked in the executor and for `COPY relation TO` (including
+  partitioned tables), so `pg_dump` fails instead of dumping no rows.
 - Per-backend cache of the records, so a query no longer reads the record
   table. The writer, and a statement trigger on the record table for changes
   made by hand, invalidate it.
@@ -46,4 +47,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `t/004_hook_chain.pl` (hook chaining with `pg_stat_statements`) and
   `t/005_reader_guard.pl` (the error as a client sees it) and
   `t/006_record_xid8.pl` (records across an XID epoch) and
-  `t/007_standby_reader.pl` (the guard on a hot standby).
+  `t/007_standby_reader.pl` (the guard on a hot standby) and
+  `t/008_copy_guard.pl` (COPY ... TO).

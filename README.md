@@ -24,8 +24,9 @@ The extension is under construction. With the library in
 documented wrong result for queries: a query whose snapshot predates a
 committed `REPACK (CONCURRENTLY)` of a table it reads gets an error instead
 of an empty table, on the primary and on a hot standby that also has the
-library preloaded. It does **not** yet cover `COPY ... TO` (and so
-`pg_dump`), standbys without the library, or the other cases listed in
+library preloaded. That covers queries, `COPY ... TO` and so `pg_dump`. It
+does **not** yet cover standbys without the library, readers that bypass
+both the executor and COPY, or the other cases listed in
 [doc/research/fix-design.md](doc/research/fix-design.md).
 
 Known limitation: records are never deleted. Each `REPACK (CONCURRENTLY)`

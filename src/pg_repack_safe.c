@@ -20,7 +20,9 @@
  *   table's non-empty storage is recorded (the writer).
  * - ProcessUtility_hook: classifies the innermost utility statement. Only
  *   REPACK with the CONCURRENTLY option counts as an unsafe rewriter, and it
- *   is refused unless the record table exists and is locked first.
+ *   is refused unless the record table exists and is locked first. COPY
+ *   relation TO, which reads outside the executor, gets the reader check
+ *   here.
  * - ExecutorStart_hook: after the executor holds its relation locks, looks
  *   for unsafe-rewrite records.
  */
@@ -35,8 +37,10 @@
 #include "access/tableam.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_inherits.h"
 #include "catalog/pg_type.h"
 #include "catalog/storage.h"
 #include "commands/defrem.h"
@@ -120,6 +124,7 @@ static Oid  recordCacheTable = InvalidOid;
 
 static Oid  lookupRecordTable(bool forReader);
 static Oid  lockRecordTableForWriter(void);
+static PlannedStmt *checkCopyTo(PlannedStmt *pstmt, bool readOnlyTree);
 
 /**
  * @brief Read a relation's storage as the current transaction left it
@@ -403,6 +408,15 @@ processUtilityHook(PlannedStmt *pstmt, const char *queryString,
      */
     if (isConcurrentRepack(pstmt->utilityStmt))
         recordTable = lockRecordTableForWriter();
+
+    /* COPY relation TO reads outside the executor; check it here. */
+    if (IsA(pstmt->utilityStmt, CopyStmt) &&
+        !((CopyStmt *) pstmt->utilityStmt)->is_from &&
+        ((CopyStmt *) pstmt->utilityStmt)->relation != NULL)
+    {
+        pstmt = checkCopyTo(pstmt, readOnlyTree);
+        readOnlyTree = false;
+    }
 
     rewriterRecordTable = recordTable;
 
@@ -768,67 +782,135 @@ loadRecordCache(Oid tableOid)
 }
 
 /**
- * @brief Reader check: refuse a query whose snapshot cannot see a rewrite
- * @param queryDesc Query being started; its relation locks are held
- *
- * Invariant: a query that reads relation R with snapshot S raises an error
- * if R has a record whose rewrite committed and is not visible to S. The
- * check runs once the query holds its locks. A rewriter holds
- * AccessExclusiveLock from the swap, where the record is written, to its
- * commit, so a lock taken after that commit sees the record committed. The
- * records come from the backend's record cache, which holds every row
- * version of the record table (it is loaded with SnapshotAny) and which the
- * rewriter's invalidation clears before such a lock is granted
- * (insertRecord). Each record is judged against S at every query; the cache
- * holds no verdicts.
- *
- * A matching record that cannot be judged because the query's snapshot is
- * not an MVCC snapshot is refused.
+ * @brief Make the record cache current and tell whether it holds records
+ * @return False if the extension is not created in this database or the
+ *         record table holds no record, in which case nothing can be refused
  */
-static void
-checkUnsafeRewriteRecords(QueryDesc *queryDesc)
+static bool
+recordCacheHasRecords(void)
 {
     Oid         tableOid = lookupRecordTable(true);
 
     if (!OidIsValid(tableOid))
-        return;
+        return false;
     if ((!recordCacheValid || !recordCacheComplete ||
          recordCacheTable != tableOid) &&
         !loadRecordCache(tableOid))
+        return false;
+    return hash_get_num_entries(recordCache) > 0;
+}
+
+/**
+ * @brief Refuse a read of one relation whose snapshot cannot see a rewrite
+ * @param relid Relation about to be read; the caller holds a lock on it
+ * @param snapshot Snapshot the read will use
+ *
+ * Invariant: raises an error if the relation has a record whose rewrite
+ * committed and is not visible to the snapshot. The caller has made the
+ * record cache current (recordCacheHasRecords) after taking its lock. A
+ * rewriter holds AccessExclusiveLock from the swap, where the record is
+ * written, to its commit, so a lock taken after that commit sees the record
+ * committed. The cache holds every row version of the record table (it is
+ * loaded with SnapshotAny), and the rewriter's invalidation clears it before
+ * such a lock is granted (insertRecord). Each record is judged against the
+ * snapshot every time; the cache holds no verdicts.
+ *
+ * A matching record that cannot be judged, because the read has no MVCC
+ * snapshot, is refused.
+ */
+static void
+checkRelationRecords(Oid relid, Snapshot snapshot)
+{
+    RecordCacheEntry *entry;
+
+    entry = hash_search(recordCache, &relid, HASH_FIND, NULL);
+    if (entry == NULL)
         return;
-    if (hash_get_num_entries(recordCache) == 0)
+
+    if (snapshot == InvalidSnapshot || !IsMVCCSnapshot(snapshot))
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_repack_safe cannot check table \"%s\" for this query",
+                        get_rel_name(relid)),
+                 errdetail("The table has an unsafe-rewrite record and the query does not run with an MVCC snapshot.")));
+
+    for (int i = 0; i < entry->nxids; i++)
+    {
+        if (rewriteHiddenFromSnapshot(entry->xids[i], snapshot))
+            ereport(ERROR,
+                    (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+                     errmsg("cannot read table \"%s\" with this snapshot",
+                            get_rel_name(relid)),
+                     errdetail("REPACK (CONCURRENTLY) rewrote the table after the snapshot was taken, and row visibility for older snapshots was not preserved."),
+                     errhint("Retry the transaction.")));
+    }
+}
+
+/**
+ * @brief Reader check for a query: every relation in its range table
+ * @param queryDesc Query being started; its relation locks are held
+ */
+static void
+checkUnsafeRewriteRecords(QueryDesc *queryDesc)
+{
+    if (!recordCacheHasRecords())
         return;
 
     foreach_node(RangeTblEntry, rte, queryDesc->plannedstmt->rtable)
     {
-        RecordCacheEntry *entry;
-
-        if (rte->rtekind != RTE_RELATION)
-            continue;
-        entry = hash_search(recordCache, &rte->relid, HASH_FIND, NULL);
-        if (entry == NULL)
-            continue;
-
-        if (queryDesc->snapshot == InvalidSnapshot ||
-            !IsMVCCSnapshot(queryDesc->snapshot))
-            ereport(ERROR,
-                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                     errmsg("pg_repack_safe cannot check table \"%s\" for this query",
-                            get_rel_name(rte->relid)),
-                     errdetail("The table has an unsafe-rewrite record and the query does not run with an MVCC snapshot.")));
-
-        for (int i = 0; i < entry->nxids; i++)
-        {
-            if (rewriteHiddenFromSnapshot(entry->xids[i],
-                                          queryDesc->snapshot))
-                ereport(ERROR,
-                        (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-                         errmsg("cannot read table \"%s\" with this snapshot",
-                                get_rel_name(rte->relid)),
-                         errdetail("REPACK (CONCURRENTLY) rewrote the table after the snapshot was taken, and row visibility for older snapshots was not preserved."),
-                         errhint("Retry the transaction.")));
-        }
+        if (rte->rtekind == RTE_RELATION)
+            checkRelationRecords(rte->relid, queryDesc->snapshot);
     }
+}
+
+/**
+ * @brief Reader check for COPY relation TO
+ * @param pstmt Planned statement wrapping a CopyStmt
+ * @param readOnlyTree Whether pstmt must not be modified
+ * @return The statement to run: pstmt, or a copy naming the checked
+ *         relation with its schema
+ *
+ * COPY relation TO scans the relation, or every partition of a partitioned
+ * table, with the active snapshot, outside the executor (copy.c, DoCopy;
+ * copyto.c, CopyRelationTo). COPY (query) TO, and COPY of a relation with
+ * row-level security, run a query and are checked in ExecutorStart.
+ *
+ * The relation and its partitions are locked here with the AccessShareLock
+ * DoCopy takes, then checked against the active snapshot. Under READ
+ * COMMITTED that snapshot was taken before the lock, so a REPACK that
+ * committed while this COPY waited for the lock is caught too. The returned
+ * statement names the relation with its schema, and the lock keeps that name
+ * from being dropped or renamed, so DoCopy opens the relation checked here.
+ */
+static PlannedStmt *
+checkCopyTo(PlannedStmt *pstmt, bool readOnlyTree)
+{
+    CopyStmt   *stmt = (CopyStmt *) pstmt->utilityStmt;
+    Oid         relid;
+    List       *relids;
+    Snapshot    snapshot;
+
+    relid = RangeVarGetRelid(stmt->relation, AccessShareLock, false);
+    if (get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE)
+        relids = find_all_inheritors(relid, AccessShareLock, NULL);
+    else
+        relids = list_make1_oid(relid);
+
+    if (recordCacheHasRecords())
+    {
+        snapshot = ActiveSnapshotSet() ? GetActiveSnapshot() : InvalidSnapshot;
+        foreach_oid(child, relids)
+            checkRelationRecords(child, snapshot);
+    }
+
+    if (readOnlyTree)
+        pstmt = copyObject(pstmt);
+    stmt = (CopyStmt *) pstmt->utilityStmt;
+    stmt->relation->schemaname = get_namespace_name(get_rel_namespace(relid));
+    stmt->relation->relname = get_rel_name(relid);
+    stmt->relation->catalogname = NULL;
+
+    return pstmt;
 }
 
 /**
