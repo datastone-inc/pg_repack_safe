@@ -279,8 +279,8 @@ tables unacceptable (2026-11-15). Remaining fail-open cases:
   unrecorded, and an unloaded library cannot check for itself (a backend
   that loaded it other than through `shared_preload_libraries` refuses,
   step 9; `t/009_not_preloaded.pl` pins the rest);
-- library not loaded on a standby: the record replicates but nothing reads it
-  (see candidate I);
+- library not loaded on a standby: closed by the WAL record (step 10), which
+  stops its replay, except for open question 17;
 - readers that bypass the executor and COPY;
 - binary-upgrade mode (below).
 
@@ -686,10 +686,22 @@ order unless noted.
     dropped while no record exists. Tests that remove the record table on
     purpose (`reader_check`, `writer`, `storage_change`, `t/006`) set the
     override.
-- [ ] **10. Standby enforcement.** Custom WAL record at the swap
+- [x] **10. Standby enforcement.** Custom WAL record at the swap
   (`RM_EXPERIMENTAL_ID` for now). Check: a TAP test in which a standby
   without the library stops replay, and one with it errors the old-snapshot
   reader. Open question 17 is settled or written up as a known gap.
+  Done. The library registers a resource manager (`RM_EXPERIMENTAL_ID`,
+  name `pg_repack_safe`, a no-op redo) when preloaded; registering is only
+  possible then (`rmgr.c:118`). The writer logs one record per unsafe swap,
+  before the table's record is inserted. `t/010_standby_wal_record.pl`: a
+  standby without the library serves reads until the REPACK, then its
+  startup process fails with "resource manager with ID 128 not registered"
+  (`rmgr.c:93`) and the server shuts down; pg_waldump on the primary shows
+  the record in the REPACK's transaction, before its commit; a standby with
+  the library errors its old snapshot; the primary's crash recovery replays
+  the record. Before the record existed, the standby without the library
+  never stopped. Open question 17 is a known gap (developer decision,
+  2026-11-16), see the question.
 - [ ] **11. Advisory pre-check.** Refuse REPACK (CONCURRENTLY), under a
   setting, when a snapshot older than a threshold exists. Check: regression
   and isolation tests; documented as best-effort.
@@ -746,6 +758,23 @@ order unless noted.
 17. An unprepared standby that starts replay at a checkpoint between the WAL
     record (I) and the REPACK commit never sees the record and does not stop.
     Can the window be closed?
+    **Known gap** (developer decision, 2026-11-16). Holding off checkpoints
+    from the record to the commit with `DELAY_CHKPT_START` is not possible:
+    the commit path asserts the flag is clear and clears it
+    (`xact.c:1473`, `1592`; `DELAY_CHKPT_IN_COMMIT` includes the START
+    bit). A second record after the commit was weighed and not built: it
+    narrows the gap but leaves a query between replaying the commit and
+    replaying that record. Conditions for a wrong result: a standby without
+    the library, whose replay starts at a checkpoint whose redo point lies
+    between a REPACK (CONCURRENTLY)'s swap and its commit, reaching
+    consistency before the commit, and a snapshot taken there before the
+    commit is replayed that then reads the table. Reproducer (manual; needs
+    a build with injection points to make deterministic): pause REPACK
+    (CONCURRENTLY) after the swap, before commit (for example a debugger
+    breakpoint after `swap_relation_files`); run `CHECKPOINT` and take a
+    base backup; start a standby from it without the library, open a
+    REPEATABLE READ snapshot there before resuming; resume the REPACK; read
+    the table on that standby: 0 rows.
 18. PREPARE TRANSACTION: irrelevant for REPACK (CONCURRENTLY), which cannot
     run in a transaction block, but the general detector must handle or
     refuse it before TRUNCATE or ALTER are switched on.

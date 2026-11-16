@@ -37,6 +37,9 @@
 #include "access/tableam.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "access/xlog_internal.h"
+#include "access/xloginsert.h"
+#include "access/xlogreader.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_class.h"
@@ -76,6 +79,22 @@ PG_FUNCTION_INFO_V1(pg_repack_safe_records_protected);
 #define RECORD_TABLE_NAME "pg_repack_safe_rewrites"
 #define CHANGED_TRIGGER_FUNCTION "pg_repack_safe_records_changed"
 #define PROTECTED_TRIGGER_FUNCTION "pg_repack_safe_records_protected"
+
+/*
+ * Custom WAL resource manager. RM_EXPERIMENTAL_ID until an ID is claimed on
+ * the PostgreSQL wiki, before the first release.
+ * TODO(dsharpe 2026-11-16): claim a resource manager ID.
+ */
+#define PG_REPACK_SAFE_RMGR_ID RM_EXPERIMENTAL_ID
+#define PG_REPACK_SAFE_RMGR_NAME "pg_repack_safe"
+#define XLOG_PG_REPACK_SAFE_UNSAFE_REWRITE 0x00
+
+/* WAL record written at the swap of an unsafe rewrite. */
+typedef struct xl_pg_repack_safe_rewrite
+{
+    Oid         dbOid;          /* database of the rewritten table */
+    Oid         relid;          /* the rewritten table */
+} xl_pg_repack_safe_rewrite;
 
 void        _PG_init(void);
 
@@ -232,6 +251,85 @@ insertRecord(Oid relid)
 }
 
 /**
+ * @brief Write the WAL record that marks an unsafe rewrite
+ * @param relid The rewritten table
+ *
+ * Written at the swap, so it precedes the rewriter's commit record. A
+ * standby without this library cannot check reads; replaying this record
+ * there fails (rmgr.c, RmgrNotFound), so its replay stops before the commit
+ * instead of serving the rewritten table to old snapshots. Known gap (open
+ * question 17): a standby whose replay starts at a checkpoint between this
+ * record and the commit never sees it.
+ */
+static void
+logUnsafeRewrite(Oid relid)
+{
+    xl_pg_repack_safe_rewrite xlrec;
+
+    xlrec.dbOid = MyDatabaseId;
+    xlrec.relid = relid;
+    XLogBeginInsert();
+    XLogRegisterData(&xlrec, sizeof(xlrec));
+    (void) XLogInsert(PG_REPACK_SAFE_RMGR_ID,
+                      XLOG_PG_REPACK_SAFE_UNSAFE_REWRITE);
+}
+
+/**
+ * @brief Redo routine: nothing to apply
+ * @param record The record being replayed
+ *
+ * The records reach standbys as rows of the record table. Replaying this
+ * record matters only where the library is missing, where it fails.
+ */
+static void
+pgRepackSafeRedo(XLogReaderState *record)
+{
+    uint8       info = XLogRecGetInfo(record) & XLR_RMGR_INFO_MASK;
+
+    if (info != XLOG_PG_REPACK_SAFE_UNSAFE_REWRITE)
+        elog(PANIC, "pg_repack_safe redo: unknown op code %u", info);
+}
+
+/**
+ * @brief Describe a record for pg_waldump and redo error context
+ * @param buf Output buffer
+ * @param record The record
+ */
+static void
+pgRepackSafeDesc(StringInfo buf, XLogReaderState *record)
+{
+    uint8       info = XLogRecGetInfo(record) & XLR_RMGR_INFO_MASK;
+
+    if (info == XLOG_PG_REPACK_SAFE_UNSAFE_REWRITE)
+    {
+        xl_pg_repack_safe_rewrite *xlrec =
+            (xl_pg_repack_safe_rewrite *) XLogRecGetData(record);
+
+        appendStringInfo(buf, "db %u rel %u", xlrec->dbOid, xlrec->relid);
+    }
+}
+
+/**
+ * @brief Name a record type for pg_waldump
+ * @param info Record info bits
+ * @return The record type's name, or NULL if unknown
+ */
+static const char *
+pgRepackSafeIdentify(uint8 info)
+{
+    if ((info & XLR_RMGR_INFO_MASK) == XLOG_PG_REPACK_SAFE_UNSAFE_REWRITE)
+        return "UNSAFE_REWRITE";
+    return NULL;
+}
+
+static const RmgrData pgRepackSafeRmgr = {
+    .rm_name = PG_REPACK_SAFE_RMGR_NAME,
+    .rm_redo = pgRepackSafeRedo,
+    .rm_desc = pgRepackSafeDesc,
+    .rm_identify = pgRepackSafeIdentify,
+};
+
+/**
  * @brief Tell whether a relation storage was created in the current transaction
  * @param locator Storage to look for
  * @return True if the storage is scheduled for deletion should the current
@@ -347,6 +445,7 @@ noteRelationAltered(Oid relid)
 
     if (OidIsValid(rewriterRecordTable) && oldBlocks > 0)
     {
+        logUnsafeRewrite(relid);
         insertRecord(relid);
         if (OidIsValid(newToastRelid))
             insertRecord(newToastRelid);
@@ -1357,6 +1456,14 @@ void
 _PG_init(void)
 {
     loadedAtServerStart = process_shared_preload_libraries_in_progress;
+
+    /*
+     * Registration is possible only while shared_preload_libraries is being
+     * processed (rmgr.c), which is also the only way an unsafe rewrite is
+     * allowed to run (lockRecordTableForWriter).
+     */
+    if (loadedAtServerStart)
+        RegisterCustomRmgr(PG_REPACK_SAFE_RMGR_ID, &pgRepackSafeRmgr);
 
     DefineCustomBoolVariable("pg_repack_safe.trace_storage_changes",
                              "Reports each detected replacement of a table's storage as a NOTICE.",

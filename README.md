@@ -25,8 +25,8 @@ documented wrong result for queries: a query whose snapshot predates a
 committed `REPACK (CONCURRENTLY)` of a table it reads gets an error instead
 of an empty table, on the primary and on a hot standby that also has the
 library preloaded. That covers queries, `COPY ... TO` and so `pg_dump`. It
-does **not** yet cover standbys without the library, readers that bypass
-both the executor and COPY, or the other cases listed in
+does **not** yet cover readers that bypass both the executor and COPY, or
+the other cases listed in
 [doc/research/fix-design.md](doc/research/fix-design.md).
 
 Requirements and refusals:
@@ -35,6 +35,15 @@ Requirements and refusals:
   is refused in a session that loaded it any other way, and in a database
   without the extension. A session that never loads the library cannot be
   stopped: its `REPACK (CONCURRENTLY)` runs unrecorded (a known gap).
+- **Every physical standby, and anything else that replays this server's
+  WAL, needs the library in `shared_preload_libraries` too.**
+  `REPACK (CONCURRENTLY)` writes a WAL record of its own before it commits;
+  a standby without the library fails on that record and shuts down
+  ("resource manager with ID 128 not registered") instead of serving the
+  repacked table to old snapshots. Known gap: a standby without the library
+  whose replay starts from a checkpoint taken between that record and the
+  commit (for example one built from a base backup started at that moment)
+  never sees the record.
 - Records are never deleted. Each `REPACK (CONCURRENTLY)` of a table with
   data adds one or two rows to `pg_repack_safe_rewrites`. Each backend keeps
   a copy of them and reloads it when the table changes, so a growing table

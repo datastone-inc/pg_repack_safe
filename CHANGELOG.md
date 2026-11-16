@@ -33,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   made by hand, invalidate it.
 - `REPACK (CONCURRENTLY)` is refused unless the library was loaded through
   `shared_preload_libraries`.
+- Custom WAL resource manager (`RM_EXPERIMENTAL_ID` for now): each
+  `REPACK (CONCURRENTLY)` logs a record before its commit, so a standby
+  without the library stops replay instead of serving the repacked table to
+  old snapshots.
 - The record table is protected while it holds records: `DROP` of the
   table, its triggers or the extension, and `TRUNCATE`, are refused unless a
   superuser sets `pg_repack_safe.allow_unprotected_drop`; `UPDATE`, `DELETE`,
@@ -58,5 +62,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `t/005_reader_guard.pl` (the error as a client sees it) and
   `t/006_record_xid8.pl` (records across an XID epoch) and
   `t/007_standby_reader.pl` (the guard on a hot standby) and
-  `t/008_copy_guard.pl` (COPY ... TO), `protection` regression test and
-  `t/009_not_preloaded.pl`.
+  `t/008_copy_guard.pl` (COPY ... TO), `protection` regression test,
+  `t/009_not_preloaded.pl` and `t/010_standby_wal_record.pl`.
