@@ -29,11 +29,12 @@ library preloaded. It does **not** yet cover `COPY ... TO` (and so
 [doc/research/fix-design.md](doc/research/fix-design.md).
 
 Known limitation: records are never deleted. Each `REPACK (CONCURRENTLY)`
-of a table with data adds one or two rows to `pg_repack_safe_rewrites`, and
-once it has any, every query in that database scans it. Do not delete them
-by hand in the transaction that wrote them, and see the design notes before
-deleting them at all: a record deleted too early can let a standby query
-read a repacked table as empty.
+of a table with data adds one or two rows to `pg_repack_safe_rewrites`.
+Each backend keeps a copy of them and reloads it when the table changes,
+so a growing table costs memory and reload time, not a scan per query. Do
+not delete records by hand in the transaction that wrote them, and see the
+design notes before deleting them at all: a record deleted too early can let
+a standby query read a repacked table as empty.
 
 What exists so far:
 

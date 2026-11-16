@@ -87,13 +87,14 @@ SELECT 1 AS refused;
 DROP EXTENSION pg_repack_safe;
 SELECT 1 AS passes;
 
--- Record table detached, then the extension dropped: only pg_extension
--- changes. The table is no longer a record table, so a row in it refuses
--- nothing.
+-- Record table detached, then the extension dropped: the table survives
+-- and is no longer a record table, so a row in it refuses nothing. Its
+-- cache-invalidation trigger depends on the extension's trigger function,
+-- so the drop needs CASCADE and removes the trigger.
 CREATE EXTENSION pg_repack_safe;
 SELECT 1 AS passes;
 ALTER EXTENSION pg_repack_safe DROP TABLE pg_repack_safe_rewrites;
-DROP EXTENSION pg_repack_safe;
+DROP EXTENSION pg_repack_safe CASCADE;
 INSERT INTO pg_repack_safe_rewrites VALUES ('pg_class'::regclass, '1');
 SELECT 1 AS passes;
 DROP TABLE pg_repack_safe_rewrites;

@@ -588,11 +588,40 @@ order unless noted.
   `t/007_standby_reader.pl`, which needs a standby snapshot from before the
   REPACK to get the error after the primary vacuumed the record table; the
   standby check of this step.
-- [ ] **7. Cache.** Per-backend "known empty" flag and record hash, cleared
+- [x] **7. Cache.** Per-backend "known empty" flag and record hash, cleared
   only by invalidation of the record table (writer and cleanup send it).
   Check: an isolation test and a standby test in which a session with a
   warm cache still errors after a later REPACK; the loop timing of §6c shows
   the per-query cost near the flag test.
+  Done. Each backend caches every (relid, rewrite_xid) row version of the
+  record table, loaded with `SnapshotAny`; each query still judges the
+  cached XIDs against its own snapshot, so the cache holds no verdicts. It
+  is cleared by a relcache invalidation of the record table: the writer
+  queues one (`CacheInvalidateRelcache`), sent at commit before locks are
+  released (`xact.c:2484-2496`) and processed by a reader when it takes its
+  lock on the rewritten table (`lmgr.c:134-137`); changes made by hand send
+  one through a statement trigger on the record table, enabled ALWAYS so
+  that `session_replication_role = replica` does not skip it. A load cut
+  short by an error is never used. The record table OID cache's pg_class
+  callback now matches only the record table's (name, schema) hash or a
+  reset, instead of any pg_class change; with the coarse callback, any DDL
+  in the database reloaded every backend's cache, and REPACK's own pg_class
+  changes reloaded it, which hid a missing writer invalidation from the
+  tests. Checks: `specs/reader_cache.spec` (cache loaded empty, cache
+  holding an earlier record, a record inserted by hand, and the same under
+  `session_replication_role = replica`) and `t/007_standby_reader.pl` (a
+  warm standby session). Mutations: with the writer's invalidation removed,
+  both REPACK permutations of the spec read 0 rows and both standby phases
+  fail; with `ENABLE ALWAYS` removed, the replica permutation fails. The
+  standby test runs its warm phase before any VACUUM of the record table,
+  and with autovacuum off: VACUUM's statistics update of the record table
+  carries its own invalidation, which reloaded the cache and masked the
+  mutation. Timing was measured with pgbench rather than the in-backend
+  loop: select-only, 1 client, -O0 build, about 11,900 tps without the
+  library; with the cache, 11,770 to 11,820 tps whether the record table
+  is empty, holds records for another table, or holds records for the table
+  read; without it (HEAD), 11,280 tps with records for the table read, about
+  4.6 us more per query.
 - [ ] **8. COPY guard.** ProcessUtility locks the relation and its partitions
   before checking. Check: interleaving 8, plus a partitioned table, and
   `t/001_repack_pg_dump.pl` passes.

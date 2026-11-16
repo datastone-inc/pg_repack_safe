@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `REPACK (CONCURRENTLY)` of a table it reads fails with SQLSTATE 40001,
   "cannot read table ... with this snapshot", instead of reading the table
   as empty. Checked in the executor; `COPY ... TO` is not covered yet.
+- Per-backend cache of the records, so a query no longer reads the record
+  table. The writer, and a statement trigger on the record table for changes
+  made by hand, invalidate it.
 - `REPACK (CONCURRENTLY)` is refused in a database without the extension, and
   when the record table does not have the definition the extension created.
 - `pg_repack_safe_rewrites` record table, created by the extension, always
@@ -36,7 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each detected replacement of storage that existed before the current
   transaction as a NOTICE.
 - Tests: `reader_guard_edges` isolation spec (edge cases and read paths of
-  the reader guard), `storage_change`, `reader_check` and `writer`
+  the reader guard), `reader_cache` isolation spec (a loaded cache learns of
+  later records), `storage_change`, `reader_check` and `writer`
   regression tests,
   `t/002_standby_record_removal.pl`, `t/003_pg_upgrade.pl`,
   `t/004_hook_chain.pl` (hook chaining with `pg_stat_statements`) and

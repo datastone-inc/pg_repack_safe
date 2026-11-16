@@ -25,3 +25,21 @@ CREATE TABLE pg_repack_safe_rewrites
 ) USING heap;
 
 REVOKE ALL ON TABLE pg_repack_safe_rewrites FROM PUBLIC;
+
+-- Readers keep a per-backend copy of the records. The writer invalidates it
+-- itself; this trigger does the same for changes made by hand, and fires
+-- whatever session_replication_role is.
+CREATE FUNCTION pg_repack_safe_records_changed()
+RETURNS trigger
+AS 'MODULE_PATHNAME'
+LANGUAGE C;
+
+REVOKE ALL ON FUNCTION pg_repack_safe_records_changed() FROM PUBLIC;
+
+CREATE TRIGGER pg_repack_safe_rewrites_changed
+    AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON pg_repack_safe_rewrites
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION pg_repack_safe_records_changed();
+
+ALTER TABLE pg_repack_safe_rewrites
+    ENABLE ALWAYS TRIGGER pg_repack_safe_rewrites_changed;

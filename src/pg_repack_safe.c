@@ -41,6 +41,7 @@
 #include "catalog/storage.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
+#include "commands/trigger.h"
 #include "executor/executor.h"
 #include "fmgr.h"
 #include "miscadmin.h"
@@ -50,14 +51,18 @@
 #include "tcop/utility.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
+#include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/xid8.h"
 
 PG_MODULE_MAGIC;
+
+PG_FUNCTION_INFO_V1(pg_repack_safe_records_changed);
 
 #define EXTENSION_NAME "pg_repack_safe"
 #define RECORD_TABLE_NAME "pg_repack_safe_rewrites"
@@ -78,9 +83,40 @@ static bool traceStorageChanges = false;
  */
 static Oid  rewriterRecordTable = InvalidOid;
 
-/* Backend-local cache of the record table's OID in the current database. */
+/*
+ * Backend-local cache of the record table's OID in the current database.
+ * recordTableNameHash is the RELNAMENSP hash of the record table's name in
+ * the extension's schema as of the last lookup (once recordTableNameHashSet),
+ * so that only changes to that pg_class entry clear the cache.
+ */
 static bool recordTableOidKnown = false;
 static Oid  recordTableOid = InvalidOid;
+static bool recordTableNameHashSet = false;
+static uint32 recordTableNameHash = 0;
+
+/*
+ * Backend-local copy of the record table: every (relid, rewrite_xid) pair,
+ * deleted row versions included, keyed by relid. recordCacheValid is cleared
+ * by any relcache invalidation of the record table (sent by the writer and by
+ * the table's statement trigger) and by any change to the cached record
+ * table OID; the next reader check then reloads it. recordCacheComplete is
+ * set only once a load has scanned the whole table, so a load cut short by
+ * an error is never used. recordCacheTable is the record table it was loaded
+ * from.
+ */
+typedef struct RecordCacheEntry
+{
+    Oid         relid;          /* hash key */
+    int         nxids;
+    int         maxxids;
+    FullTransactionId *xids;
+} RecordCacheEntry;
+
+static MemoryContext recordCacheContext = NULL;
+static HTAB *recordCache = NULL;
+static bool recordCacheValid = false;
+static bool recordCacheComplete = false;
+static Oid  recordCacheTable = InvalidOid;
 
 static Oid  lookupRecordTable(bool forReader);
 static Oid  lockRecordTableForWriter(void);
@@ -125,11 +161,11 @@ selfVisibleRelfilenode(Oid relid, Oid *toastRelid)
  * @param relid Relation that old snapshots must not read
  *
  * The record carries the current transaction's full (64-bit) ID, whose low
- * 32 bits are the ID the rewrite stamped on every row it copied. The record table
- * (rewriterRecordTable) was locked with RowExclusiveLock when the statement
- * started, so it cannot have been dropped, renamed or moved since, provided
- * this is still that transaction. REPACK (CONCURRENTLY, ANALYZE) commits
- * after the swap and runs ANALYZE in a new transaction (repack.c,
+ * 32 bits are the ID the rewrite stamped on every row it copied. The record
+ * table (rewriterRecordTable) was locked with RowExclusiveLock when the
+ * statement started, so it cannot have been dropped, renamed or moved since,
+ * provided this is still that transaction. REPACK (CONCURRENTLY, ANALYZE)
+ * commits after the swap and runs ANALYZE in a new transaction (repack.c,
  * process_single_relation), so the lock is checked rather than assumed.
  */
 static void
@@ -152,6 +188,15 @@ insertRecord(Oid relid)
     tuple = heap_form_tuple(RelationGetDescr(rel), values, nulls);
     simple_heap_insert(rel, tuple);
     heap_freetuple(tuple);
+
+    /*
+     * Readers' record caches must learn of the record. The invalidation is
+     * sent when this transaction commits, before it releases its locks
+     * (xact.c, CommitTransaction), so a reader that locks the rewritten table
+     * after the commit processes it while taking that lock (lmgr.c,
+     * LockRelationOid), before its check runs.
+     */
+    CacheInvalidateRelcache(rel);
     table_close(rel, NoLock);
 }
 
@@ -382,15 +427,39 @@ processUtilityHook(PlannedStmt *pstmt, const char *queryString,
  * @param arg Unused
  * @param cacheid Cache that was invalidated
  * @param hashvalue Hash of the invalidated entry, or 0 for all
+ *
+ * Any pg_extension change clears the cache. A pg_class change clears it
+ * only if it is a reset (hash 0) or touches an entry with the record table's
+ * name in the extension's schema: an update sends invalidations for both the
+ * old and the new row, so a rename, schema move or drop of the record table
+ * matches, and so does a new table taking that name. Before the first lookup
+ * has set the hash, every pg_class change clears it.
  */
 static void
 recordTableCacheCallback(Datum arg, int cacheid, uint32 hashvalue)
 {
     (void) arg;
-    (void) cacheid;
-    (void) hashvalue;
+
+    if (cacheid == RELNAMENSP && hashvalue != 0 && recordTableNameHashSet &&
+        hashvalue != recordTableNameHash)
+        return;
 
     recordTableOidKnown = false;
+    recordCacheValid = false;
+}
+
+/**
+ * @brief Relcache callback: forget the record cache when the table changes
+ * @param arg Unused
+ * @param relid Invalidated relation, or InvalidOid for all relations
+ */
+static void
+recordCacheRelcacheCallback(Datum arg, Oid relid)
+{
+    (void) arg;
+
+    if (!OidIsValid(relid) || relid == recordCacheTable)
+        recordCacheValid = false;
 }
 
 /**
@@ -421,8 +490,23 @@ lookupRecordTable(bool forReader)
         recordTableOidKnown = true;
         extensionOid = get_extension_oid(EXTENSION_NAME, true);
         if (OidIsValid(extensionOid))
-            tableOid = get_relname_relid(RECORD_TABLE_NAME,
-                                         get_extension_schema(extensionOid));
+        {
+            Oid         schemaOid = get_extension_schema(extensionOid);
+
+            /*
+             * Set before the pg_class lookup, so that an invalidation the
+             * lookup processes is matched against this schema. One processed
+             * earlier was matched against the previous lookup's schema; if
+             * the schema changed since, the pg_extension change cleared the
+             * cache anyway.
+             */
+            recordTableNameHash =
+                GetSysCacheHashValue2(RELNAMENSP,
+                                      PointerGetDatum(RECORD_TABLE_NAME),
+                                      ObjectIdGetDatum(schemaOid));
+            recordTableNameHashSet = true;
+            tableOid = get_relname_relid(RECORD_TABLE_NAME, schemaOid);
+        }
         if (!recordTableOidKnown)
             continue;
 
@@ -577,6 +661,113 @@ rewriteHiddenFromSnapshot(FullTransactionId fxid, Snapshot snapshot)
 }
 
 /**
+ * @brief Load the record cache from the record table
+ * @param tableOid The record table found by lookupRecordTable
+ * @return False if the extension or its record table went away meanwhile,
+ *         in which case there is nothing to check
+ *
+ * Invariant: when this returns true, the cache holds every row version of
+ * the record table as of a scan that no invalidation of the table followed.
+ * The cache is marked valid before the table is locked and scanned; taking
+ * the lock processes pending invalidations, and a callback that fires then
+ * or later clears the mark, so the load is repeated.
+ */
+static bool
+loadRecordCache(Oid tableOid)
+{
+    for (;;)
+    {
+        Relation    rel;
+        HASHCTL     ctl;
+
+        CHECK_FOR_INTERRUPTS();
+
+        recordCacheComplete = false;
+        recordCacheValid = true;
+        recordCacheTable = tableOid;
+        rel = try_table_open(tableOid, AccessShareLock);
+        if (rel == NULL || !recordTableOidKnown ||
+            recordTableOid != tableOid)
+        {
+            if (rel != NULL)
+                table_close(rel, AccessShareLock);
+            recordCacheValid = false;
+            recordTableOidKnown = false;
+            tableOid = lookupRecordTable(true);
+            if (!OidIsValid(tableOid))
+                return false;
+            continue;
+        }
+        checkRecordTableDefinition(rel);
+
+        if (recordCacheContext == NULL)
+            recordCacheContext =
+                AllocSetContextCreate(CacheMemoryContext,
+                                      "pg_repack_safe record cache",
+                                      ALLOCSET_SMALL_SIZES);
+        else
+            MemoryContextReset(recordCacheContext);
+
+        ctl.keysize = sizeof(Oid);
+        ctl.entrysize = sizeof(RecordCacheEntry);
+        ctl.hcxt = recordCacheContext;
+        recordCache = hash_create("pg_repack_safe records", 16, &ctl,
+                                  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+        if (RelationGetNumberOfBlocks(rel) > 0)
+        {
+            TableScanDesc scan;
+            HeapTuple   tuple;
+            TupleDesc   desc = RelationGetDescr(rel);
+
+            scan = table_beginscan(rel, SnapshotAny, 0, NULL, SO_NONE);
+            while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+            {
+                Oid         relid;
+                FullTransactionId fxid;
+                bool        relidNull;
+                bool        xidNull;
+                RecordCacheEntry *entry;
+                bool        found;
+
+                relid = DatumGetObjectId(heap_getattr(tuple, 1, desc,
+                                                      &relidNull));
+                fxid = DatumGetFullTransactionId(heap_getattr(tuple, 2, desc,
+                                                              &xidNull));
+                if (relidNull || xidNull)
+                    continue;
+
+                entry = hash_search(recordCache, &relid, HASH_ENTER, &found);
+                if (!found)
+                {
+                    entry->nxids = 0;
+                    entry->maxxids = 4;
+                    entry->xids = MemoryContextAlloc(recordCacheContext,
+                                                     entry->maxxids *
+                                                     sizeof(FullTransactionId));
+                }
+                else if (entry->nxids == entry->maxxids)
+                {
+                    entry->maxxids *= 2;
+                    entry->xids = repalloc(entry->xids,
+                                           entry->maxxids *
+                                           sizeof(FullTransactionId));
+                }
+                entry->xids[entry->nxids++] = fxid;
+            }
+            table_endscan(scan);
+        }
+        table_close(rel, AccessShareLock);
+
+        if (recordCacheValid)
+        {
+            recordCacheComplete = true;
+            return true;
+        }
+    }
+}
+
+/**
  * @brief Reader check: refuse a query whose snapshot cannot see a rewrite
  * @param queryDesc Query being started; its relation locks are held
  *
@@ -584,72 +775,38 @@ rewriteHiddenFromSnapshot(FullTransactionId fxid, Snapshot snapshot)
  * if R has a record whose rewrite committed and is not visible to S. The
  * check runs once the query holds its locks. A rewriter holds
  * AccessExclusiveLock from the swap, where the record is written, to its
- * commit, so a lock taken after that commit sees the record committed, and
- * the record table is scanned with SnapshotAny so that a record deleted
- * since S was taken is still found (doc/research/fix-design.md, section 6b).
+ * commit, so a lock taken after that commit sees the record committed. The
+ * records come from the backend's record cache, which holds every row
+ * version of the record table (it is loaded with SnapshotAny) and which the
+ * rewriter's invalidation clears before such a lock is granted
+ * (insertRecord). Each record is judged against S at every query; the cache
+ * holds no verdicts.
  *
- * A record table with zero blocks holds no record, live or deleted, so the
- * scan is skipped. A matching record that cannot be judged because the
- * query's snapshot is not an MVCC snapshot is refused.
+ * A matching record that cannot be judged because the query's snapshot is
+ * not an MVCC snapshot is refused.
  */
 static void
 checkUnsafeRewriteRecords(QueryDesc *queryDesc)
 {
-    Relation    rel;
-    List       *relids = NIL;
-    TableScanDesc scan;
-    HeapTuple   tuple;
-    Oid         hiddenRelid = InvalidOid;
+    Oid         tableOid = lookupRecordTable(true);
 
-    /*
-     * Taking the lock processes pending invalidation messages. Accept the
-     * relation only if the cached OID is still valid once the lock is held;
-     * otherwise look the table up again.
-     */
-    for (;;)
-    {
-        Oid         tableOid = lookupRecordTable(true);
-
-        if (!OidIsValid(tableOid))
-            return;
-
-        rel = try_table_open(tableOid, AccessShareLock);
-        if (rel != NULL && recordTableOidKnown)
-            break;
-        if (rel != NULL)
-            table_close(rel, AccessShareLock);
-        recordTableOidKnown = false;
-    }
-
-    if (RelationGetNumberOfBlocks(rel) == 0)
-    {
-        table_close(rel, AccessShareLock);
+    if (!OidIsValid(tableOid))
         return;
-    }
-    checkRecordTableDefinition(rel);
+    if ((!recordCacheValid || !recordCacheComplete ||
+         recordCacheTable != tableOid) &&
+        !loadRecordCache(tableOid))
+        return;
+    if (hash_get_num_entries(recordCache) == 0)
+        return;
 
     foreach_node(RangeTblEntry, rte, queryDesc->plannedstmt->rtable)
     {
-        if (rte->rtekind == RTE_RELATION)
-            relids = list_append_unique_oid(relids, rte->relid);
-    }
+        RecordCacheEntry *entry;
 
-    scan = table_beginscan(rel, SnapshotAny, 0, NULL, SO_NONE);
-    while (relids != NIL &&
-           (tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
-    {
-        Oid         relid;
-        FullTransactionId fxid;
-        bool        isnull;
-
-        relid = DatumGetObjectId(heap_getattr(tuple, 1,
-                                              RelationGetDescr(rel), &isnull));
-        if (isnull || !list_member_oid(relids, relid))
+        if (rte->rtekind != RTE_RELATION)
             continue;
-        fxid = DatumGetFullTransactionId(heap_getattr(tuple, 2,
-                                                      RelationGetDescr(rel),
-                                                      &isnull));
-        if (isnull)
+        entry = hash_search(recordCache, &rte->relid, HASH_FIND, NULL);
+        if (entry == NULL)
             continue;
 
         if (queryDesc->snapshot == InvalidSnapshot ||
@@ -657,26 +814,44 @@ checkUnsafeRewriteRecords(QueryDesc *queryDesc)
             ereport(ERROR,
                     (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                      errmsg("pg_repack_safe cannot check table \"%s\" for this query",
-                            get_rel_name(relid)),
+                            get_rel_name(rte->relid)),
                      errdetail("The table has an unsafe-rewrite record and the query does not run with an MVCC snapshot.")));
 
-        if (rewriteHiddenFromSnapshot(fxid, queryDesc->snapshot))
+        for (int i = 0; i < entry->nxids; i++)
         {
-            hiddenRelid = relid;
-            break;
+            if (rewriteHiddenFromSnapshot(entry->xids[i],
+                                          queryDesc->snapshot))
+                ereport(ERROR,
+                        (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+                         errmsg("cannot read table \"%s\" with this snapshot",
+                                get_rel_name(rte->relid)),
+                         errdetail("REPACK (CONCURRENTLY) rewrote the table after the snapshot was taken, and row visibility for older snapshots was not preserved."),
+                         errhint("Retry the transaction.")));
         }
     }
-    table_endscan(scan);
-    table_close(rel, AccessShareLock);
-    list_free(relids);
+}
 
-    if (OidIsValid(hiddenRelid))
+/**
+ * @brief Trigger function: invalidate readers' record caches
+ * @return NULL (statement-level AFTER trigger)
+ *
+ * Fires after any INSERT, UPDATE, DELETE or TRUNCATE of the record table
+ * (the trigger is ENABLE ALWAYS, so session_replication_role does not skip
+ * it), so changes made by hand reach readers' caches like the writer's own.
+ */
+Datum
+pg_repack_safe_records_changed(PG_FUNCTION_ARGS)
+{
+    TriggerData *trigdata = (TriggerData *) fcinfo->context;
+
+    if (!CALLED_AS_TRIGGER(fcinfo))
         ereport(ERROR,
-                (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-                 errmsg("cannot read table \"%s\" with this snapshot",
-                        get_rel_name(hiddenRelid)),
-                 errdetail("REPACK (CONCURRENTLY) rewrote the table after the snapshot was taken, and row visibility for older snapshots was not preserved."),
-                 errhint("Retry the transaction.")));
+                (errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+                 errmsg("pg_repack_safe_records_changed() must be called as a trigger")));
+
+    CacheInvalidateRelcache(trigdata->tg_relation);
+
+    return PointerGetDatum(NULL);
 }
 
 /**
@@ -717,12 +892,13 @@ _PG_init(void)
     /*
      * The cached record table OID is derived from pg_extension (existence
      * and schema of the extension) and pg_class (the table by name), so a
-     * change to either catalog clears it.
+     * change to the relevant entries clears it (recordTableCacheCallback).
      */
     CacheRegisterSyscacheCallback(RELNAMENSP, recordTableCacheCallback,
                                   (Datum) 0);
     CacheRegisterSyscacheCallback(EXTENSIONOID, recordTableCacheCallback,
                                   (Datum) 0);
+    CacheRegisterRelcacheCallback(recordCacheRelcacheCallback, (Datum) 0);
 
     prevObjectAccessHook = object_access_hook;
     object_access_hook = objectAccessHook;

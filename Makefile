@@ -13,7 +13,7 @@ REGRESS = doc_examples storage_change reader_check writer
 # specs/isolation.conf (the library preloaded, wal_level = replica), and
 # never on the server PGHOST/PGPORT point at.
 ISOLATION = repack_concurrently_snapshot repack_concurrently_cursor \
-            reader_guard_edges
+            reader_guard_edges reader_cache
 ISOLATION_OPTS = --temp-instance=./tmp_check_iso \
                  --temp-config=$(srcdir)/specs/isolation.conf
 

@@ -1,0 +1,78 @@
+Parsed test spec with 3 sessions
+
+starting permutation: r_warm r_begin p_repack r_t r_commit
+step r_warm: SELECT count(*) FROM t;
+count
+-----
+    5
+(1 row)
+
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) t;
+step r_t: SELECT count(*) FROM t;
+ERROR:  cannot read table "t" with this snapshot
+step r_commit: COMMIT;
+
+starting permutation: p_repack r_warm r_begin p_repack r_t r_commit
+step p_repack: REPACK (CONCURRENTLY) t;
+step r_warm: SELECT count(*) FROM t;
+count
+-----
+    5
+(1 row)
+
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) t;
+step r_t: SELECT count(*) FROM t;
+ERROR:  cannot read table "t" with this snapshot
+step r_commit: COMMIT;
+
+starting permutation: r_warm o_begin o_record r_begin o_commit r_t r_commit
+step r_warm: SELECT count(*) FROM t;
+count
+-----
+    5
+(1 row)
+
+step o_begin: BEGIN;
+step o_record: INSERT INTO pg_repack_safe_rewrites VALUES ('t'::regclass, pg_current_xact_id());
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step o_commit: COMMIT; RESET session_replication_role;
+step r_t: SELECT count(*) FROM t;
+ERROR:  cannot read table "t" with this snapshot
+step r_commit: COMMIT;
+
+starting permutation: r_warm o_replica o_record r_begin o_commit r_t r_commit
+step r_warm: SELECT count(*) FROM t;
+count
+-----
+    5
+(1 row)
+
+step o_replica: SET session_replication_role = replica; BEGIN;
+step o_record: INSERT INTO pg_repack_safe_rewrites VALUES ('t'::regclass, pg_current_xact_id());
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step o_commit: COMMIT; RESET session_replication_role;
+step r_t: SELECT count(*) FROM t;
+ERROR:  cannot read table "t" with this snapshot
+step r_commit: COMMIT;
