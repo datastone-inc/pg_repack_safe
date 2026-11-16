@@ -23,10 +23,17 @@ The extension is under construction. With the library in
 `shared_preload_libraries` and the extension created, it prevents the
 documented wrong result for queries: a query whose snapshot predates a
 committed `REPACK (CONCURRENTLY)` of a table it reads gets an error instead
-of an empty table. It does **not** yet cover `COPY ... TO` (and so
-`pg_dump`), standbys, or the other cases listed in
-[doc/research/fix-design.md](doc/research/fix-design.md), and records are
-never cleaned up yet.
+of an empty table, on the primary and on a hot standby that also has the
+library preloaded. It does **not** yet cover `COPY ... TO` (and so
+`pg_dump`), standbys without the library, or the other cases listed in
+[doc/research/fix-design.md](doc/research/fix-design.md).
+
+Known limitation: records are never deleted. Each `REPACK (CONCURRENTLY)`
+of a table with data adds one or two rows to `pg_repack_safe_rewrites`, and
+once it has any, every query in that database scans it. Do not delete them
+by hand in the transaction that wrote them, and see the design notes before
+deleting them at all: a record deleted too early can let a standby query
+read a repacked table as empty.
 
 What exists so far:
 

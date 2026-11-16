@@ -41,4 +41,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `t/002_standby_record_removal.pl`, `t/003_pg_upgrade.pl`,
   `t/004_hook_chain.pl` (hook chaining with `pg_stat_statements`) and
   `t/005_reader_guard.pl` (the error as a client sees it) and
-  `t/006_record_xid8.pl` (records across an XID epoch).
+  `t/006_record_xid8.pl` (records across an XID epoch) and
+  `t/007_standby_reader.pl` (the guard on a hot standby).

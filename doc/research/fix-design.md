@@ -364,12 +364,18 @@ Probe results, 2026-11-15, skeleton library `src/pg_repack_safe.c`:
 - **Old storage size (Q9).** For the same reason the relcache entry of `r1`
   still points at the old storage in the hook, so its block count is readable
   there. Probe: empty and one-row tables.
-- **Record lifetime (Q5).** The primary may DELETE a record once its XID
-  precedes every local snapshot's xmin; a DELETE is always safe because the
-  reader scans with `SnapshotAny`. Physical removal is VACUUM's, which on the
-  primary waits for old snapshots and on a standby raises the usual recovery
-  conflict (cancel or replay delay) for snapshots that still need the row.
-  Probe: standby RR query across DELETE + VACUUM of the record.
+- **Record lifetime (Q5).** Corrected 2026-11-16, see step 6. A DELETE is
+  safe only if the deleting transaction is not the rewriter and its XID
+  follows the rewriter's XID R. The reader scans with `SnapshotAny`, so it
+  needs the row physically present, not live. On the primary, VACUUM keeps a
+  deleted row while its deleter does not precede OldestXmin
+  (`heapam_visibility.c:1125`, `1329`), and a snapshot that does not see R
+  has xmin <= R. On a standby, the removal replays with a recovery conflict
+  only up to the logged horizon, and that horizon ignores a row deleted by
+  its inserting transaction (`heapam.c:8228-8239`): such a removal cancels
+  nothing [R, step 6]. A deleter whose XID follows R puts the horizon at
+  or after every needing snapshot's xmin, and the conflict cancels that
+  snapshot instead (`t/002_standby_record_removal.pl`).
 - **Why not shared memory.** A shared-memory record fed by the WAL record's
   redo routine would be cluster-wide and cheap, but a standby or base backup
   that starts replay at a checkpoint between the WAL record and the commit
@@ -560,10 +566,28 @@ order unless noted.
   of the accepted spurious error). Run on stock PostgreSQL 19 without the
   library, every permutation expected to error returns 0 rows for a 5-row
   table, and both spurious-error permutations return a correct 0.
-- [ ] **6. Record cleanup.** DELETE records whose XID precedes every local
+- [x] **6. Record cleanup.** DELETE records whose XID precedes every local
   snapshot; rely on VACUUM for removal. Check: the record table returns to
   zero blocks after old snapshots end; a standby test with the real table
   and the library loaded on both nodes.
+  Outcome (developer decision, 2026-11-16): **no cleanup for now**; records
+  stay live and accumulate, a known limitation in the README, to be
+  revisited after step 7's cache. The first design, chosen first, had the
+  writer delete each record at pre-commit of its own transaction and set
+  autovacuum to run on any dead row. Its test passed on the primary (the
+  record survived VACUUM while an old snapshot lived; autovacuum emptied the
+  table afterwards) but caught a silent wrong result on a standby without
+  hot_standby_feedback: a standby snapshot from before the REPACK read the
+  table as empty (`after|0`), with no recovery conflict. Cause:
+  `HeapTupleHeaderAdvanceConflictHorizon` (`heapam.c:8228-8239`) leaves a
+  row deleted by its inserting transaction out of the conflict horizon, so
+  its removal cancels no standby query. The design was reverted. A later
+  cleanup must delete from another transaction whose XID follows the
+  record's (options weighed: deleting at the next REPACK plus a SQL
+  function, or a dynamic background worker). Kept:
+  `t/007_standby_reader.pl`, which needs a standby snapshot from before the
+  REPACK to get the error after the primary vacuumed the record table; the
+  standby check of this step.
 - [ ] **7. Cache.** Per-backend "known empty" flag and record hash, cleared
   only by invalidation of the record table (writer and cleanup send it).
   Check: an isolation test and a standby test in which a session with a
@@ -601,6 +625,9 @@ order unless noted.
 5. Record cleanup: a record may be deleted once its XID is visible to every
    snapshot, but the primary cannot see standby snapshots without
    hot_standby_feedback. What is the safe deletion rule?
+   Partly answered (step 6): the deleter must be a later transaction whose
+   XID follows the record's; deleting in the rewriter's own transaction
+   gives wrong results on standbys. Who deletes, and when, is deferred.
 6. PL/pgSQL procedure COMMIT loops holding TOAST pointers across a swap.
 7. Are reads through parallel workers and inlined SQL functions checked?
    [R] Yes for views, inlined set-returning SQL functions, parallel plans
