@@ -4,8 +4,9 @@ Research notes, 2026-11-15, against the PG19 tree at /opt/pg19/src (19rc2).
 Tags: **[V]** read in the code, **[I]** inferred and needs a reproducer,
 **[R]** confirmed by this repo's tests. Line numbers marked `~` are within a
 few lines. **Status: direction chosen 2026-11-15 (record-based reader guard,
-see "Design direction"); several points still await the developer's
-confirmation and nothing is prototyped.**
+see "Design direction"); step 0 of the implementation plan (skeleton and
+probes) is built, the guard itself is not; several points still await the
+developer's confirmation.**
 
 ## Bottom line
 
@@ -470,10 +471,15 @@ order unless noted.
 - [x] **0. Skeleton and probes.** Library with the three hooks, record table,
   trace setting. Check: `storage_change` regression test and
   `t/002_standby_record_removal.pl` pass (§6c).
-- [ ] **1. Test harness with the library preloaded.** The guard needs
+- [x] **1. Test harness with the library preloaded.** The guard needs
   `shared_preload_libraries`, which the developer's cluster on port 55434
   does not set. Run the isolation specs against a temporary cluster and leave
   that cluster alone. Check: the existing specs pass unchanged there.
+  Done: `ISOLATION_OPTS` runs them on a temporary instance with
+  `specs/isolation.conf`; a probe spec on that instance showed
+  `shared_preload_libraries = pg_repack_safe` and `wal_level = replica`. The
+  `REGRESS` suite still runs on the configured server without the library
+  preloaded.
 - [ ] **2. Flip the reproducers.** Change the expected output of
   `repack_concurrently_snapshot`, `repack_concurrently_cursor` and
   `t/001_repack_pg_dump.pl` from the wrong rows to the 40001 error (pg_dump:

@@ -31,9 +31,13 @@ A failing run leaves `regression.diffs` in the repository root.
 
 - `sql/` + `expected/` (`REGRESS`): single-session tests.
 - `specs/*.spec` + `expected/*.out` (`ISOLATION`): concurrency
-  interleavings, run against the configured server, which must have
-  `wal_level = replica` or higher for `REPACK (CONCURRENTLY)`. A failing run
-  leaves its diffs under `output_iso/`.
+  interleavings. They run on a temporary instance under `tmp_check_iso/`,
+  built from the installed binaries with the settings in
+  `specs/isolation.conf`: the library in `shared_preload_libraries`, which the
+  reader guard needs, and `wal_level = replica`, which
+  `REPACK (CONCURRENTLY)` needs. The server that `PGHOST`/`PGPORT` point at is
+  not used. A failing run leaves its diffs under `output_iso/` and the
+  instance in `tmp_check_iso/`.
 - `t/*.pl` (`TAP_TESTS`): cases that drive separate client programs such as
   `pg_dump`. Each creates its own temporary cluster under `tmp_check/`.
 
