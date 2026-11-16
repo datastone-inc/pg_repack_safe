@@ -547,11 +547,19 @@ order unless noted.
   table refuses nothing" no longer observes anything in one session and
   moves to step 9 (Q15). Not covered yet: parallel workers (Q7, step 5).
   `rewrite_xid` is `xid8` (Q19).
-- [ ] **5. Negative and edge tests.** Interleavings 7, 9, 11-16: no error
+- [x] **5. Negative and edge tests.** Interleavings 7, 9, 11-16: no error
   after VACUUM FULL alone, GRANT alone, a table created after the snapshot,
   or an empty table; error after own DDL, after VACUUM FULL following REPACK,
   and when rows were deleted after the snapshot; the accepted spurious error
   pinned. Check: all pass.
+  Done (`specs/reader_guard_edges.spec`, 14 permutations, all as expected).
+  Added: a record for another table refuses nothing; reads through a view,
+  an inlined set-returning SQL function, a parallel plan
+  (`debug_parallel_query`) and a partitioned parent are refused (Q7); a
+  table created after the snapshot and then repacked errors (a second form
+  of the accepted spurious error). Run on stock PostgreSQL 19 without the
+  library, every permutation expected to error returns 0 rows for a 5-row
+  table, and both spurious-error permutations return a correct 0.
 - [ ] **6. Record cleanup.** DELETE records whose XID precedes every local
   snapshot; rely on VACUUM for removal. Check: the record table returns to
   zero blocks after old snapshots end; a standby test with the real table
@@ -595,6 +603,11 @@ order unless noted.
    hot_standby_feedback. What is the safe deletion rule?
 6. PL/pgSQL procedure COMMIT loops holding TOAST pointers across a swap.
 7. Are reads through parallel workers and inlined SQL functions checked?
+   [R] Yes for views, inlined set-returning SQL functions, parallel plans
+   and partitioned parents (`specs/reader_guard_edges.spec`). Workers start
+   at the first `ExecGather` call (`nodeGather.c:152-182`), after the
+   leader's check; non-inlined functions run their own `ExecutorStart`
+   (`repack_concurrently_cursor`).
 8. Overhead of the ExecutorStart check (pgbench): one record lookup per
    relation per ExecutorStart, and whether it needs a cache.
 9. At `OAT_POST_ALTER` in `swap_relation_files`, which OID owns the old

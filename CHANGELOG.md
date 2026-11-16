@@ -35,7 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `pg_repack_safe.trace_storage_changes` setting (superuser), which reports
   each detected replacement of storage that existed before the current
   transaction as a NOTICE.
-- Tests: `storage_change`, `reader_check` and `writer` regression tests,
+- Tests: `reader_guard_edges` isolation spec (edge cases and read paths of
+  the reader guard), `storage_change`, `reader_check` and `writer`
+  regression tests,
   `t/002_standby_record_removal.pl`, `t/003_pg_upgrade.pl`,
   `t/004_hook_chain.pl` (hook chaining with `pg_stat_statements`) and
   `t/005_reader_guard.pl` (the error as a client sees it) and

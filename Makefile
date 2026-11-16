@@ -12,7 +12,8 @@ REGRESS = doc_examples storage_change reader_check writer
 # instance built from the installed binaries, with the settings in
 # specs/isolation.conf (the library preloaded, wal_level = replica), and
 # never on the server PGHOST/PGPORT point at.
-ISOLATION = repack_concurrently_snapshot repack_concurrently_cursor
+ISOLATION = repack_concurrently_snapshot repack_concurrently_cursor \
+            reader_guard_edges
 ISOLATION_OPTS = --temp-instance=./tmp_check_iso \
                  --temp-config=$(srcdir)/specs/isolation.conf
 

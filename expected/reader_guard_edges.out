@@ -1,0 +1,194 @@
+Parsed test spec with 3 sessions
+
+starting permutation: r_begin p_vacfull r_t r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_vacfull: VACUUM FULL t;
+step r_t: SELECT count(*), sum(v) FROM t;
+count|sum
+-----+---
+    5| 15
+(1 row)
+
+step r_commit: COMMIT;
+
+starting permutation: r_begin p_grant r_t r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_grant: GRANT SELECT ON t TO PUBLIC;
+step r_t: SELECT count(*), sum(v) FROM t;
+count|sum
+-----+---
+    5| 15
+(1 row)
+
+step r_commit: COMMIT;
+
+starting permutation: r_begin o_create_n r_n r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step o_create_n: CREATE TABLE n (id int PRIMARY KEY); INSERT INTO n VALUES (1);
+step r_n: SELECT count(*) FROM n;
+count
+-----
+    0
+(1 row)
+
+step r_commit: COMMIT;
+
+starting permutation: r_begin p_repack_e r_e r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_repack_e: REPACK (CONCURRENTLY) e;
+step r_e: SELECT count(*) FROM e;
+count
+-----
+    0
+(1 row)
+
+step r_commit: COMMIT;
+
+starting permutation: r_begin p_repack_p1 r_t r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_repack_p1: REPACK (CONCURRENTLY) p1;
+step r_t: SELECT count(*), sum(v) FROM t;
+count|sum
+-----+---
+    5| 15
+(1 row)
+
+step r_commit: COMMIT;
+
+starting permutation: r_begin p_repack r_grant r_t r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) t;
+step r_grant: GRANT SELECT ON t TO PUBLIC;
+step r_t: SELECT count(*), sum(v) FROM t;
+ERROR:  cannot read table "t" with this snapshot
+step r_commit: COMMIT;
+
+starting permutation: r_begin p_repack p_vacfull r_t r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) t;
+step p_vacfull: VACUUM FULL t;
+step r_t: SELECT count(*), sum(v) FROM t;
+ERROR:  cannot read table "t" with this snapshot
+step r_commit: COMMIT;
+
+starting permutation: r_begin o_delete p_repack r_t r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step o_delete: DELETE FROM t;
+step p_repack: REPACK (CONCURRENTLY) t;
+step r_t: SELECT count(*), sum(v) FROM t;
+ERROR:  cannot read table "t" with this snapshot
+step r_commit: COMMIT;
+
+starting permutation: r_begin p_repack r_view r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) t;
+step r_view: SELECT count(*) FROM t_view;
+ERROR:  cannot read table "t" with this snapshot
+step r_commit: COMMIT;
+
+starting permutation: r_begin p_repack r_srf r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) t;
+step r_srf: SELECT count(*) FROM t_rows();
+ERROR:  cannot read table "t" with this snapshot
+step r_commit: COMMIT;
+
+starting permutation: r_begin p_repack r_parallel r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) t;
+step r_parallel: SET LOCAL debug_parallel_query = on; SELECT count(*) FROM t;
+ERROR:  cannot read table "t" with this snapshot
+step r_commit: COMMIT;
+
+starting permutation: r_begin p_repack_p1 r_parent r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_repack_p1: REPACK (CONCURRENTLY) p1;
+step r_parent: SELECT count(*) FROM p;
+ERROR:  cannot read table "p1" with this snapshot
+step r_commit: COMMIT;
+
+starting permutation: r_begin o_insert_e p_repack_e r_e r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step o_insert_e: INSERT INTO e SELECT generate_series(1, 3);
+step p_repack_e: REPACK (CONCURRENTLY) e;
+step r_e: SELECT count(*) FROM e;
+ERROR:  cannot read table "e" with this snapshot
+step r_commit: COMMIT;
+
+starting permutation: r_begin o_create_n p_repack_n r_n r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step o_create_n: CREATE TABLE n (id int PRIMARY KEY); INSERT INTO n VALUES (1);
+step p_repack_n: REPACK (CONCURRENTLY) n;
+step r_n: SELECT count(*) FROM n;
+ERROR:  cannot read table "n" with this snapshot
+step r_commit: COMMIT;
