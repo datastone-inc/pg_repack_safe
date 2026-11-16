@@ -69,3 +69,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `t/008_copy_guard.pl` (COPY ... TO), `protection` regression test,
   `t/009_not_preloaded.pl`, `t/010_standby_wal_record.pl`, `precheck`
   isolation spec and `t/011_precheck.pl`.
+- Known-gap tests that pin today's behaviour: `known_gaps` isolation spec
+  (TRUNCATE, rewriting ALTER TABLE, REFRESH MATERIALIZED VIEW, the
+  foreign-key check), `t/012_standby_safe_rewrite.pl` (VACUUM FULL and
+  REPACK against hot standbys without feedback); and `t/013_tablesync.pl`
+  and `t/014_plpgsql_toast.pl` for paths found protected. README "Known
+  gaps" lists them.

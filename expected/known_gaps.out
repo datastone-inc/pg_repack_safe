@@ -1,0 +1,77 @@
+Parsed test spec with 2 sessions
+
+starting permutation: r_begin w_truncate r_t r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step w_truncate: TRUNCATE t CASCADE;
+step r_t: SELECT count(*), sum(v) FROM t;
+count|sum
+-----+---
+    0|   
+(1 row)
+
+step r_commit: COMMIT;
+
+starting permutation: r_begin w_alter r_a r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step w_alter: ALTER TABLE a ALTER COLUMN v TYPE bigint;
+step r_a: SELECT count(*), sum(v) FROM a;
+count|sum
+-----+---
+    0|   
+(1 row)
+
+step r_commit: COMMIT;
+
+starting permutation: r_begin w_refresh r_mv r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step w_refresh: REFRESH MATERIALIZED VIEW mv;
+step r_mv: SELECT count(*), sum(v) FROM mv;
+count|sum
+-----+---
+    4| 10
+(1 row)
+
+step r_commit: COMMIT;
+
+starting permutation: r_begin w_refresh_c r_mv r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step w_refresh_c: REFRESH MATERIALIZED VIEW CONCURRENTLY mv;
+step r_mv: SELECT count(*), sum(v) FROM mv;
+count|sum
+-----+---
+    3|  6
+(1 row)
+
+step r_commit: COMMIT;
+
+starting permutation: r_begin w_repack_pk r_fk r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step w_repack_pk: REPACK (CONCURRENTLY) pk;
+step r_fk: INSERT INTO fk VALUES (1);
+ERROR:  insert or update on table "fk" violates foreign key constraint "fk_id_fkey"
+step r_commit: COMMIT;

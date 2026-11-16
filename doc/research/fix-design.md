@@ -724,9 +724,24 @@ order unless noted.
   `t/011_precheck.pl` (a single long statement not counted, a later
   statement counted, the threshold); removing the spans-a-statement rule
   makes `t/011` fail.
-- [ ] **12. Known gaps and Group B.** A reproducer and a README entry for
+- [x] **12. Known gaps and Group B.** A reproducer and a README entry for
   each: TRUNCATE, rewriting ALTER TABLE, readers that bypass the executor
   and COPY, and open questions 1-4, 6 and 16.
+  Done. `specs/known_gaps.spec` pins TRUNCATE and a rewriting ALTER TABLE
+  (old snapshot reads 0 rows), REFRESH MATERIALIZED VIEW (Q4, Q16: reads
+  the new contents; the refresh inserts frozen rows, `matview.c:494`;
+  REFRESH CONCURRENTLY is the control), and the foreign-key fast path.
+  Census of readers outside the executor and COPY: every user-table scan in
+  `src/backend` outside the executor either takes a fresh snapshot after
+  its lock (`tablecmds.c:6416`, `14805`; `tid.c:358`; `partbounds.c:3362`;
+  `index.c:3355`), uses a dirty snapshot (`execReplication.c:210`, `443`),
+  or feeds statistics (`selfuncs.c`, `analyze.c`), except the PostgreSQL 19
+  foreign-key fast path (`ri_triggers.c:2883-2901`), which scans the
+  referenced table's index with the transaction snapshot: after a REPACK
+  (CONCURRENTLY) of that table, an old snapshot's INSERT fails with a
+  foreign-key violation (23503) instead of 40001. Not wrong rows; pinned as
+  a known gap. Q1, Q2, Q3 and Q6: see the questions. README "Known gaps"
+  lists each with its test.
 - [ ] **13. Productize.** README guarantees and non-guarantees, installation
   and standby requirements, `doc_examples`, hook audit, an optimised-build
   benchmark, the resource manager ID claim.
@@ -735,10 +750,33 @@ order unless noted.
 
 1. VACUUM FULL / plain REPACK on a standby without hot_standby_feedback: wrong
    results or a conflict cancel?
+   **Wrong results**, in stock PostgreSQL 19 too (developer decision,
+   2026-11-16: known gap). A standby snapshot misses rows deleted after it
+   was taken: the rewrite keeps only what primary snapshots need and logs no
+   conflict record (no conflict-horizon code in `rewriteheap.c`,
+   `repack.c`, `heapam_handler.c`), and the replayed lock conflicts only
+   with queries holding a lock on the table (`high-availability.sgml:1869`).
+   `max_standby_streaming_delay = -1` does not help; `hot_standby_feedback`
+   does, and one feedback standby protects every standby of that primary.
+   Reported on pgsql-hackers by Noah Misch in 2012-01 with this reproducer;
+   no fix found. `t/012_standby_safe_rewrite.pl`. Option kept: record these
+   rewrites as standby-only records, if users ask.
 2. Logical-replication tablesync racing REPACK CONCURRENTLY: rows permanently
    missing on the subscriber?
+   **Yes in stock PostgreSQL 19, closed by the COPY check.** The sync
+   worker's COPY with a snapshot from before the REPACK returns no rows and
+   no error without the check, and is refused with it
+   (`t/013_tablesync.pl`, which runs the sync worker's commands,
+   `tablesync.c:1113`, `1414-1431`). A real subscription rarely reaches it:
+   CREATE SUBSCRIPTION reads the table on the publisher and waits behind the
+   REPACK, and a slot created while the REPACK holds an XID waits for it.
 3. Hot-standby RR query spanning commit replay of REPACK CONCURRENTLY: empty?
+   Answered: with the library on the standby it gets 40001
+   (`t/007_standby_reader.pl`); without it, replay stops (`t/010`).
 4. REFRESH MATERIALIZED VIEW: does an old snapshot see the new contents?
+   **Yes**: without CONCURRENTLY the refresh inserts its rows frozen
+   (`matview.c:494`, `TABLE_INSERT_FROZEN`), visible to every snapshot.
+   Known gap (decision 4), pinned in `specs/known_gaps.spec`.
 5. Record cleanup: a record may be deleted once its XID is visible to every
    snapshot, but the primary cannot see standby snapshots without
    hot_standby_feedback. What is the safe deletion rule?
@@ -746,6 +784,10 @@ order unless noted.
    XID follows the record's; deleting in the rewriter's own transaction
    gives wrong results on standbys. Who deletes, and when, is deferred.
 6. PL/pgSQL procedure COMMIT loops holding TOAST pointers across a swap.
+   Answered: values stay correct. PL/pgSQL detoasts before storing a value
+   in non-atomic contexts (`pl_exec.c:9009-9020`) and holdable cursors
+   detoast what they keep (`portalcmds.c:417-421`).
+   `t/014_plpgsql_toast.pl`.
 7. Are reads through parallel workers and inlined SQL functions checked?
    [R] Yes for views, inlined set-returning SQL functions, parallel plans
    and partitioned parents (`specs/reader_guard_edges.spec`). Workers start
@@ -773,6 +815,8 @@ order unless noted.
     records are live. Settled at step 9: refused (DROP and TRUNCATE unless
     `pg_repack_safe.allow_unprotected_drop` is set by a superuser).
 16. Is REFRESH MATERIALIZED VIEW in scope as a fourth wrong-results path?
+    It is a wrong-results path (Q4); not recorded, a known gap under
+    decision 4, like TRUNCATE and rewriting ALTER TABLE.
 
 17. An unprepared standby that starts replay at a checkpoint between the WAL
     record (I) and the REPACK commit never sees the record and does not stop.

@@ -100,6 +100,43 @@ See [doc/installation.md](doc/installation.md).
 CREATE EXTENSION pg_repack_safe;
 ```
 
+## Known gaps
+
+Each has a test that pins today's behaviour.
+
+- **TRUNCATE and rewriting ALTER TABLE** (for example a column type change)
+  are not recorded: a snapshot taken before them reads the table as empty,
+  as in stock PostgreSQL, where both are documented as not MVCC-safe
+  (`specs/known_gaps.spec`).
+- **REFRESH MATERIALIZED VIEW** without `CONCURRENTLY` is not recorded: a
+  snapshot taken before it reads the view's *new* contents, because the
+  refresh writes its rows frozen. `REFRESH ... CONCURRENTLY` is not affected
+  (`specs/known_gaps.spec`).
+- **Foreign-key checks** use a path that bypasses the reader check: an
+  INSERT or UPDATE in a transaction whose snapshot predates a
+  `REPACK (CONCURRENTLY)` of the referenced table fails with a foreign-key
+  violation (SQLSTATE 23503) instead of a serialization failure (40001). No
+  wrong rows, but an error a client would not retry
+  (`specs/known_gaps.spec`).
+- **Hot standbys without `hot_standby_feedback`**: `VACUUM FULL`, `CLUSTER`
+  and plain `REPACK` on the primary can drop rows that a standby snapshot
+  still needs, and the standby query then silently misses them, with or
+  without this extension (stock PostgreSQL behaviour, reported on
+  pgsql-hackers in 2012 and still unfixed). Turn on `hot_standby_feedback`,
+  ideally with a physical replication slot, on every hot standby that runs
+  queries (`t/012_standby_safe_rewrite.pl`). One standby with feedback holds
+  the primary's cleanup back for every standby. If users ask for it, this
+  extension could also guard these rewrites on standbys, as it does
+  `REPACK (CONCURRENTLY)`.
+- **A standby without the library** whose replay starts in the moment
+  between a `REPACK (CONCURRENTLY)`'s WAL record and its commit, and **a
+  session that never loads the library**: see the requirements above.
+
+Covered, for the record: `pg_dump`, `COPY ... TO`, logical replication's
+initial table copy (refused, and the sync worker retries;
+`t/013_tablesync.pl`), and PL/pgSQL procedures that commit inside a loop
+(`t/014_plpgsql_toast.pl`).
+
 ## Optional pre-check
 
 The reader guard turns a wrong result into an error, which a long report or
