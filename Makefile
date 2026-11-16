@@ -26,9 +26,18 @@ ISOLATION_OPTS = --temp-instance=./tmp_check_iso \
 TAP_TESTS = 1
 
 # Compiler flags
-PG_CPPFLAGS = -Wall -Wextra -Werror
+# PostgreSQL's release-build headers have inline functions whose parameters
+# are used only under assertions, so unused parameters are not errors.
+PG_CPPFLAGS = -Wall -Wextra -Wno-unused-parameter -Werror
 
 # Build configuration
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+# The TAP tests load a test-only module (test/modules/oat_observer) next to
+# this one; install it for them. make install does not install it.
+installcheck: install-test-modules
+install-test-modules:
+	$(MAKE) -C test/modules/oat_observer PG_CONFIG=$(PG_CONFIG) install
+.PHONY: install-test-modules

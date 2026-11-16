@@ -75,3 +75,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   REPACK against hot standbys without feedback); and `t/013_tablesync.pl`
   and `t/014_plpgsql_toast.pl` for paths found protected. README "Known
   gaps" lists them.
+- `t/015_oat_hook_chain.pl` (object access hook chaining), with the
+  test-only module `test/modules/oat_observer`, installed by
+  `make installcheck` and not by `make install`.
+
+### Changed
+
+- Builds against release (non-assert) PostgreSQL builds: unused parameters
+  in PostgreSQL's headers are no longer errors.
+
+- README rewritten around what is unsafe in stock PostgreSQL 19, what the
+  extension guarantees and what it does not; `doc/installation.md` covers
+  server and standby configuration, settings, `pg_upgrade` and other
+  extensions.

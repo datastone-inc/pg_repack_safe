@@ -895,6 +895,54 @@ isConcurrentRepack(Node *parsetree)
 }
 
 /**
+ * @brief Run the rest of the ProcessUtility chain under a classification
+ * @param recordTable rewriterRecordTable for the statement
+ * @param mvccSafeRewriter inMvccSafeRewriter for the statement
+ * @param pstmt Planned statement wrapping the utility statement
+ * @param queryString Source text
+ * @param readOnlyTree Whether the tree must not be modified
+ * @param context Where the statement came from
+ * @param params Bound parameters
+ * @param queryEnv Query environment
+ * @param dest Result receiver
+ * @param qc Completion tag output
+ *
+ * Sets the two classification variables for the statement and restores
+ * the enclosing statement's values however it ends. A function of its own
+ * so that nothing it uses after the setjmp in PG_TRY is modified before
+ * it (the caller replaces pstmt and readOnlyTree for COPY TO).
+ */
+static void
+runUtilityAs(Oid recordTable, bool mvccSafeRewriter, PlannedStmt *pstmt,
+             const char *queryString, bool readOnlyTree,
+             ProcessUtilityContext context, ParamListInfo params,
+             QueryEnvironment *queryEnv, DestReceiver *dest,
+             QueryCompletion *qc)
+{
+    Oid         savedRewriterRecordTable = rewriterRecordTable;
+    bool        savedInMvccSafeRewriter = inMvccSafeRewriter;
+
+    rewriterRecordTable = recordTable;
+    inMvccSafeRewriter = mvccSafeRewriter;
+
+    PG_TRY();
+    {
+        if (prevProcessUtilityHook != NULL)
+            prevProcessUtilityHook(pstmt, queryString, readOnlyTree, context,
+                                   params, queryEnv, dest, qc);
+        else
+            standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+                                    params, queryEnv, dest, qc);
+    }
+    PG_FINALLY();
+    {
+        rewriterRecordTable = savedRewriterRecordTable;
+        inMvccSafeRewriter = savedInMvccSafeRewriter;
+    }
+    PG_END_TRY();
+}
+
+/**
  * @brief ProcessUtility_hook: classify the innermost utility statement
  * @param pstmt Planned statement wrapping the utility statement
  * @param queryString Source text
@@ -911,8 +959,6 @@ processUtilityHook(PlannedStmt *pstmt, const char *queryString,
                    ParamListInfo params, QueryEnvironment *queryEnv,
                    DestReceiver *dest, QueryCompletion *qc)
 {
-    Oid         savedRewriterRecordTable = rewriterRecordTable;
-    bool        savedInMvccSafeRewriter = inMvccSafeRewriter;
     Oid         recordTable = InvalidOid;
     bool        unsafeRewriter = isConcurrentRepack(pstmt->utilityStmt);
 
@@ -920,6 +966,10 @@ processUtilityHook(PlannedStmt *pstmt, const char *queryString,
      * An unsafe rewrite must be recorded, so it runs only once the record
      * table is found and locked. This runs before rewriterRecordTable is set
      * so that an error leaves it unchanged.
+     *
+     * The refusals here (preload, record table, pre-check, COPY check) run
+     * before the previous ProcessUtility hook, so a refused statement never
+     * reaches the modules loaded before this one: it must not run at all.
      */
     if (unsafeRewriter)
     {
@@ -943,26 +993,12 @@ processUtilityHook(PlannedStmt *pstmt, const char *queryString,
         readOnlyTree = false;
     }
 
-    rewriterRecordTable = recordTable;
-    inMvccSafeRewriter = !unsafeRewriter &&
-        (IsA(pstmt->utilityStmt, VacuumStmt) ||
-         IsA(pstmt->utilityStmt, RepackStmt));
-
-    PG_TRY();
-    {
-        if (prevProcessUtilityHook != NULL)
-            prevProcessUtilityHook(pstmt, queryString, readOnlyTree, context,
-                                   params, queryEnv, dest, qc);
-        else
-            standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
-                                    params, queryEnv, dest, qc);
-    }
-    PG_FINALLY();
-    {
-        rewriterRecordTable = savedRewriterRecordTable;
-        inMvccSafeRewriter = savedInMvccSafeRewriter;
-    }
-    PG_END_TRY();
+    runUtilityAs(recordTable,
+                 !unsafeRewriter &&
+                 (IsA(pstmt->utilityStmt, VacuumStmt) ||
+                  IsA(pstmt->utilityStmt, RepackStmt)),
+                 pstmt, queryString, readOnlyTree, context, params, queryEnv,
+                 dest, qc);
 }
 
 /**
@@ -1198,8 +1234,12 @@ lockRecordTableForWriter(void)
 
     for (;;)
     {
-        Oid         tableOid = lookupRecordTable(false);
+        Oid         tableOid;
         Relation    rel;
+
+        CHECK_FOR_INTERRUPTS();
+
+        tableOid = lookupRecordTable(false);
 
         if (!OidIsValid(tableOid))
             ereport(ERROR,

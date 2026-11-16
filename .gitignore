@@ -4,7 +4,7 @@
 *.a
 *.dylib
 *.dll
-/.deps/
+.deps/
 
 # PGXS Build Output
 /regression.diffs

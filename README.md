@@ -10,80 +10,101 @@
 [![Language](https://img.shields.io/badge/Language-C-orange.svg)](https://en.wikipedia.org/wiki/C_(programming_language))
 [![Extension](https://img.shields.io/badge/Type-PostgreSQL%20Extension-purple.svg)](https://www.postgresql.org/docs/current/extend-extensions.html)
 
-PostgreSQL extension (description to come)
+Makes PostgreSQL 19's `REPACK (CONCURRENTLY)` safe: a query whose snapshot
+predates the repack gets a retryable error instead of wrong rows.
 
 </div>
 <!-- markdownlint-enable MD033 MD041 -->
 
 ---
 
-## Overview
+## The problem
 
-The extension is under construction. With the library in
-`shared_preload_libraries` and the extension created, it prevents the
-documented wrong result for queries: a query whose snapshot predates a
-committed `REPACK (CONCURRENTLY)` of a table it reads gets an error instead
-of an empty table, on the primary and on a hot standby that also has the
-library preloaded. That covers queries, `COPY ... TO` and so `pg_dump`. It
-does **not** yet cover readers that bypass both the executor and COPY, or
-the other cases listed in
+PostgreSQL 19's `REPACK (CONCURRENTLY)` rewrites a table without blocking
+reads or writes, but it is not MVCC-safe (documented in the `REPACK`
+reference page and in "MVCC caveats"). After it commits, a transaction whose
+snapshot was taken before it committed, and which had not yet touched the
+table, reads the table as **empty**. Nothing raises an error. The same
+happens to `pg_dump` (a dump with the table's rows missing), to cursors, and
+to logical replication's initial table copy (a subscriber that never gets
+the table's existing rows).
+
+## What pg_repack_safe guarantees
+
+With the library in `shared_preload_libraries` on the primary and on every
+standby, and the extension created in the database:
+
+- A read of a table, whose snapshot does not see a committed
+  `REPACK (CONCURRENTLY)` of that table, fails with
+  `ERROR: cannot read table "..." with this snapshot`, SQLSTATE 40001 (a
+  serialization failure: retry the transaction), instead of returning wrong
+  rows. This covers every query through the executor (views, functions,
+  cursors, parallel plans, partitions, the TOAST table), `COPY ... TO`
+  (including partitioned tables, `pg_dump`, and logical replication's
+  initial copy), on the primary and on hot standbys.
+- A standby without the library stops replaying at the first
+  `REPACK (CONCURRENTLY)` instead of serving its rows.
+- Reads that do not need an error get none: snapshots taken after the
+  repack committed, snapshots that had already read the table (the repack
+  waits for them), empty tables, `VACUUM FULL`, `CLUSTER`, plain `REPACK`.
+  One accepted exception: a table whose only rows were inserted after the
+  snapshot and that is then repacked gives a spurious error.
+
+The reproducers that fail on stock PostgreSQL 19 and pass with the
+extension are `specs/repack_concurrently_*.spec`, `t/001_repack_pg_dump.pl`,
+`t/008_copy_guard.pl` and `t/013_tablesync.pl`.
+
+## What it does not guarantee
+
+See [Known gaps](#known-gaps): other commands that rewrite tables without
+preserving visibility (`TRUNCATE`, rewriting `ALTER TABLE`, `REFRESH
+MATERIALIZED VIEW`), the foreign-key check's error class, `VACUUM FULL`
+against hot standbys without `hot_standby_feedback` (a stock PostgreSQL
+problem), and a few configurations the extension cannot see.
+
+## Requirements
+
+- PostgreSQL 19, `wal_level = replica` or higher (required by
+  `REPACK (CONCURRENTLY)` itself).
+- `shared_preload_libraries = 'pg_repack_safe'` on the primary **and on
+  every physical standby**, or anything else that replays the WAL.
+  `REPACK (CONCURRENTLY)` is refused in a session that loaded the library
+  any other way. A standby without it fails on the extension's WAL record
+  and shuts down ("resource manager with ID 128 not registered").
+- `CREATE EXTENSION pg_repack_safe` in every database where
+  `REPACK (CONCURRENTLY)` runs; it is refused elsewhere.
+- Recommended: `hot_standby_feedback = on` on hot standbys that run queries
+  (see [Known gaps](#known-gaps)).
+
+Details, including `pg_upgrade` and other extensions, are in
+[doc/installation.md](doc/installation.md).
+
+## How it works
+
+Each `REPACK (CONCURRENTLY)` of a table with data writes a record, (table,
+rewriting transaction ID), into the extension's table
+`pg_repack_safe_rewrites`, plus one for the table's TOAST table, and a WAL
+record of its own. Once a query holds its locks, it checks the records of
+the tables it reads against its snapshot; each backend keeps a copy of the
+records, refreshed by cache invalidation, so the check costs about as much
+as a hash lookup. The design and its evidence are in
 [doc/research/fix-design.md](doc/research/fix-design.md).
 
-Requirements and refusals:
+The record table is protected:
 
-- The library must be in `shared_preload_libraries`. `REPACK (CONCURRENTLY)`
-  is refused in a session that loaded it any other way, and in a database
-  without the extension. A session that never loads the library cannot be
-  stopped: its `REPACK (CONCURRENTLY)` runs unrecorded (a known gap).
-- **Every physical standby, and anything else that replays this server's
-  WAL, needs the library in `shared_preload_libraries` too.**
-  `REPACK (CONCURRENTLY)` writes a WAL record of its own before it commits;
-  a standby without the library fails on that record and shuts down
-  ("resource manager with ID 128 not registered") instead of serving the
-  repacked table to old snapshots. Known gap: a standby without the library
-  whose replay starts from a checkpoint taken between that record and the
-  commit (for example one built from a base backup started at that moment)
-  never sees the record.
-- Records are never deleted. Each `REPACK (CONCURRENTLY)` of a table with
-  data adds one or two rows to `pg_repack_safe_rewrites`. Each backend keeps
-  a copy of them and reloads it when the table changes, so a growing table
-  costs memory and reload time, not a scan per query.
-- Because old snapshots, on the primary or a standby, may rely on any
-  record, the record table is protected. While it holds records, `DROP` of
-  the table, its triggers or the extension, and `TRUNCATE` of the table,
-  are refused unless a superuser sets `pg_repack_safe.allow_unprotected_drop`
-  (see [Removing the extension](#removing-the-extension)). `UPDATE` and
-  `DELETE` of records, rewrites of the table that do not keep every record
-  unchanged (a rewriting `ALTER TABLE`, `REPACK (CONCURRENTLY)`), and changes
-  to when its triggers fire are always refused. `VACUUM`, `VACUUM FULL`,
-  `CLUSTER` and `REPACK` of it, also database-wide, are allowed.
+- Records are never deleted. Each `REPACK (CONCURRENTLY)` adds one or two
+  rows; the table only grows.
+- While it holds records, `DROP` of the table, its triggers or the
+  extension, and `TRUNCATE` of the table, are refused unless a superuser
+  sets `pg_repack_safe.allow_unprotected_drop` (see
+  [Removing the extension](#removing-the-extension)). `UPDATE` and `DELETE`
+  of records, rewrites that do not keep every record unchanged (a rewriting
+  `ALTER TABLE`, `REPACK (CONCURRENTLY)`), and changes to when its triggers
+  fire are always refused. `VACUUM`, `VACUUM FULL`, `CLUSTER` and `REPACK`
+  of it, also database-wide, are allowed.
 - If the record table loses its definition or either trigger by a route no
   hook could stop, every query and `REPACK (CONCURRENTLY)` in that database
   is refused until the extension is re-created.
-
-What exists so far:
-
-- a loadable library whose hooks detect when a table's storage is replaced
-  and whether `REPACK (CONCURRENTLY)` did it;
-- the writer: with the library loaded, `REPACK (CONCURRENTLY)` of a table
-  that has data writes a record, (table, rewriting transaction ID), into the
-  extension's table `pg_repack_safe_rewrites`, plus one for the table's TOAST
-  relation. `REPACK (CONCURRENTLY)` is refused in a database where the
-  extension is not created, and when its record table cannot be found or has
-  been redefined;
-- the reader check: once a query holds its locks, it raises
-  `ERROR: cannot read table "..." with this snapshot` (SQLSTATE 40001, a
-  serialization failure: retry the transaction) when a table it reads has a
-  record whose `REPACK (CONCURRENTLY)` committed but is not visible to the
-  query's snapshot. `EXPLAIN` without `ANALYZE` is not checked, since it
-  reads no rows. Queries are also refused if the extension exists but the
-  record table has been renamed, moved to another schema, or dropped. That second refusal is off while the server runs in
-  binary-upgrade mode (`pg_upgrade`, or a server started by hand with `-b`),
-  because `pg_upgrade` restores the extension before its table.
-  `REPACK (CONCURRENTLY)` is refused whenever the extension exists and the
-  table cannot be found, in that mode too.
-
-The design is in [doc/research/fix-design.md](doc/research/fix-design.md).
 
 ## Installation
 
@@ -92,13 +113,14 @@ make
 sudo make install        # omit sudo when the PostgreSQL install is yours
 ```
 
-See [doc/installation.md](doc/installation.md).
-
-## Quick Start
+Then add the library to `shared_preload_libraries` (primary and standbys),
+restart, and in each database:
 
 ```sql
 CREATE EXTENSION pg_repack_safe;
 ```
+
+See [doc/installation.md](doc/installation.md).
 
 ## Known gaps
 

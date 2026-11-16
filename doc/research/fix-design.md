@@ -745,6 +745,31 @@ order unless noted.
 - [ ] **13. Productize.** README guarantees and non-guarantees, installation
   and standby requirements, `doc_examples`, hook audit, an optimised-build
   benchmark, the resource manager ID claim.
+  - Hook audit (2026-11-16): no blockers. Fixed at the developer's choice:
+    `CHECK_FOR_INTERRUPTS` in `lockRecordTableForWriter`'s retry loop; the
+    `object_access_hook` chain is now tested (`t/015_oat_hook_chain.pl`,
+    with the test-only module `test/modules/oat_observer`, installed by
+    `make installcheck` only; removing our chain call fails it); the
+    ordering of ProcessUtility refusals before the previous hook is
+    documented in the code and in `doc/installation.md`.
+  - README restructured: the problem, the guarantee, what is not
+    guaranteed, requirements, how it works. `doc/installation.md` covers
+    server configuration (standbys first), settings, `pg_upgrade`, other
+    extensions, the resource manager ID, and what `make installcheck`
+    installs. `t/010` now also shows a standby restarted with the library
+    resumes replay. `doc_examples` covers every SQL example.
+  - Optimised build (PostgreSQL 19rc2, meson release, `-O3`, no
+    assertions; select-only pgbench, prepared, scale 10, three 10 s runs):
+    1 client, 21,090 tps without the library; 20,850 with it and no
+    records; 20,725 with records for another table; 20,650 with records for
+    the table read (at most about 2%, about 1 us per query). 8 clients:
+    71,605 without; 72,400, 72,195, 71,345 with, within run-to-run noise
+    (about 1%). Building against the release build also exposed two
+    defects the debug build hid, both fixed: PostgreSQL's release headers
+    fail `-Wextra -Werror` (unused parameters), so the Makefiles add
+    `-Wno-unused-parameter`; and `processUtilityHook` modified `pstmt` and
+    `readOnlyTree` before its `PG_TRY` (`-Wclobbered`), so the `PG_TRY`
+    moved into `runUtilityAs`, which modifies nothing before its setjmp.
 
 ## Open questions needing reproducers
 

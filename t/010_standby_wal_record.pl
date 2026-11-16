@@ -102,6 +102,16 @@ is( $primary->safe_psql('postgres',
         "SELECT '$recordLsn'::pg_lsn < '$commitLsn'::pg_lsn"),
     't', 'the record precedes the commit');
 
+# Restarted with the library, the standby replays the record and catches up
+# (doc/installation.md).
+$bare->append_conf('postgresql.conf',
+    "shared_preload_libraries = 'pg_repack_safe'\n");
+$bare->start;
+$primary->wait_for_catchup($bare);
+is($bare->safe_psql('postgres', 'SELECT count(*) FROM t'), '5',
+    'standby restarted with the library resumes replay');
+$bare->stop;
+
 # The primary's crash recovery replays the record.
 $primary->stop('immediate');
 $primary->start;

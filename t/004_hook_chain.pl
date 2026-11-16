@@ -13,8 +13,8 @@
 #   hook ran, and refuses an old snapshot's query of the repacked table only
 #   if its ExecutorStart hook ran.
 #
-# object_access_hook has no second user among the installed stock modules, so
-# its chaining is not covered here.
+# object_access_hook has no second user among the installed stock modules;
+# t/015_oat_hook_chain.pl covers its chaining with a test-only module.
 
 use strict;
 use warnings FATAL => 'all';
