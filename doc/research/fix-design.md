@@ -525,13 +525,28 @@ order unless noted.
   the library loaded once a record exists. That is why the isolation specs,
   `t/001`, `t/003` and `t/004` now fail, each on that refusal only; the
   regression suite passes.
-- [ ] **4. Reader.** Replace the "cannot check" refusal with the
+- [x] **4. Reader.** Replace the "cannot check" refusal with the
   `SnapshotAny` scan and the error text of §6b. Check: the two isolation
   specs from step 2 pass, and a TAP test pins SQLSTATE 40001, DETAIL and
   HINT (psql with `VERBOSITY verbose`). `t/001_repack_pg_dump.pl` still fails
   here: pg_dump reads with `COPY ... TO stdout` (`pg_dump.c:2429`), which
   scans without the executor (`copyto.c:1362`, `copyto.c:1396`); it passes at
   step 8.
+  Done. Both specs pass; `t/005_reader_guard.pl` pins 40001, DETAIL and
+  HINT, shows EXPLAIN without ANALYZE passing (it reads no rows, so the check
+  is skipped) and EXPLAIN ANALYZE refused, and refuses a direct read of the
+  post-swap TOAST relation (Q10). `t/003` passes again; `t/004` now refuses a
+  real old-snapshot read instead of a planted record. `t/001` fails only its
+  four GUARDED subtests (COPY). The relations checked are every
+  `RTE_RELATION` of the plan's range table; the snapshot is the query's
+  (`queryDesc->snapshot`), and a matching record under a non-MVCC snapshot
+  is refused. The snapshot test runs before the commit-log lookup, so a
+  record older than the snapshot's xmin never reaches the commit log.
+  `reader_check` keeps the single-session verdicts that must pass
+  (bootstrap, committed, aborted and own XIDs); its case "a detached record
+  table refuses nothing" no longer observes anything in one session and
+  moves to step 9 (Q15). Not covered yet: parallel workers (Q7, step 5).
+  `rewrite_xid` is `xid8` (Q19).
 - [ ] **5. Negative and edge tests.** Interleavings 7, 9, 11-16: no error
   after VACUUM FULL alone, GRANT alone, a table created after the snapshot,
   or an empty table; error after own DDL, after VACUUM FULL following REPACK,
@@ -607,6 +622,14 @@ order unless noted.
 18. PREPARE TRANSACTION: irrelevant for REPACK (CONCURRENTLY), which cannot
     run in a transaction block, but the general detector must handle or
     refuse it before TRUNCATE or ALTER are switched on.
+19. XID wraparound of records. Settled 2026-11-16 (developer decision): the
+    column is `xid8`. A record at least 2^31 transactions older than the
+    next XID precedes every live snapshot's xmin (XIDs stop short of oldest
+    datfrozenxid + 2^31, `varsup.c:384`, `varsup.c:400`, `varsup.c:139`) and
+    passes without a commit-log lookup; any other record's 32-bit form is
+    unambiguous; a record at or past the next XID is refused as corrupt.
+    [R] `t/006_record_xid8.pl` on a cluster at epoch 1; with the age rule
+    disabled the test fails, as a 32-bit column would.
 
 How these group:
 - **Needed to build the guard:** 5, 7, 8, 9, 10, 13, 14, 15, 17. All but 8

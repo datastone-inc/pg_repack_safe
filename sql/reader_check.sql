@@ -7,10 +7,14 @@
  * @file reader_check.sql
  * @brief The reader check in the ExecutorStart hook
  *
- * A query passes when the extension is absent from the database, or when its
- * record table has no blocks. A query is refused when the record table is not
- * empty, and when the extension exists but its record table cannot be found.
- * In that last state REPACK (CONCURRENTLY) is refused as well.
+ * A query passes when the extension is absent from the database, when its
+ * record table has no blocks, and when every record for the relations it
+ * reads has an XID its snapshot sees as committed, an aborted XID, or the
+ * query's own transaction's XID. A record refuses a query only when its XID
+ * committed and the query's snapshot does not see it, which takes a second
+ * session: the isolation specs and t/005_reader_guard.pl cover that. A
+ * query is also refused when the extension exists but its record table
+ * cannot be found; in that state REPACK (CONCURRENTLY) is refused as well.
  */
 
 LOAD 'pg_repack_safe';
@@ -23,17 +27,37 @@ CREATE EXTENSION pg_repack_safe;
 -- Empty record table: the query passes.
 SELECT 1 AS passes;
 
--- A record makes the table non-empty: every query is refused.
+CREATE TABLE rc_t (id int PRIMARY KEY);
+
+-- Records this session's snapshots all see: queries pass.
+-- The bootstrap XID precedes every snapshot.
 INSERT INTO pg_repack_safe_rewrites VALUES ('pg_class'::regclass, '1');
-SELECT 1 AS refused;
-SELECT count(*) AS refused FROM pg_repack_safe_rewrites;
+SELECT count(*) > 0 AS passes FROM pg_class;
+-- A transaction that committed before the snapshot was taken.
+BEGIN;
+SELECT pg_current_xact_id() AS committed_xid \gset
+COMMIT;
+INSERT INTO pg_repack_safe_rewrites VALUES ('rc_t'::regclass, :'committed_xid');
+SELECT count(*) AS passes FROM rc_t;
+-- An aborted transaction.
+BEGIN;
+SELECT pg_current_xact_id() AS aborted_xid \gset
+ROLLBACK;
+INSERT INTO pg_repack_safe_rewrites VALUES ('rc_t'::regclass, :'aborted_xid');
+SELECT count(*) AS passes FROM rc_t;
+-- The query's own transaction, whose XID was assigned after its snapshot.
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) AS passes FROM rc_t;
+INSERT INTO pg_repack_safe_rewrites
+    VALUES ('rc_t'::regclass, pg_current_xact_id());
+SELECT count(*) AS passes FROM rc_t;
+COMMIT;
 
 -- TRUNCATE is a utility statement and gives the table zero blocks again.
 TRUNCATE pg_repack_safe_rewrites;
 SELECT 1 AS passes;
 
 -- With the record table in place, REPACK (CONCURRENTLY) runs.
-CREATE TABLE rc_t (id int PRIMARY KEY);
 REPACK (CONCURRENTLY) rc_t;
 
 -- Record table renamed: it cannot be found, so the query is refused, and so

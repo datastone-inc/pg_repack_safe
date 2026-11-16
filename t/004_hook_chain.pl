@@ -10,7 +10,8 @@
 #   and records a query only if its ExecutorStart hook ran (that hook sets up
 #   the timing its ExecutorEnd hook requires);
 # - pg_repack_safe classifies REPACK (CONCURRENTLY) only if its ProcessUtility
-#   hook ran, and refuses a query only if its ExecutorStart hook ran.
+#   hook ran, and refuses an old snapshot's query of the repacked table only
+#   if its ExecutorStart hook ran.
 #
 # object_access_hook has no second user among the installed stock modules, so
 # its chaining is not covered here.
@@ -40,8 +41,14 @@ foreach my $name (sort keys %orders)
         CREATE EXTENSION pg_repack_safe;
         CREATE TABLE chain_t (id int PRIMARY KEY);
         INSERT INTO chain_t SELECT generate_series(1, 3);
+        CREATE TABLE chain_other (id int);
         SELECT pg_stat_statements_reset();
     });
+
+    # A snapshot taken before the REPACK, without touching chain_t.
+    my $reader = $node->background_psql('postgres', on_error_stop => 0);
+    $reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+    $reader->query_safe('SELECT count(*) FROM chain_other');
 
     # ProcessUtility: both modules see the same REPACK.
     my ($ret, $stdout, $stderr) = $node->psql('postgres', q{
@@ -67,20 +74,29 @@ foreach my $name (sort keys %orders)
         '1',
         "$name: pg_stat_statements recorded the query");
 
-    $node->safe_psql('postgres',
-        q{INSERT INTO pg_repack_safe_rewrites VALUES ('chain_t'::regclass, '1')});
-    ($ret, $stdout, $stderr) =
-      $node->psql('postgres', 'SELECT count(*) FROM chain_t');
-    isnt($ret, 0, "$name: query refused with a record present");
+    # The old snapshot's read of chain_t is refused only if
+    # pg_repack_safe's ExecutorStart hook ran.
+    $reader->{stderr} = '';
+    $reader->query('SELECT count(*) FROM chain_t');
     like(
-        $stderr,
-        qr/pg_repack_safe cannot check unsafe-rewrite records yet/,
-        "$name: pg_repack_safe refused the query");
+        $reader->{stderr},
+        qr/cannot read table "chain_t" with this snapshot/,
+        "$name: pg_repack_safe refused the old snapshot's query");
+    # BackgroundPsql keeps stderr across queries; clear the expected error.
+    $reader->{stderr} = '';
+    $reader->query_safe('ROLLBACK');
+    $reader->quit;
 
-    # The refused query still ends cleanly for both modules.
-    $node->safe_psql('postgres', 'TRUNCATE pg_repack_safe_rewrites');
-    is($node->safe_psql('postgres', 'SELECT count(*) FROM chain_t'),
-        '3', "$name: queries pass again after the record is removed");
+    # The refused query still ends cleanly for both modules. The query has
+    # its own shape: pg_stat_statements does not tell queries apart by
+    # column alias, so a count(*) here would join chain_probe's entry.
+    is($node->safe_psql('postgres', 'SELECT max(id) FROM chain_t'),
+        '3', "$name: a new snapshot's query passes");
+    is( $node->safe_psql('postgres', q{
+            SELECT sum(calls) FROM pg_stat_statements
+            WHERE query = 'SELECT max(id) FROM chain_t'}),
+        '1',
+        "$name: pg_stat_statements recorded the query that passed");
 
     $node->stop;
 }

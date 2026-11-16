@@ -33,6 +33,7 @@
 #include "access/relation.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_class.h"
@@ -54,6 +55,7 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/xid8.h"
 
 PG_MODULE_MAGIC;
 
@@ -122,8 +124,8 @@ selfVisibleRelfilenode(Oid relid, Oid *toastRelid)
  * @brief Write one unsafe-rewrite record
  * @param relid Relation that old snapshots must not read
  *
- * The record carries the current transaction's ID, which is also the ID the
- * rewrite stamped on every row it copied. The record table
+ * The record carries the current transaction's full (64-bit) ID, whose low
+ * 32 bits are the ID the rewrite stamped on every row it copied. The record table
  * (rewriterRecordTable) was locked with RowExclusiveLock when the statement
  * started, so it cannot have been dropped, renamed or moved since, provided
  * this is still that transaction. REPACK (CONCURRENTLY, ANALYZE) commits
@@ -146,7 +148,7 @@ insertRecord(Oid relid)
 
     rel = table_open(rewriterRecordTable, NoLock);
     values[0] = ObjectIdGetDatum(relid);
-    values[1] = TransactionIdGetDatum(GetCurrentTransactionId());
+    values[1] = FullTransactionIdGetDatum(GetCurrentFullTransactionId());
     tuple = heap_form_tuple(RelationGetDescr(rel), values, nulls);
     simple_heap_insert(rel, tuple);
     heap_freetuple(tuple);
@@ -460,7 +462,7 @@ lookupRecordTable(bool forReader)
  *
  * The writer forms its rows from this definition and the reader scans the
  * table with heap semantics, so any other definition is refused: two columns
- * (oid, xid), the heap access method, and permanent storage, which survives
+ * (oid, xid8), the heap access method, and permanent storage, which survives
  * a crash and reaches standbys through WAL.
  */
 static void
@@ -475,7 +477,7 @@ checkRecordTableDefinition(Relation rel)
         TupleDescAttr(desc, 0)->attisdropped ||
         TupleDescAttr(desc, 0)->atttypid != OIDOID ||
         TupleDescAttr(desc, 1)->attisdropped ||
-        TupleDescAttr(desc, 1)->atttypid != XIDOID)
+        TupleDescAttr(desc, 1)->atttypid != XID8OID)
         ereport(ERROR,
                 (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                  errmsg("pg_repack_safe cannot use its record table"),
@@ -529,18 +531,75 @@ lockRecordTableForWriter(void)
 }
 
 /**
- * @brief Reader check: look for unsafe-rewrite records
+ * @brief Tell whether a record's rewrite is invisible to a snapshot
+ * @param fxid The record's rewrite_xid, a full transaction ID
+ * @param snapshot The reader's MVCC snapshot
+ * @return True if the rewrite committed but the snapshot does not see it
  *
- * Invariant: a record table with zero blocks holds no record, live or
- * deleted, so no relation in this database has a pending unsafe rewrite.
- * Reading the records is not implemented; a non-empty record table cannot be
- * given a verdict, so the query is refused.
+ * A record at least 2^31 transactions older than the next transaction ID
+ * precedes every live snapshot's xmin: transaction IDs are not assigned
+ * past xidStopLimit, below oldest datfrozenxid + 2^31 (varsup.c,
+ * SetTransactionIdLimit), and datfrozenxid never passes a live snapshot's
+ * xmin. Such a record is visible to the snapshot or aborted and is passed
+ * without its 32-bit form, which may by then name a newer transaction. Any
+ * other record's 32-bit form is unambiguous. A record at or beyond the next
+ * transaction ID cannot come from the writer and is refused.
+ *
+ * The snapshot test comes before the commit-log lookup: an XID it does not
+ * report as running is either visible to it or aborted, and in both cases the
+ * snapshot sees the rewritten table as stock MVCC would. The current
+ * transaction's own rewrite is visible to it.
+ */
+static bool
+rewriteHiddenFromSnapshot(FullTransactionId fxid, Snapshot snapshot)
+{
+    FullTransactionId next = ReadNextFullTransactionId();
+    TransactionId xid;
+
+    if (!FullTransactionIdPrecedes(fxid, next))
+        ereport(ERROR,
+                (errcode(ERRCODE_DATA_CORRUPTED),
+                 errmsg("pg_repack_safe found an unsafe-rewrite record with a transaction ID that has not been assigned"),
+                 errdetail("Record transaction ID %" PRIu64 ", next transaction ID %" PRIu64 ".",
+                           U64FromFullTransactionId(fxid),
+                           U64FromFullTransactionId(next))));
+
+    if (U64FromFullTransactionId(next) - U64FromFullTransactionId(fxid) >=
+        (uint64) (MaxTransactionId >> 1))
+        return false;
+
+    xid = XidFromFullTransactionId(fxid);
+    if (!XidInMVCCSnapshot(xid, snapshot))
+        return false;
+    if (TransactionIdIsCurrentTransactionId(xid))
+        return false;
+    return TransactionIdDidCommit(xid);
+}
+
+/**
+ * @brief Reader check: refuse a query whose snapshot cannot see a rewrite
+ * @param queryDesc Query being started; its relation locks are held
+ *
+ * Invariant: a query that reads relation R with snapshot S raises an error
+ * if R has a record whose rewrite committed and is not visible to S. The
+ * check runs once the query holds its locks. A rewriter holds
+ * AccessExclusiveLock from the swap, where the record is written, to its
+ * commit, so a lock taken after that commit sees the record committed, and
+ * the record table is scanned with SnapshotAny so that a record deleted
+ * since S was taken is still found (doc/research/fix-design.md, section 6b).
+ *
+ * A record table with zero blocks holds no record, live or deleted, so the
+ * scan is skipped. A matching record that cannot be judged because the
+ * query's snapshot is not an MVCC snapshot is refused.
  */
 static void
-checkUnsafeRewriteRecords(void)
+checkUnsafeRewriteRecords(QueryDesc *queryDesc)
 {
     Relation    rel;
-    BlockNumber blocks;
+    List       *relids = NIL;
+    TableScanDesc scan;
+    HeapTuple   tuple;
+    Oid         hiddenRelid = InvalidOid;
 
     /*
      * Taking the lock processes pending invalidation messages. Accept the
@@ -561,18 +620,63 @@ checkUnsafeRewriteRecords(void)
             table_close(rel, AccessShareLock);
         recordTableOidKnown = false;
     }
-    blocks = RelationGetNumberOfBlocks(rel);
-    table_close(rel, AccessShareLock);
 
-    if (blocks == 0)
+    if (RelationGetNumberOfBlocks(rel) == 0)
+    {
+        table_close(rel, AccessShareLock);
         return;
+    }
+    checkRecordTableDefinition(rel);
 
-    /* TODO(dsharpe 2026-11-15): scan the records against the snapshot. */
-    ereport(ERROR,
-            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-             errmsg("pg_repack_safe cannot check unsafe-rewrite records yet"),
-             errdetail("The record table \"%s\" is not empty.",
-                       RECORD_TABLE_NAME)));
+    foreach_node(RangeTblEntry, rte, queryDesc->plannedstmt->rtable)
+    {
+        if (rte->rtekind == RTE_RELATION)
+            relids = list_append_unique_oid(relids, rte->relid);
+    }
+
+    scan = table_beginscan(rel, SnapshotAny, 0, NULL, SO_NONE);
+    while (relids != NIL &&
+           (tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+    {
+        Oid         relid;
+        FullTransactionId fxid;
+        bool        isnull;
+
+        relid = DatumGetObjectId(heap_getattr(tuple, 1,
+                                              RelationGetDescr(rel), &isnull));
+        if (isnull || !list_member_oid(relids, relid))
+            continue;
+        fxid = DatumGetFullTransactionId(heap_getattr(tuple, 2,
+                                                      RelationGetDescr(rel),
+                                                      &isnull));
+        if (isnull)
+            continue;
+
+        if (queryDesc->snapshot == InvalidSnapshot ||
+            !IsMVCCSnapshot(queryDesc->snapshot))
+            ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                     errmsg("pg_repack_safe cannot check table \"%s\" for this query",
+                            get_rel_name(relid)),
+                     errdetail("The table has an unsafe-rewrite record and the query does not run with an MVCC snapshot.")));
+
+        if (rewriteHiddenFromSnapshot(fxid, queryDesc->snapshot))
+        {
+            hiddenRelid = relid;
+            break;
+        }
+    }
+    table_endscan(scan);
+    table_close(rel, AccessShareLock);
+    list_free(relids);
+
+    if (OidIsValid(hiddenRelid))
+        ereport(ERROR,
+                (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+                 errmsg("cannot read table \"%s\" with this snapshot",
+                        get_rel_name(hiddenRelid)),
+                 errdetail("REPACK (CONCURRENTLY) rewrote the table after the snapshot was taken, and row visibility for older snapshots was not preserved."),
+                 errhint("Retry the transaction.")));
 }
 
 /**
@@ -589,7 +693,9 @@ executorStartHook(QueryDesc *queryDesc, int eflags)
     else
         standard_ExecutorStart(queryDesc, eflags);
 
-    checkUnsafeRewriteRecords();
+    /* EXPLAIN without ANALYZE reads no rows. */
+    if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0)
+        checkUnsafeRewriteRecords(queryDesc);
 }
 
 /**

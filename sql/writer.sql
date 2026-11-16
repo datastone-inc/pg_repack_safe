@@ -18,10 +18,6 @@
  * and which an older snapshot could still read, is recorded. Without the
  * extension in the database, REPACK (CONCURRENTLY) is refused, since it
  * would have nowhere to record the rewrite.
- *
- * Once a record exists, the reader check refuses every query in a backend
- * that has the library loaded, so the records are read after \c, in a
- * backend that has not loaded it.
  */
 
 LOAD 'pg_repack_safe';
@@ -64,10 +60,8 @@ REPACK (CONCURRENTLY) wr_t;
 REPACK (CONCURRENTLY, ANALYZE) public.pg_temp_1;
 REPACK (CONCURRENTLY) wr_deleted;
 
-\c -
-
 -- Each record names the table or its post-swap TOAST relation, and carries
--- the XID that wrote it, which is also the XID that wrote every row of the
+-- the full XID that wrote it, whose 32-bit form also wrote every row of the
 -- repacked table.
 SELECT CASE r.relid
            WHEN 'wr_t'::regclass THEN 'wr_t'
@@ -75,17 +69,17 @@ SELECT CASE r.relid
            WHEN 'public.pg_temp_1'::regclass THEN 'pg_temp_1'
            WHEN 'wr_deleted'::regclass THEN 'wr_deleted'
        END AS recorded,
-       r.rewrite_xid = r.xmin AS by_rewriter
+       r.rewrite_xid::xid = r.xmin AS by_rewriter
 FROM pg_repack_safe_rewrites r, pg_class c
 WHERE c.oid = 'wr_t'::regclass
 ORDER BY recorded;
 
 SELECT count(*) AS rows,
-       bool_and(t.xmin = r.rewrite_xid) AS rows_by_rewriter
+       bool_and(t.xmin = r.rewrite_xid::xid) AS rows_by_rewriter
 FROM wr_t t, pg_repack_safe_rewrites r
 WHERE r.relid = 'wr_t'::regclass;
 
-SELECT bool_and(t.xmin = r.rewrite_xid) AS rows_by_rewriter
+SELECT bool_and(t.xmin = r.rewrite_xid::xid) AS rows_by_rewriter
 FROM public.pg_temp_1 t, pg_repack_safe_rewrites r
 WHERE r.relid = 'public.pg_temp_1'::regclass;
 

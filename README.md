@@ -19,9 +19,14 @@ PostgreSQL extension (description to come)
 
 ## Overview
 
-The extension is under construction. **It does not yet prevent any wrong
-result**, and with the library loaded it is not usable on a database that
-runs `REPACK (CONCURRENTLY)`; see the last point below.
+The extension is under construction. With the library in
+`shared_preload_libraries` and the extension created, it prevents the
+documented wrong result for queries: a query whose snapshot predates a
+committed `REPACK (CONCURRENTLY)` of a table it reads gets an error instead
+of an empty table. It does **not** yet cover `COPY ... TO` (and so
+`pg_dump`), standbys, or the other cases listed in
+[doc/research/fix-design.md](doc/research/fix-design.md), and records are
+never cleaned up yet.
 
 What exists so far:
 
@@ -33,13 +38,13 @@ What exists so far:
   relation. `REPACK (CONCURRENTLY)` is refused in a database where the
   extension is not created, and when its record table cannot be found or has
   been redefined;
-- a placeholder reader check. The check that compares records with the
-  reader's snapshot is not written, so with the library loaded **every query
-  in the database is refused while the record table is non-empty**, that is,
-  after any `REPACK (CONCURRENTLY)` of a table with data, until the table is
-  emptied with `TRUNCATE pg_repack_safe_rewrites`. Queries are also refused
-  if the extension exists but the table has been renamed, moved to another
-  schema, or dropped. That second refusal is off while the server runs in
+- the reader check: once a query holds its locks, it raises
+  `ERROR: cannot read table "..." with this snapshot` (SQLSTATE 40001, a
+  serialization failure: retry the transaction) when a table it reads has a
+  record whose `REPACK (CONCURRENTLY)` committed but is not visible to the
+  query's snapshot. `EXPLAIN` without `ANALYZE` is not checked, since it
+  reads no rows. Queries are also refused if the extension exists but the
+  record table has been renamed, moved to another schema, or dropped. That second refusal is off while the server runs in
   binary-upgrade mode (`pg_upgrade`, or a server started by hand with `-b`),
   because `pg_upgrade` restores the extension before its table.
   `REPACK (CONCURRENTLY)` is refused whenever the extension exists and the
