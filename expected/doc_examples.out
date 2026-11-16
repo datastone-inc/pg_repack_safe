@@ -8,3 +8,23 @@ SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_repack_safe';
 (1 row)
 
 DROP EXTENSION pg_repack_safe;
+-- README.md, Removing the extension
+CREATE EXTENSION pg_repack_safe;
+CREATE TABLE de_t (id int PRIMARY KEY);
+INSERT INTO de_t SELECT generate_series(1, 3);
+REPACK (CONCURRENTLY) de_t;
+-- Step 2: no snapshot here predates the record.
+SELECT pid, datname, backend_xmin
+FROM pg_stat_activity
+WHERE backend_xmin IS NOT NULL
+  AND age(backend_xmin) >= (SELECT age(max(rewrite_xid)::xid)
+                            FROM pg_repack_safe_rewrites);
+ pid | datname | backend_xmin 
+-----+---------+--------------
+(0 rows)
+
+-- Step 3.
+SET pg_repack_safe.allow_unprotected_drop = on;
+DROP EXTENSION pg_repack_safe;
+RESET pg_repack_safe.allow_unprotected_drop;
+DROP TABLE de_t;

@@ -275,8 +275,10 @@ any storage change it did not recognise. This variant is silent on any rewrite
 the writer side did not record, so safety rests on the writer census above.
 Reason: the developer ruled spurious errors on MVCC-safe rewrites and new
 tables unacceptable (2026-11-15). Remaining fail-open cases:
-- library not preloaded on the primary: REPACK runs unrecorded, and an
-  unloaded library cannot check for itself;
+- library never loaded in the primary backend that runs REPACK: it runs
+  unrecorded, and an unloaded library cannot check for itself (a backend
+  that loaded it other than through `shared_preload_libraries` refuses,
+  step 9; `t/009_not_preloaded.pl` pins the rest);
 - library not loaded on a standby: the record replicates but nothing reads it
   (see candidate I);
 - readers that bypass the executor and COPY;
@@ -482,7 +484,7 @@ order unless noted.
   does not set. Run the isolation specs against a temporary cluster and leave
   that cluster alone. Check: the existing specs pass unchanged there.
   Done: `ISOLATION_OPTS` runs them on a temporary instance with
-  `specs/isolation.conf`; a probe spec on that instance showed
+  `specs/isolation.conf` (now `test/temp_instance.conf`); a probe spec on that instance showed
   `shared_preload_libraries = pg_repack_safe` and `wal_level = replica`. The
   `REGRESS` suite still runs on the configured server without the library
   preloaded.
@@ -640,10 +642,50 @@ order unless noted.
   lock. With the COPY check removed, every relation-COPY case fails, and the
   READ COMMITTED COPY returns no rows and no error, the stock wrong result;
   `COPY (query)` and row-level security still pass through ExecutorStart.
-- [ ] **9. Refusals.** REPACK (CONCURRENTLY) refused when the library is not
+- [x] **9. Refusals.** REPACK (CONCURRENTLY) refused when the library is not
   preloaded (the refusals for a missing extension, a missing record table
   and a redefined record table exist, step 3 and §6b); DROP, TRUNCATE and
   rewrites of the record table refused. Check: regression tests for each.
+  Done, with the developer's decisions of 2026-11-16:
+  - The REGRESS suite runs on a temporary preloaded instance, like the
+    isolation specs (`test/temp_instance.conf`); no suite uses the
+    developer's cluster.
+  - REPACK (CONCURRENTLY) is refused unless `_PG_init` ran during
+    `process_shared_preload_libraries` (`t/009_not_preloaded.pl`: LOAD and
+    `session_preload_libraries` refused). A backend that never loads the
+    library cannot be stopped: REPACK does not fire event triggers
+    (`cmdtaglist.h:199`), so the extension cannot make it load the library.
+    That gap is pinned in the same test.
+  - While the record table has any block: OAT_DROP of the record table,
+    of either of its triggers or of the extension, by any route, and
+    OAT_TRUNCATE of the table, are refused unless a superuser sets
+    `pg_repack_safe.allow_unprotected_drop`; the message names the set
+    (extension, record table, triggers) and the DETAIL the object reached,
+    since DROP EXTENSION reaches a trigger first, and the HINT points to
+    the README's removal procedure, whose standby check `t/007` exercises.
+    Always refused: a storage replacement of the record table other than
+    by VACUUM (FULL), CLUSTER or REPACK without CONCURRENTLY (developer
+    decision, 2026-11-16: those keep every record with its xmin and value,
+    so database-wide VACUUM FULL and REPACK keep working); that leaves
+    REPACK (CONCURRENTLY) and ALTER TABLE rewrites, which re-stamp rows and
+    can change values (ALTER COLUMN ... USING); UPDATE and DELETE of records,
+    by a BEFORE statement trigger enabled ALWAYS (MERGE and writable CTEs
+    included); any change that leaves either trigger not firing ALWAYS
+    (OAT_POST_ALTER on the trigger, `trigger.c:1842`). The triggers are
+    identified by their functions, so renaming them is allowed.
+  - The definition check now requires both triggers firing ALWAYS, so a
+    record table damaged by a route no hook stops (a backend without the
+    library) refuses every read and REPACK (CONCURRENTLY). Exemption,
+    extending the binary-upgrade decision of §6b: readers in binary-upgrade
+    mode skip the trigger requirement, because pg_restore creates the
+    triggers after the table and runs queries in between;
+    `t/003_pg_upgrade.pl` fails without it, on that error. REPACK
+    (CONCURRENTLY) is not exempt.
+  - `sql/protection.sql` covers each refusal, the override and its
+    superuser-only setting, and the fail-closed state after a trigger is
+    dropped while no record exists. Tests that remove the record table on
+    purpose (`reader_check`, `writer`, `storage_change`, `t/006`) set the
+    override.
 - [ ] **10. Standby enforcement.** Custom WAL record at the swap
   (`RM_EXPERIMENTAL_ID` for now). Check: a TAP test in which a standby
   without the library stops replay, and one with it errors the old-snapshot
@@ -697,7 +739,8 @@ order unless noted.
     database: REPACK (CONCURRENTLY) in a database with no record table
     should refuse.
 15. REPACK, TRUNCATE or DROP EXTENSION on the record table itself while
-    records are live.
+    records are live. Settled at step 9: refused (DROP and TRUNCATE unless
+    `pg_repack_safe.allow_unprotected_drop` is set by a superuser).
 16. Is REFRESH MATERIALIZED VIEW in scope as a fourth wrong-results path?
 
 17. An unprepared standby that starts replay at a checkpoint between the WAL

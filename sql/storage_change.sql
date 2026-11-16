@@ -15,7 +15,6 @@
  * the transient heap's side of a REPACK swap.
  */
 
-LOAD 'pg_repack_safe';
 -- REPACK (CONCURRENTLY) is refused in a database without the extension.
 CREATE EXTENSION pg_repack_safe;
 SET pg_repack_safe.trace_storage_changes = on;
@@ -64,4 +63,8 @@ VACUUM FULL sc_empty;
 
 DROP MATERIALIZED VIEW sc_mv;
 DROP TABLE sc_t, sc_empty, public.pg_temp_1;
+-- The REPACKs above left records, so removing the extension takes the
+-- superuser override (protection.sql tests the refusal).
+SET pg_repack_safe.allow_unprotected_drop = on;
 DROP EXTENSION pg_repack_safe;
+RESET pg_repack_safe.allow_unprotected_drop;

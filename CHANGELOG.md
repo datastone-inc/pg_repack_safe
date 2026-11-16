@@ -31,6 +31,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Per-backend cache of the records, so a query no longer reads the record
   table. The writer, and a statement trigger on the record table for changes
   made by hand, invalidate it.
+- `REPACK (CONCURRENTLY)` is refused unless the library was loaded through
+  `shared_preload_libraries`.
+- The record table is protected while it holds records: `DROP` of the
+  table, its triggers or the extension, and `TRUNCATE`, are refused unless a
+  superuser sets `pg_repack_safe.allow_unprotected_drop`; `UPDATE`, `DELETE`,
+  `REPACK (CONCURRENTLY)` and rewriting `ALTER TABLE` of it, and changes to
+  when its triggers fire are refused (`VACUUM FULL`, `CLUSTER` and `REPACK`
+  are allowed). The README describes how to remove the extension safely. A
+  record table without both triggers firing ALWAYS refuses every read and
+  `REPACK (CONCURRENTLY)`.
 - `REPACK (CONCURRENTLY)` is refused in a database without the extension, and
   when the record table does not have the definition the extension created.
 - `pg_repack_safe_rewrites` record table, created by the extension, always
@@ -48,4 +58,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `t/005_reader_guard.pl` (the error as a client sees it) and
   `t/006_record_xid8.pl` (records across an XID epoch) and
   `t/007_standby_reader.pl` (the guard on a hot standby) and
-  `t/008_copy_guard.pl` (COPY ... TO).
+  `t/008_copy_guard.pl` (COPY ... TO), `protection` regression test and
+  `t/009_not_preloaded.pl`.

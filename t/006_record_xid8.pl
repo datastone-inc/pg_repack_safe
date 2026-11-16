@@ -71,7 +71,9 @@ $reader->query_safe('ROLLBACK');
 $reader->quit;
 
 # A record from a transaction ID not yet assigned.
+# Emptying the record table takes the superuser override (protection.sql).
 $node->safe_psql('postgres', q{
+    SET pg_repack_safe.allow_unprotected_drop = on;
     TRUNCATE pg_repack_safe_rewrites;
     INSERT INTO pg_repack_safe_rewrites
         SELECT 't'::regclass, (pg_current_xact_id()::text::bigint + 1000000)::text::xid8;

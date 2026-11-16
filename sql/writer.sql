@@ -20,8 +20,6 @@
  * would have nowhere to record the rewrite.
  */
 
-LOAD 'pg_repack_safe';
-
 CREATE TABLE wr_t (id int PRIMARY KEY, v text);
 INSERT INTO wr_t SELECT g, repeat('x', 3000) || g FROM generate_series(1, 3) g;
 CREATE TABLE wr_empty (id int PRIMARY KEY);
@@ -92,5 +90,9 @@ SELECT a.amname
 FROM pg_class c JOIN pg_am a ON a.oid = c.relam
 WHERE c.oid = 'pg_repack_safe_rewrites'::regclass;
 
+-- The REPACKs above left records, so removing the extension takes the
+-- superuser override (protection.sql tests the refusal).
+SET pg_repack_safe.allow_unprotected_drop = on;
 DROP EXTENSION pg_repack_safe;
+RESET pg_repack_safe.allow_unprotected_drop;
 DROP TABLE wr_t, wr_empty, wr_deleted, public.pg_temp_1;

@@ -1,0 +1,128 @@
+/*
+ * Copyright (c) 2026 dataStone Inc.
+ * SPDX-License-Identifier: MIT
+ */
+
+/**
+ * @file protection.sql
+ * @brief Operations refused on the record table (fix-design.md, step 9)
+ *
+ * Records are the only protection old snapshots have, and they are never
+ * deleted. While the record table holds any row version:
+ * - DROP of the record table or the extension, by any route, and TRUNCATE
+ *   of the record table are refused unless a superuser sets
+ *   pg_repack_safe.allow_unprotected_drop;
+ * - rewrites of the record table other than VACUUM FULL, CLUSTER and REPACK
+ *   without CONCURRENTLY, which keep every record unchanged, are refused:
+ *   REPACK (CONCURRENTLY) and rewriting ALTER TABLE;
+ * - UPDATE and DELETE of records are refused, by any route (MERGE, a
+ *   writable CTE); INSERT is allowed.
+ * Changing when the record table's triggers fire is refused always, and
+ * dropping them follows the DROP rule: they carry the cache invalidation and
+ * the UPDATE/DELETE refusal. A record table without both triggers, firing
+ * ALWAYS, refuses every read and REPACK (CONCURRENTLY).
+ */
+
+CREATE EXTENSION pg_repack_safe;
+
+-- No record yet: dropping the extension is allowed.
+DROP EXTENSION pg_repack_safe;
+CREATE EXTENSION pg_repack_safe;
+
+CREATE TABLE pr_t (id int PRIMARY KEY);
+INSERT INTO pr_t SELECT generate_series(1, 5);
+REPACK (CONCURRENTLY) pr_t;
+SELECT count(*) AS records FROM pg_repack_safe_rewrites;
+
+-- DROP and TRUNCATE: refused. (DROP TABLE of an extension member is
+-- refused by PostgreSQL itself; the detached case below reaches this
+-- extension's refusal.)
+DROP TABLE pg_repack_safe_rewrites;
+TRUNCATE pg_repack_safe_rewrites;
+TRUNCATE pr_t, pg_repack_safe_rewrites;
+DROP EXTENSION pg_repack_safe;
+DROP EXTENSION pg_repack_safe CASCADE;
+-- Detached from the extension, then dropped, or the extension dropped:
+-- refused.
+ALTER EXTENSION pg_repack_safe DROP TABLE pg_repack_safe_rewrites;
+DROP TABLE pg_repack_safe_rewrites;
+DROP EXTENSION pg_repack_safe CASCADE;
+ALTER EXTENSION pg_repack_safe ADD TABLE pg_repack_safe_rewrites;
+
+-- MVCC-safe rewrites, also database-wide, are allowed and keep every
+-- record; REPACK (CONCURRENTLY) and ALTER TABLE rewrites are refused.
+SELECT relid = 'pr_t'::regclass AS pr_t_record FROM pg_repack_safe_rewrites;
+VACUUM pg_repack_safe_rewrites;
+VACUUM FULL pg_repack_safe_rewrites;
+REPACK pg_repack_safe_rewrites;
+VACUUM FULL;
+REPACK;
+SELECT relid = 'pr_t'::regclass AS pr_t_record FROM pg_repack_safe_rewrites;
+ALTER TABLE pg_repack_safe_rewrites
+    ALTER COLUMN relid TYPE oid USING (relid::text)::oid;
+-- PostgreSQL refuses this one itself (no identity index); were it to run,
+-- the hook would refuse its swap like the ALTER TABLE rewrite above.
+REPACK (CONCURRENTLY) pg_repack_safe_rewrites;
+
+-- UPDATE and DELETE: refused by any route. INSERT is allowed.
+UPDATE pg_repack_safe_rewrites SET relid = 0;
+DELETE FROM pg_repack_safe_rewrites;
+WITH d AS (DELETE FROM pg_repack_safe_rewrites RETURNING 1)
+SELECT count(*) FROM d;
+MERGE INTO pg_repack_safe_rewrites r
+USING (VALUES (1)) v(x) ON true
+WHEN MATCHED THEN DELETE;
+INSERT INTO pg_repack_safe_rewrites VALUES (0, '1');
+SELECT count(*) AS records FROM pg_repack_safe_rewrites;
+
+-- The triggers: disabling, changing when they fire, or dropping them is
+-- refused, whatever the spelling.
+ALTER TABLE pg_repack_safe_rewrites
+    DISABLE TRIGGER pg_repack_safe_rewrites_changed;
+ALTER TABLE pg_repack_safe_rewrites DISABLE TRIGGER ALL;
+ALTER TABLE pg_repack_safe_rewrites DISABLE TRIGGER USER;
+ALTER TABLE pg_repack_safe_rewrites
+    ENABLE TRIGGER pg_repack_safe_rewrites_protected;
+ALTER TABLE pg_repack_safe_rewrites
+    ENABLE REPLICA TRIGGER pg_repack_safe_rewrites_changed;
+DROP TRIGGER pg_repack_safe_rewrites_changed ON pg_repack_safe_rewrites;
+DROP TRIGGER pg_repack_safe_rewrites_protected ON pg_repack_safe_rewrites;
+-- Renaming a trigger changes nothing it does: allowed.
+ALTER TRIGGER pg_repack_safe_rewrites_changed ON pg_repack_safe_rewrites
+    RENAME TO pr_renamed;
+ALTER TRIGGER pr_renamed ON pg_repack_safe_rewrites
+    RENAME TO pg_repack_safe_rewrites_changed;
+-- Re-enabling as ALWAYS is a no-op: allowed.
+ALTER TABLE pg_repack_safe_rewrites
+    ENABLE ALWAYS TRIGGER pg_repack_safe_rewrites_changed;
+
+-- The override is for superusers only.
+CREATE ROLE pr_user;
+SET ROLE pr_user;
+SET pg_repack_safe.allow_unprotected_drop = on;
+RESET ROLE;
+DROP ROLE pr_user;
+
+-- With the override, DROP and TRUNCATE are allowed; ALTER TABLE rewrites,
+-- UPDATE, DELETE and the triggers stay refused.
+SET pg_repack_safe.allow_unprotected_drop = on;
+ALTER TABLE pg_repack_safe_rewrites
+    ALTER COLUMN relid TYPE oid USING (relid::text)::oid;
+DELETE FROM pg_repack_safe_rewrites;
+ALTER TABLE pg_repack_safe_rewrites DISABLE TRIGGER ALL;
+TRUNCATE pg_repack_safe_rewrites;
+INSERT INTO pg_repack_safe_rewrites VALUES (0, '1');
+DROP EXTENSION pg_repack_safe;
+RESET pg_repack_safe.allow_unprotected_drop;
+
+-- Without records, dropping a trigger is allowed, and then every read and
+-- every REPACK (CONCURRENTLY) is refused until the extension is re-created:
+-- the same state a backend without the library could leave behind.
+CREATE EXTENSION pg_repack_safe;
+DROP TRIGGER pg_repack_safe_rewrites_protected ON pg_repack_safe_rewrites;
+SELECT count(*) AS refused FROM pr_t;
+REPACK (CONCURRENTLY) pr_t;
+DROP EXTENSION pg_repack_safe;
+SELECT count(*) AS passes FROM pr_t;
+
+DROP TABLE pr_t;

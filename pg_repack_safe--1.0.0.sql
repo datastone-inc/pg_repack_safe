@@ -43,3 +43,21 @@ CREATE TRIGGER pg_repack_safe_rewrites_changed
 
 ALTER TABLE pg_repack_safe_rewrites
     ENABLE ALWAYS TRIGGER pg_repack_safe_rewrites_changed;
+
+-- Records are never updated or deleted: an older snapshot, on this server
+-- or on a standby, may rely on any of them. The library also refuses DROP,
+-- TRUNCATE and rewrites of the table, and changes to these triggers.
+CREATE FUNCTION pg_repack_safe_records_protected()
+RETURNS trigger
+AS 'MODULE_PATHNAME'
+LANGUAGE C;
+
+REVOKE ALL ON FUNCTION pg_repack_safe_records_protected() FROM PUBLIC;
+
+CREATE TRIGGER pg_repack_safe_rewrites_protected
+    BEFORE UPDATE OR DELETE ON pg_repack_safe_rewrites
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION pg_repack_safe_records_protected();
+
+ALTER TABLE pg_repack_safe_rewrites
+    ENABLE ALWAYS TRIGGER pg_repack_safe_rewrites_protected;

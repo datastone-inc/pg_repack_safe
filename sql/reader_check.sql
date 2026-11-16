@@ -17,7 +17,10 @@
  * cannot be found; in that state REPACK (CONCURRENTLY) is refused as well.
  */
 
-LOAD 'pg_repack_safe';
+-- This test truncates, renames, moves and drops the record table to reach
+-- the reader's lookup failures. protection.sql tests the refusals of those
+-- operations, so the superuser override is on here.
+SET pg_repack_safe.allow_unprotected_drop = on;
 
 -- Extension absent: no verdict is needed, the query passes.
 SELECT 1 AS passes;
@@ -89,8 +92,8 @@ SELECT 1 AS passes;
 
 -- Record table detached, then the extension dropped: the table survives
 -- and is no longer a record table, so a row in it refuses nothing. Its
--- cache-invalidation trigger depends on the extension's trigger function,
--- so the drop needs CASCADE and removes the trigger.
+-- triggers depend on the extension's trigger functions, so the drop needs
+-- CASCADE and removes them.
 CREATE EXTENSION pg_repack_safe;
 SELECT 1 AS passes;
 ALTER EXTENSION pg_repack_safe DROP TABLE pg_repack_safe_rewrites;
@@ -101,3 +104,5 @@ DROP TABLE pg_repack_safe_rewrites;
 
 DROP SCHEMA rc_other;
 DROP TABLE rc_t;
+
+RESET pg_repack_safe.allow_unprotected_drop;

@@ -98,6 +98,19 @@ $primary->safe_psql('postgres', 'REPACK (CONCURRENTLY) t');
 $primary->safe_psql('postgres', 'VACUUM pg_repack_safe_rewrites');
 $primary->wait_for_catchup($standby);
 
+# The README's check before removing the extension ("Removing the
+# extension", step 2) lists this standby session, and only on the standby.
+my $oldSnapshots = q{
+    SELECT pid FROM pg_stat_activity
+    WHERE backend_xmin IS NOT NULL
+      AND age(backend_xmin) >= (SELECT age(max(rewrite_xid)::xid)
+                                FROM pg_repack_safe_rewrites)};
+my $readerPid = $reader->query_safe('SELECT pg_backend_pid()');
+is($standby->safe_psql('postgres', $oldSnapshots), $readerPid,
+    'README check on the standby lists the old snapshot');
+is($primary->safe_psql('postgres', $oldSnapshots), '',
+    'README check on the primary does not see it');
+
 ($out, $err) = runIn($reader, 'SELECT count(*) FROM t');
 like($err, $guardError,
     'standby: old snapshot gets the error after the REPACK and a VACUUM');
