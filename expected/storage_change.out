@@ -9,17 +9,23 @@
  * Each statement that replaces a table's storage must produce exactly one
  * NOTICE for that table, with the old storage's block count, and only
  * REPACK (CONCURRENTLY) may be classified as an unsafe rewriter. Statements
- * that alter pg_class without replacing storage must produce none.
+ * that alter pg_class without replacing storage must produce none, and so
+ * must the replacement of storage created in the same transaction, such as
+ * the transient heap's side of a REPACK swap.
  */
 LOAD 'pg_repack_safe';
+-- REPACK (CONCURRENTLY) is refused in a database without the extension.
+CREATE EXTENSION pg_repack_safe;
 SET pg_repack_safe.trace_storage_changes = on;
 CREATE TABLE sc_t (id int PRIMARY KEY, v text);
 INSERT INTO sc_t SELECT g, 'row ' || g FROM generate_series(1, 3) g;
 CREATE TABLE sc_empty (id int PRIMARY KEY);
--- Creating a materialized view populates it through a swap of its own
--- still-empty storage, which is detected like any other.
+-- A user table with the name the transient heap of a REPACK would carry: it
+-- is reported like any other.
+CREATE TABLE public.pg_temp_1 (id int PRIMARY KEY);
+-- Creating a materialized view populates it through a swap of storage
+-- created in the same transaction: not reported.
 CREATE MATERIALIZED VIEW sc_mv AS SELECT g FROM generate_series(1, 3) g;
-NOTICE:  pg_repack_safe: storage of "sc_mv" replaced, old storage has 0 blocks, unsafe rewriter: no
 -- No storage change: no NOTICE.
 ALTER TABLE sc_t SET (fillfactor = 90);
 ALTER TABLE sc_t RENAME COLUMN v TO w;
@@ -33,6 +39,13 @@ REPACK sc_t;
 NOTICE:  pg_repack_safe: storage of "sc_t" replaced, old storage has 1 blocks, unsafe rewriter: no
 REPACK sc_t USING INDEX sc_t_pkey;
 NOTICE:  pg_repack_safe: storage of "sc_t" replaced, old storage has 1 blocks, unsafe rewriter: no
+VACUUM FULL public.pg_temp_1;
+NOTICE:  pg_repack_safe: storage of "pg_temp_1" replaced, old storage has 0 blocks, unsafe rewriter: no
+-- Other storage replacements, detected but not classified as unsafe.
+ALTER TABLE sc_t ALTER COLUMN extra TYPE bigint;
+NOTICE:  pg_repack_safe: storage of "sc_t" replaced, old storage has 1 blocks, unsafe rewriter: no
+REFRESH MATERIALIZED VIEW sc_mv;
+NOTICE:  pg_repack_safe: storage of "sc_mv" replaced, old storage has 1 blocks, unsafe rewriter: no
 -- REPACK (CONCURRENTLY) in each option spelling: unsafe rewriter.
 REPACK (CONCURRENTLY) sc_t USING INDEX sc_t_pkey;
 NOTICE:  pg_repack_safe: storage of "sc_t" replaced, old storage has 1 blocks, unsafe rewriter: yes
@@ -45,11 +58,6 @@ NOTICE:  pg_repack_safe: storage of "sc_t" replaced, old storage has 1 blocks, u
 -- An empty table: the old storage has zero blocks.
 REPACK (CONCURRENTLY) sc_empty USING INDEX sc_empty_pkey;
 NOTICE:  pg_repack_safe: storage of "sc_empty" replaced, old storage has 0 blocks, unsafe rewriter: yes
--- Other storage replacements, detected but not classified as unsafe.
-ALTER TABLE sc_t ALTER COLUMN extra TYPE bigint;
-NOTICE:  pg_repack_safe: storage of "sc_t" replaced, old storage has 1 blocks, unsafe rewriter: no
-REFRESH MATERIALIZED VIEW sc_mv;
-NOTICE:  pg_repack_safe: storage of "sc_mv" replaced, old storage has 1 blocks, unsafe rewriter: no
 -- TRUNCATE raises no OAT_POST_ALTER, so it is not detected here.
 TRUNCATE sc_t;
 -- The classification does not leak past a failed statement.
@@ -58,4 +66,5 @@ ERROR:  relation "sc_missing" does not exist
 VACUUM FULL sc_empty;
 NOTICE:  pg_repack_safe: storage of "sc_empty" replaced, old storage has 0 blocks, unsafe rewriter: no
 DROP MATERIALIZED VIEW sc_mv;
-DROP TABLE sc_t, sc_empty;
+DROP TABLE sc_t, sc_empty, public.pg_temp_1;
+DROP EXTENSION pg_repack_safe;

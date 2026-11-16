@@ -6,7 +6,7 @@ OBJS = src/pg_repack_safe.o
 DATA = pg_repack_safe--1.0.0.sql
 
 # doc_examples: validates SQL examples from README.md and doc/*.md
-REGRESS = doc_examples storage_change reader_check
+REGRESS = doc_examples storage_change reader_check writer
 
 # Concurrency cases: specs/*.spec, expected/*.out. They run on a temporary
 # instance built from the installed binaries, with the settings in

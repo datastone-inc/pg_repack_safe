@@ -305,8 +305,8 @@ The exemption cannot hide an unsafe rewrite, for two reasons:
 - The ProcessUtility hook refuses REPACK (CONCURRENTLY) when the extension
   exists and its record table cannot be found, with no binary-upgrade
   exemption (`reader_check` regression test; `t/003_pg_upgrade.pl` on a
-  server started with `-b`). The check runs when the statement starts; the
-  writer (step 3) must look the table up again at the swap.
+  server started with `-b`). The check runs when the statement starts and
+  locks the record table, so it is still in place at the swap.
 - Stock PostgreSQL refuses to create the new heap in binary-upgrade mode
   unless its OID was preset: "pg_class heap OID value not set when in binary
   upgrade mode" (`heap.c:1556-1559`), seen in `t/003_pg_upgrade.pl` when
@@ -492,7 +492,7 @@ order unless noted.
   of `t/001` failing; the controls passed. isolationtester prints only the
   primary message (`isolationtester.c:1024-1031`) and pg_dump does not print
   the SQLSTATE, so none of the three pins 40001.
-- [ ] **3. Writer.** At the swap, when the innermost statement is REPACK
+- [x] **3. Writer.** At the swap, when the innermost statement is REPACK
   (CONCURRENTLY) and the old storage has blocks, insert (table OID, XID) and
   the post-swap TOAST OID into the record table. Check: a regression test
   shows one record after REPACK (CONCURRENTLY), none for an empty table, none
@@ -501,6 +501,30 @@ order unless noted.
   `pg_temp_<oid>` name (`repack.c:1324`) the trace NOTICE filters on: a user
   table can carry that name and would get no record. Check: the regression
   test includes a user table named `pg_temp_1`.
+  Done (`sql/writer.sql`). The transient heap is the side of the swap whose
+  old storage was created in this transaction: that storage is queued for
+  deletion at abort (`storage.c:168`; pre-existing storage only ever at
+  commit, `storage.c:216`), read through `smgrGetPendingDeletes`. The
+  relation's own "created here" flag cannot serve: `swap_relation_files`
+  copies the target's `rd_createSubid` onto the transient heap
+  (`repack.c:~1789`), and a probe showed the transient heap recorded under
+  that rule. The trace NOTICE uses the same rule (developer decision,
+  2026-11-16), so it no longer reports CREATE MATERIALIZED VIEW. The old
+  storage's blocks are counted through the relation cache, which still
+  points at the old storage until the next CCI (`RelationAssumeNewRelfilelocator`
+  only sets subtransaction IDs, `relcache.c:4026`); the writer checks that
+  rather than assuming it, and refuses on a mismatch. A table whose rows
+  were all deleted is recorded and its new storage is empty, which shows the
+  old storage is the one counted. The record table is locked
+  (RowExclusiveLock) and its definition checked when the statement starts,
+  so no lock is taken mid-swap and the table cannot be dropped, renamed or
+  moved before the record is written; `USING heap` fixes its access method.
+  Moved here from step 9 (developer decision, 2026-11-16): REPACK
+  (CONCURRENTLY) is refused in a database without the extension.
+  Until step 4, the placeholder reader refuses every query in a backend with
+  the library loaded once a record exists. That is why the isolation specs,
+  `t/001`, `t/003` and `t/004` now fail, each on that refusal only; the
+  regression suite passes.
 - [ ] **4. Reader.** Replace the "cannot check" refusal with the
   `SnapshotAny` scan and the error text of §6b. Check: the two isolation
   specs from step 2 pass, and a TAP test pins SQLSTATE 40001, DETAIL and
@@ -526,8 +550,8 @@ order unless noted.
   before checking. Check: interleaving 8, plus a partitioned table, and
   `t/001_repack_pg_dump.pl` passes.
 - [ ] **9. Refusals.** REPACK (CONCURRENTLY) refused when the library is not
-  preloaded or the extension is missing in the database (the refusal for
-  a missing record table exists, §6b); DROP, TRUNCATE and
+  preloaded (the refusals for a missing extension, a missing record table
+  and a redefined record table exist, step 3 and §6b); DROP, TRUNCATE and
   rewrites of the record table refused. Check: regression tests for each.
 - [ ] **10. Standby enforcement.** Custom WAL record at the swap
   (`RM_EXPERIMENTAL_ID` for now). Check: a TAP test in which a standby

@@ -13,11 +13,13 @@
 
 -- One row per unsafe rewrite: the rewritten relation and the rewriter's
 -- transaction ID. Readers whose snapshot does not see rewrite_xid as
--- committed must not read relid.
+-- committed must not read relid. The reader scans the table with heap
+-- semantics (SnapshotAny), so the access method is fixed here rather than
+-- taken from default_table_access_method.
 CREATE TABLE pg_repack_safe_rewrites
 (
     relid oid NOT NULL,
     rewrite_xid xid NOT NULL
-);
+) USING heap;
 
 REVOKE ALL ON TABLE pg_repack_safe_rewrites FROM PUBLIC;
