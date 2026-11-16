@@ -29,6 +29,12 @@ What exists so far:
 - an empty record table, `pg_repack_safe_rewrites`, that the guard will use.
   Nothing writes to it yet. With the library loaded, queries are refused if
   it is ever non-empty, because the check that would read it is not written.
+  Queries are also refused if the extension exists but the table has been
+  renamed, moved to another schema, or dropped. That second refusal is off
+  while the server runs in binary-upgrade mode (`pg_upgrade`, or a server
+  started by hand with `-b`), because `pg_upgrade` restores the extension
+  before its table. `REPACK (CONCURRENTLY)` is refused whenever the extension
+  exists and the table cannot be found, in that mode too.
 
 The design is in [doc/research/fix-design.md](doc/research/fix-design.md).
 

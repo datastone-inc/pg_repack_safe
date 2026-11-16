@@ -69,6 +69,8 @@ static bool inUnsafeRewriter = false;
 static bool recordTableOidKnown = false;
 static Oid  recordTableOid = InvalidOid;
 
+static Oid  lookupRecordTable(bool forReader);
+
 /**
  * @brief Read a relation's relfilenode as the current transaction left it
  * @param relid OID of the relation
@@ -137,8 +139,7 @@ noteRelationAltered(Oid relid)
      * and not the transient heap on the other side of the swap, whose name
      * is not stable across runs.
      */
-    if (traceStorageChanges &&
-        (relkind == RELKIND_RELATION || relkind == RELKIND_MATVIEW) &&
+    if ((relkind == RELKIND_RELATION || relkind == RELKIND_MATVIEW) &&
         strncmp(NameStr(relname), TRANSIENT_HEAP_PREFIX,
                 strlen(TRANSIENT_HEAP_PREFIX)) != 0)
     {
@@ -172,8 +173,9 @@ objectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
     if (prevObjectAccessHook != NULL)
         prevObjectAccessHook(access, classId, objectId, subId, arg);
 
-    if (access == OAT_POST_ALTER && classId == RelationRelationId &&
-        subId == 0)
+    /* The detection's only consumer is the trace NOTICE. */
+    if (traceStorageChanges && access == OAT_POST_ALTER &&
+        classId == RelationRelationId && subId == 0)
         noteRelationAltered(objectId);
 }
 
@@ -184,6 +186,11 @@ objectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
  *
  * Mirrors the option loop in ExecRepack (repack.c), the only place that
  * sets CLUOPT_CONCURRENT.
+ *
+ * A CONCURRENTLY value that is not a Boolean raises an error here, through
+ * the same defGetBoolean call ExecRepack makes. The statement fails either
+ * way; when it has a second fault, this error is reported instead of the one
+ * ExecRepack would have reached first.
  */
 static bool
 isConcurrentRepack(Node *parsetree)
@@ -222,8 +229,18 @@ processUtilityHook(PlannedStmt *pstmt, const char *queryString,
                    DestReceiver *dest, QueryCompletion *qc)
 {
     bool        savedInUnsafeRewriter = inUnsafeRewriter;
+    bool        unsafeRewriter = isConcurrentRepack(pstmt->utilityStmt);
 
-    inUnsafeRewriter = isConcurrentRepack(pstmt->utilityStmt);
+    /*
+     * An unsafe rewrite must be recorded. If the extension exists but its
+     * record table cannot be found, there is nowhere to record it, so the
+     * lookup raises an error here, in binary-upgrade mode too. This runs
+     * before the flag is set so that the error leaves the flag unchanged.
+     */
+    if (unsafeRewriter)
+        (void) lookupRecordTable(false);
+
+    inUnsafeRewriter = unsafeRewriter;
 
     PG_TRY();
     {
@@ -259,23 +276,63 @@ recordTableCacheCallback(Datum arg, int cacheid, uint32 hashvalue)
 
 /**
  * @brief Find the unsafe-rewrite record table in the current database
+ * @param forReader True when called for the reader check, which alone is
+ *        exempt from the missing-table error in binary-upgrade mode
  * @return OID of the record table, or InvalidOid when the extension is not
  *         created in this database
+ *
+ * Invariant: the returned OID comes from lookups during which no pg_class
+ * invalidation arrived. The catalog lookups can process invalidation
+ * messages, so the cache is marked valid before they run; a callback that
+ * fires during them clears the mark and the lookup is repeated.
+ *
+ * An extension without its record table is catalog state that neither the
+ * reader check nor an unsafe rewriter can work with, so it raises an error.
  */
 static Oid
-lookupRecordTable(void)
+lookupRecordTable(bool forReader)
 {
-    Oid         extensionOid;
+    while (!recordTableOidKnown)
+    {
+        Oid         extensionOid;
+        Oid         tableOid = InvalidOid;
 
-    if (recordTableOidKnown)
-        return recordTableOid;
+        CHECK_FOR_INTERRUPTS();
 
-    recordTableOid = InvalidOid;
-    extensionOid = get_extension_oid(EXTENSION_NAME, true);
-    if (OidIsValid(extensionOid))
-        recordTableOid = get_relname_relid(RECORD_TABLE_NAME,
-                                           get_extension_schema(extensionOid));
-    recordTableOidKnown = true;
+        recordTableOidKnown = true;
+        extensionOid = get_extension_oid(EXTENSION_NAME, true);
+        if (OidIsValid(extensionOid))
+            tableOid = get_relname_relid(RECORD_TABLE_NAME,
+                                         get_extension_schema(extensionOid));
+        if (!recordTableOidKnown)
+            continue;
+
+        if (OidIsValid(extensionOid) && !OidIsValid(tableOid))
+        {
+            /* Not cached: every query looks again until the state is fixed. */
+            recordTableOidKnown = false;
+
+            /*
+             * Exemption, decided by the developer (fix-design.md §6b): in
+             * binary-upgrade mode pg_dump creates the extension empty
+             * (pg_dump.c, binary_upgrade_create_empty_extension) and adds the
+             * record table in a later statement, so this state is expected
+             * and the queries in between must pass. Only superusers can
+             * connect in that mode (postinit.c). REPACK (CONCURRENTLY) is
+             * not exempt, so no unsafe rewrite can happen in this state.
+             */
+            if (forReader && IsBinaryUpgrade)
+                return InvalidOid;
+
+            ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                     errmsg("pg_repack_safe cannot find its record table"),
+                     errdetail("The extension \"%s\" exists in this database, but the table \"%s\" is not in its schema.",
+                               EXTENSION_NAME, RECORD_TABLE_NAME),
+                     errhint("Restore the table's name and schema, or drop and re-create the extension.")));
+        }
+        recordTableOid = tableOid;
+    }
 
     return recordTableOid;
 }
@@ -291,18 +348,27 @@ lookupRecordTable(void)
 static void
 checkUnsafeRewriteRecords(void)
 {
-    Oid         tableOid = lookupRecordTable();
     Relation    rel;
     BlockNumber blocks;
 
-    if (!OidIsValid(tableOid))
-        return;
-
-    rel = try_table_open(tableOid, AccessShareLock);
-    if (rel == NULL)
+    /*
+     * Taking the lock processes pending invalidation messages. Accept the
+     * relation only if the cached OID is still valid once the lock is held;
+     * otherwise look the table up again.
+     */
+    for (;;)
     {
+        Oid         tableOid = lookupRecordTable(true);
+
+        if (!OidIsValid(tableOid))
+            return;
+
+        rel = try_table_open(tableOid, AccessShareLock);
+        if (rel != NULL && recordTableOidKnown)
+            break;
+        if (rel != NULL)
+            table_close(rel, AccessShareLock);
         recordTableOidKnown = false;
-        return;
     }
     blocks = RelationGetNumberOfBlocks(rel);
     table_close(rel, AccessShareLock);
@@ -351,7 +417,14 @@ _PG_init(void)
                              NULL, NULL, NULL);
     MarkGUCPrefixReserved("pg_repack_safe");
 
+    /*
+     * The cached record table OID is derived from pg_extension (existence
+     * and schema of the extension) and pg_class (the table by name), so a
+     * change to either catalog clears it.
+     */
     CacheRegisterSyscacheCallback(RELNAMENSP, recordTableCacheCallback,
+                                  (Datum) 0);
+    CacheRegisterSyscacheCallback(EXTENSIONOID, recordTableCacheCallback,
                                   (Datum) 0);
 
     prevObjectAccessHook = object_access_hook;

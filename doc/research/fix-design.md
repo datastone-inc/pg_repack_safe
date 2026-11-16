@@ -278,7 +278,40 @@ tables unacceptable (2026-11-15). Remaining fail-open cases:
   unloaded library cannot check for itself;
 - library not loaded on a standby: the record replicates but nothing reads it
   (see candidate I);
-- readers that bypass the executor and COPY.
+- readers that bypass the executor and COPY;
+- binary-upgrade mode (below).
+
+**Binary-upgrade exemption (developer decision, 2026-11-16).** The reader
+check refuses a query when the extension exists but its record table cannot
+be found. In binary-upgrade mode that refusal is skipped and the query
+passes. Reason: pg_dump creates the extension empty with
+`binary_upgrade_create_empty_extension` (`pg_dump.c:12205`) and adds the
+record table in a later statement, so the refusal made `pg_restore` fail and
+blocked pg_upgrade of any database with the extension
+(`t/003_pg_upgrade.pl` reproduced it). Why it is acceptable: only superusers
+can connect in that mode (`postinit.c:941`), the server listens only on
+pg_upgrade's private socket (`pg_upgrade/server.c:182`), and no snapshot
+survives the upgrade. The refusal for a non-empty record table is not
+exempted.
+
+The mode is a postmaster option, not a pg_upgrade private: `-b` sets
+`IsBinaryUpgrade` (`postmaster.c:612`), so an operator can start any cluster
+with `pg_ctl start -o "-b"`, and then the exemption lasts as long as that
+server runs and applies to TCP connections too, if the configuration allows
+them.
+
+The exemption cannot hide an unsafe rewrite, for two reasons:
+- The ProcessUtility hook refuses REPACK (CONCURRENTLY) when the extension
+  exists and its record table cannot be found, with no binary-upgrade
+  exemption (`reader_check` regression test; `t/003_pg_upgrade.pl` on a
+  server started with `-b`). The check runs when the statement starts; the
+  writer (step 3) must look the table up again at the swap.
+- Stock PostgreSQL refuses to create the new heap in binary-upgrade mode
+  unless its OID was preset: "pg_class heap OID value not set when in binary
+  upgrade mode" (`heap.c:1556-1559`), seen in `t/003_pg_upgrade.pl` when
+  REPACK (CONCURRENTLY) ran under `-b` with the record table present. A
+  superuser can preset the OIDs with the `binary_upgrade_set_next_*`
+  functions, so this alone is not a guarantee.
 
 ### 6c. Build questions investigated 2026-11-15
 
@@ -450,7 +483,11 @@ order unless noted.
   (CONCURRENTLY) and the old storage has blocks, insert (table OID, XID) and
   the post-swap TOAST OID into the record table. Check: a regression test
   shows one record after REPACK (CONCURRENTLY), none for an empty table, none
-  after VACUUM FULL, none after a failed REPACK.
+  after VACUUM FULL, none after a failed REPACK. The writer must tell the
+  rewritten table from the transient heap by meaning, not by the
+  `pg_temp_<oid>` name (`repack.c:1324`) the trace NOTICE filters on: a user
+  table can carry that name and would get no record. Check: the regression
+  test includes a user table named `pg_temp_1`.
 - [ ] **4. Reader.** Replace the "cannot check" refusal with the
   `SnapshotAny` scan and the error text of §6b. Check: the three tests from
   step 2 pass.
@@ -471,7 +508,8 @@ order unless noted.
 - [ ] **8. COPY guard.** ProcessUtility locks the relation and its partitions
   before checking. Check: interleaving 8, plus a partitioned table.
 - [ ] **9. Refusals.** REPACK (CONCURRENTLY) refused when the library is not
-  preloaded or the extension is missing in the database; DROP, TRUNCATE and
+  preloaded or the extension is missing in the database (the refusal for
+  a missing record table exists, §6b); DROP, TRUNCATE and
   rewrites of the record table refused. Check: regression tests for each.
 - [ ] **10. Standby enforcement.** Custom WAL record at the swap
   (`RM_EXPERIMENTAL_ID` for now). Check: a TAP test in which a standby
