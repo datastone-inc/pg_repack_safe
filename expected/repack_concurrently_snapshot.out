@@ -9,11 +9,7 @@ count
 
 step p_repack: REPACK (CONCURRENTLY) accounts USING INDEX accounts_pkey;
 step r_read: SELECT count(*), sum(balance) FROM accounts;
-count|sum
------+---
-    0|   
-(1 row)
-
+ERROR:  cannot read table "accounts" with this snapshot
 step r_commit: COMMIT;
 step p_check: SELECT count(*), sum(balance) FROM accounts;
 count|sum

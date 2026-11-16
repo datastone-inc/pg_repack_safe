@@ -1,16 +1,19 @@
 # Copyright (c) 2026 dataStone Inc.
 # SPDX-License-Identifier: MIT
 #
-# pg_dump against REPACK (CONCURRENTLY) on stock PostgreSQL 19.
+# pg_dump against REPACK (CONCURRENTLY).
 #
 # pg_dump reads every table under one REPEATABLE READ snapshot. A table that
 # REPACK (CONCURRENTLY) rewrites and commits after that snapshot was taken,
-# but before pg_dump locks the table, is dumped with no rows: pg_dump exits 0
-# and the dump silently lacks the table's data.
+# but before pg_dump locks the table, is dumped with no rows on stock
+# PostgreSQL 19: pg_dump exits 0 and the dump silently lacks the table's data.
 #
-# The tests marked "WRONG RESULT" pin the stock behaviour; they assert the
-# empty dump. When pg_repack_safe prevents it, they flip to assert either a
-# complete dump or a refused REPACK.
+# With pg_repack_safe preloaded and created, the cases marked "GUARDED"
+# expect pg_dump to fail with the reader guard's error instead. pg_dump reads
+# the table with COPY ... TO stdout (pg_dump.c:2429), which scans the table
+# without the executor (copyto.c:1362, copyto.c:1396), so these cases depend
+# on the COPY guard as well as the executor guard. pg_dump prints only the
+# primary message, so the SQLSTATE is not pinned here.
 
 use strict;
 use warnings FATAL => 'all';
@@ -24,14 +27,18 @@ my $rows = 5;
 
 my $node = PostgreSQL::Test::Cluster->new('main');
 $node->init(allows_streaming => 1);
+$node->append_conf('postgresql.conf',
+    "shared_preload_libraries = 'pg_repack_safe'\n");
 $node->start;
 
 $node->safe_psql('postgres', qq{
+    CREATE EXTENSION pg_repack_safe;
     CREATE TABLE customers (id int PRIMARY KEY, name text NOT NULL);
     INSERT INTO customers SELECT g, 'customer ' || g FROM generate_series(1, $rows) g;
 });
 
 my $repack_sql = 'REPACK (CONCURRENTLY) customers USING INDEX customers_pkey;';
+my $guard_error = qr/cannot read table "customers" with this snapshot/;
 
 # Number of data rows in a plain-format, data-only dump of customers.
 sub dumpedRows
@@ -67,10 +74,12 @@ sub dumpArgs
 
     $node->safe_psql('postgres', $repack_sql);
 
-    my ($out, $err) = run_command([dumpArgs("--snapshot=$snapshot")]);
-    is($err, '', 'exported snapshot: pg_dump reports no error');
-    is(dumpedRows($out), 0,
-        'WRONG RESULT: dump with a pre-REPACK exported snapshot has no rows');
+    my ($out, $err) = ('', '');
+    my $ok = IPC::Run::run([dumpArgs("--snapshot=$snapshot")],
+        '>', \$out, '2>', \$err);
+    ok(!$ok, 'GUARDED: pg_dump with a pre-REPACK exported snapshot fails');
+    like($err, $guard_error,
+        'GUARDED: exported snapshot: pg_dump reports the guard error');
 
     $holder->query_safe('COMMIT');
     $holder->quit;
@@ -110,10 +119,10 @@ sub dumpArgs
     $blocker->quit;
 
     $dump->finish;
-    is($dump->result(0), 0, 'concurrent: pg_dump exits 0');
-    is($err, '', 'concurrent: pg_dump reports no error');
-    is(dumpedRows($out), 0,
-        'WRONG RESULT: pg_dump started during REPACK dumps no rows');
+    isnt($dump->result(0), 0,
+        'GUARDED: pg_dump started during REPACK fails');
+    like($err, $guard_error,
+        'GUARDED: concurrent: pg_dump reports the guard error');
 
     $repacker->quit;
 }

@@ -480,11 +480,18 @@ order unless noted.
   `shared_preload_libraries = pg_repack_safe` and `wal_level = replica`. The
   `REGRESS` suite still runs on the configured server without the library
   preloaded.
-- [ ] **2. Flip the reproducers.** Change the expected output of
+- [x] **2. Flip the reproducers.** Change the expected output of
   `repack_concurrently_snapshot`, `repack_concurrently_cursor` and
   `t/001_repack_pg_dump.pl` from the wrong rows to the 40001 error (pg_dump:
   a failed dump). Controls stay unchanged. Check: the three tests fail, for
   that reason only.
+  Done: the specs create the extension and expect `cannot read table "..."
+  with this snapshot` at `r_read` and `c_fetchall`; `t/001` preloads the
+  library and expects pg_dump to fail with that message. The run showed the
+  stock wrong rows at exactly those two steps and the four GUARDED subtests
+  of `t/001` failing; the controls passed. isolationtester prints only the
+  primary message (`isolationtester.c:1024-1031`) and pg_dump does not print
+  the SQLSTATE, so none of the three pins 40001.
 - [ ] **3. Writer.** At the swap, when the innermost statement is REPACK
   (CONCURRENTLY) and the old storage has blocks, insert (table OID, XID) and
   the post-swap TOAST OID into the record table. Check: a regression test
@@ -495,8 +502,12 @@ order unless noted.
   table can carry that name and would get no record. Check: the regression
   test includes a user table named `pg_temp_1`.
 - [ ] **4. Reader.** Replace the "cannot check" refusal with the
-  `SnapshotAny` scan and the error text of §6b. Check: the three tests from
-  step 2 pass.
+  `SnapshotAny` scan and the error text of §6b. Check: the two isolation
+  specs from step 2 pass, and a TAP test pins SQLSTATE 40001, DETAIL and
+  HINT (psql with `VERBOSITY verbose`). `t/001_repack_pg_dump.pl` still fails
+  here: pg_dump reads with `COPY ... TO stdout` (`pg_dump.c:2429`), which
+  scans without the executor (`copyto.c:1362`, `copyto.c:1396`); it passes at
+  step 8.
 - [ ] **5. Negative and edge tests.** Interleavings 7, 9, 11-16: no error
   after VACUUM FULL alone, GRANT alone, a table created after the snapshot,
   or an empty table; error after own DDL, after VACUUM FULL following REPACK,
@@ -512,7 +523,8 @@ order unless noted.
   warm cache still errors after a later REPACK; the loop timing of §6c shows
   the per-query cost near the flag test.
 - [ ] **8. COPY guard.** ProcessUtility locks the relation and its partitions
-  before checking. Check: interleaving 8, plus a partitioned table.
+  before checking. Check: interleaving 8, plus a partitioned table, and
+  `t/001_repack_pg_dump.pl` passes.
 - [ ] **9. Refusals.** REPACK (CONCURRENTLY) refused when the library is not
   preloaded or the extension is missing in the database (the refusal for
   a missing record table exists, §6b); DROP, TRUNCATE and
