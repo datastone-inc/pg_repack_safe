@@ -179,7 +179,8 @@ static Oid  recordCacheTable = InvalidOid;
 
 static Oid  lookupRecordTable(bool forReader);
 static Oid  lockRecordTableForWriter(void);
-static PlannedStmt *checkCopyTo(PlannedStmt *pstmt, bool readOnlyTree);
+static PlannedStmt *checkCopyTo(PlannedStmt *pstmt, bool readOnlyTree,
+                                List **attachLocked);
 
 /**
  * @brief Read a relation's storage as the current transaction left it
@@ -961,6 +962,7 @@ processUtilityHook(PlannedStmt *pstmt, const char *queryString,
 {
     Oid         recordTable = InvalidOid;
     bool        unsafeRewriter = isConcurrentRepack(pstmt->utilityStmt);
+    List       *attachLocked = NIL;
 
     /*
      * An unsafe rewrite must be recorded, so it runs only once the record
@@ -989,7 +991,7 @@ processUtilityHook(PlannedStmt *pstmt, const char *queryString,
         !((CopyStmt *) pstmt->utilityStmt)->is_from &&
         ((CopyStmt *) pstmt->utilityStmt)->relation != NULL)
     {
-        pstmt = checkCopyTo(pstmt, readOnlyTree);
+        pstmt = checkCopyTo(pstmt, readOnlyTree, &attachLocked);
         readOnlyTree = false;
     }
 
@@ -999,6 +1001,13 @@ processUtilityHook(PlannedStmt *pstmt, const char *queryString,
                   IsA(pstmt->utilityStmt, RepackStmt)),
                  pstmt, queryString, readOnlyTree, context, params, queryEnv,
                  dest, qc);
+
+    /*
+     * The COPY has scanned its partitions, so partitions may be attached
+     * again. After an error, the transaction's abort releases these locks.
+     */
+    foreach_oid(parent, attachLocked)
+        UnlockRelationOid(parent, ShareUpdateExclusiveLock);
 }
 
 /**
@@ -1120,18 +1129,6 @@ lookupRecordTable(bool forReader)
 }
 
 /**
- * @brief Check that the record table has the definition the writer expects
- * @param rel The record table, locked by the caller
- * @param forReader True when called for the reader check
- *
- * The writer forms its rows from this definition and the reader scans the
- * table with heap semantics, so any other definition is refused: two columns
- * (oid, xid8), the heap access method, and permanent storage, which survives
- * a crash and reaches standbys through WAL.
- */
-static bool isRecordTriggerFunction(Oid funcOid, const char *name);
-
-/**
  * @brief Tell whether the record table has one of its triggers, firing ALWAYS
  * @param rel The record table
  * @param functionName The trigger function the trigger must call
@@ -1161,6 +1158,16 @@ hasRecordTrigger(Relation rel, const char *functionName, bool before,
     return false;
 }
 
+/**
+ * @brief Check that the record table has the definition the writer expects
+ * @param rel The record table, locked by the caller
+ * @param forReader True when called for the reader check
+ *
+ * The writer forms its rows from this definition and the reader scans the
+ * table with heap semantics, so any other definition is refused: two columns
+ * (oid, xid8), the heap access method, and permanent storage, which survives
+ * a crash and reaches standbys through WAL.
+ */
 static void
 checkRecordTableDefinition(Relation rel, bool forReader)
 {
@@ -1213,9 +1220,9 @@ checkRecordTableDefinition(Relation rel, bool forReader)
  * Refuses the rewrite when the library was not loaded through
  * shared_preload_libraries, and when there is nowhere to record it: the
  * extension is not created in this database, or its record table cannot be
- * found or has another definition. The lock keeps the table from being dropped, renamed or
- * moved to another schema (each needs AccessExclusiveLock) before the swap
- * writes the record. Taking it processes pending invalidation messages, so
+ * found or has another definition. The lock keeps the table from being
+ * dropped, renamed or moved to another schema (each needs
+ * AccessExclusiveLock) before the swap writes the record. Taking it processes pending invalidation messages, so
  * the OID is accepted only if the cache still holds it once the lock is held.
  */
 static Oid
@@ -1501,9 +1508,58 @@ checkUnsafeRewriteRecords(QueryDesc *queryDesc)
 }
 
 /**
+ * @brief List a partitioned table's partitions so that the list cannot grow
+ * @param relid A partitioned table, on which the caller holds a lock
+ * @param attachLocked Output: the partitioned tables locked here with
+ *        ShareUpdateExclusiveLock, appended to the list; the caller releases
+ *        those locks once the statement has scanned the partitions
+ * @return relid and every relation below it, each locked with
+ *         AccessShareLock
+ *
+ * Invariant: until the locks in attachLocked are released, listing the
+ * partitions again returns no relation that is not in the returned list.
+ * A relation joins the tree only as a partition of one of its partitioned
+ * tables, through CREATE TABLE ... PARTITION OF or ALTER TABLE ... ATTACH
+ * PARTITION, and both take at least ShareUpdateExclusiveLock on that parent
+ * (tablecmds.c, DefineRelation and AlterTableGetLockLevel), which conflicts
+ * with itself. So every partitioned table in the tree is locked in that mode
+ * and the tree is listed again until a listing finds each of them locked
+ * before it began.
+ */
+static List *
+listStablePartitions(Oid relid, List **attachLocked)
+{
+    LockRelationOid(relid, ShareUpdateExclusiveLock);
+    *attachLocked = lappend_oid(*attachLocked, relid);
+
+    for (;;)
+    {
+        List       *relids;
+        bool        lockedMore = false;
+
+        CHECK_FOR_INTERRUPTS();
+
+        relids = find_all_inheritors(relid, AccessShareLock, NULL);
+        foreach_oid(child, relids)
+        {
+            if (get_rel_relkind(child) != RELKIND_PARTITIONED_TABLE ||
+                list_member_oid(*attachLocked, child))
+                continue;
+            LockRelationOid(child, ShareUpdateExclusiveLock);
+            *attachLocked = lappend_oid(*attachLocked, child);
+            lockedMore = true;
+        }
+        if (!lockedMore)
+            return relids;
+        list_free(relids);
+    }
+}
+
+/**
  * @brief Reader check for COPY relation TO
  * @param pstmt Planned statement wrapping a CopyStmt
  * @param readOnlyTree Whether pstmt must not be modified
+ * @param attachLocked Output: see listStablePartitions
  * @return The statement to run: pstmt, or a copy naming the checked
  *         relation with its schema
  *
@@ -1518,9 +1574,12 @@ checkUnsafeRewriteRecords(QueryDesc *queryDesc)
  * committed while this COPY waited for the lock is caught too. The returned
  * statement names the relation with its schema, and the lock keeps that name
  * from being dropped or renamed, so DoCopy opens the relation checked here.
+ * For a partitioned table, DoCopy lists the partitions again and scans that
+ * list (copyto.c, BeginCopyTo); listStablePartitions keeps it equal to the
+ * list checked here.
  */
 static PlannedStmt *
-checkCopyTo(PlannedStmt *pstmt, bool readOnlyTree)
+checkCopyTo(PlannedStmt *pstmt, bool readOnlyTree, List **attachLocked)
 {
     CopyStmt   *stmt = (CopyStmt *) pstmt->utilityStmt;
     Oid         relid;
@@ -1529,7 +1588,7 @@ checkCopyTo(PlannedStmt *pstmt, bool readOnlyTree)
 
     relid = RangeVarGetRelid(stmt->relation, AccessShareLock, false);
     if (get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE)
-        relids = find_all_inheritors(relid, AccessShareLock, NULL);
+        relids = listStablePartitions(relid, attachLocked);
     else
         relids = list_make1_oid(relid);
 

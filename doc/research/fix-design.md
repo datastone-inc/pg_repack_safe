@@ -642,6 +642,21 @@ order unless noted.
   lock. With the COPY check removed, every relation-COPY case fails, and the
   READ COMMITTED COPY returns no rows and no error, the stock wrong result;
   `COPY (query)` and row-level security still pass through ExecutorStart.
+  Partition list (hook audit, 2026-11-20): DoCopy lists the partitions
+  again (`copyto.c:863`) and scans that list (`copyto.c:1356`), and ATTACH
+  PARTITION needs only ShareUpdateExclusiveLock on the parent
+  (`tablecmds.c:4879`), so a repacked table attached between the two
+  listings was scanned unchecked. The guard now takes
+  ShareUpdateExclusiveLock on every partitioned table of the tree before
+  the listing it checks, and releases those locks when the statement ends.
+  Rows enter `pg_inherits` for tables only through DefineRelation
+  (`tablecmds.c:3619`, parent lock `tablecmds.c:889`), ATTACH PARTITION
+  (`tablecmds.c:21808`) and ALTER TABLE ... INHERIT (`tablecmds.c:18653`,
+  not allowed on a partitioned parent). Cost:
+  ATTACH PARTITION, ANALYZE and another `COPY ... TO` of the same
+  partitioned table wait for the COPY. `specs/copy_attach_race.spec` pins
+  the interleaving; without the lock the ATTACH completes during the COPY,
+  which then returns without an error.
 - [x] **9. Refusals.** REPACK (CONCURRENTLY) refused when the library is not
   preloaded (the refusals for a missing extension, a missing record table
   and a redefined record table exist, step 3 and §6b); DROP, TRUNCATE and
@@ -752,6 +767,13 @@ order unless noted.
     `make installcheck` only; removing our chain call fails it); the
     ordering of ProcessUtility refusals before the previous hook is
     documented in the code and in `doc/installation.md`.
+  - Hook audit (2026-11-20): no chain blockers. Fixed: the COPY partition
+    list race (step 8). Suggestion, not applied: a `_PG_fini` that restores
+    the three hooks. PG19 never calls one: no file under `src/backend` or
+    `src/include` refers to `_PG_fini`, and a loaded library is never
+    unloaded (`dfmgr.c:183`), so the function could not run or be tested.
+    Restoring a saved hook value would also be wrong whenever a library
+    loaded later has chained to ours.
   - README restructured: the problem, the guarantee, what is not
     guaranteed, requirements, how it works. `doc/installation.md` covers
     server configuration (standbys first), settings, `pg_upgrade`, other

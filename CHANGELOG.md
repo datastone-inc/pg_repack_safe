@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "cannot read table ... with this snapshot", instead of reading the table
   as empty. Checked in the executor and for `COPY relation TO` (including
   partitioned tables), so `pg_dump` fails instead of dumping no rows.
+- `COPY relation TO` of a partitioned table holds `ShareUpdateExclusiveLock`
+  on it and on every partitioned table below it while the statement runs, so
+  a partition attached during the COPY cannot be scanned unchecked. `ALTER
+  TABLE ... ATTACH PARTITION`, `ANALYZE` and a second `COPY ... TO` of the
+  same partitioned table wait for the COPY to end.
 - Per-backend cache of the records, so a query no longer reads the record
   table. The writer, and a statement trigger on the record table for changes
   made by hand, invalidate it.

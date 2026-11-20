@@ -1,0 +1,50 @@
+Parsed test spec with 3 sessions
+
+starting permutation: r_begin p_repack_p2 o_lock r_copy p_attach o_commit r_commit p_count
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_repack_p2: REPACK (CONCURRENTLY) p2;
+step o_lock: BEGIN; LOCK TABLE p1 IN ACCESS EXCLUSIVE MODE;
+step r_copy: SELECT copy_p(); <waiting ...>
+step p_attach: ALTER TABLE p ATTACH PARTITION p2 FOR VALUES FROM (100) TO (200); <waiting ...>
+step o_commit: COMMIT;
+step r_copy: <... completed>
+copy_p
+------
+1
+2
+3
+
+(1 row)
+
+step p_attach: <... completed>
+step r_commit: COMMIT;
+step p_count: SELECT count(*) FROM p;
+count
+-----
+    6
+(1 row)
+
+
+starting permutation: r_begin p_repack_p2 p_attach r_copy r_commit p_count
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_repack_p2: REPACK (CONCURRENTLY) p2;
+step p_attach: ALTER TABLE p ATTACH PARTITION p2 FOR VALUES FROM (100) TO (200);
+step r_copy: SELECT copy_p();
+ERROR:  cannot read table "p2" with this snapshot
+step r_commit: COMMIT;
+step p_count: SELECT count(*) FROM p;
+count
+-----
+    6
+(1 row)
+

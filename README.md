@@ -90,6 +90,13 @@ records, refreshed by cache invalidation, so the check costs about as much
 as a hash lookup. The design and its evidence are in
 [doc/research/fix-design.md](doc/research/fix-design.md).
 
+`COPY relation TO` of a partitioned table also holds
+`ShareUpdateExclusiveLock` on it, and on any partitioned table below it,
+until the statement ends, so that no partition is attached after the check.
+`ALTER TABLE ... ATTACH PARTITION`, `ANALYZE` and another `COPY ... TO` of
+the same partitioned table wait for it. `COPY (SELECT ...) TO` takes no such
+lock.
+
 The record table is protected:
 
 - Records are never deleted. Each `REPACK (CONCURRENTLY)` adds one or two
