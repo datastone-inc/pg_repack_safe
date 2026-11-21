@@ -40,7 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   be found (renamed, moved to another schema, or dropped) or lacks either of
   its triggers firing ALWAYS. Both refusals are skipped in binary-upgrade
   mode so that `pg_upgrade` works; `REPACK (CONCURRENTLY)` stays refused
-  there. `pg_upgrade` carries the records over unchanged.
+  there. `pg_upgrade` carries the records over unchanged; `pg_dump` leaves
+  them behind.
 - The record table is protected. `UPDATE` and `DELETE` of records,
   `REPACK (CONCURRENTLY)` and rewriting `ALTER TABLE` of the table, and
   changes to when its triggers fire are refused (`VACUUM FULL`, `CLUSTER`

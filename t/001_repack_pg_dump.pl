@@ -121,6 +121,21 @@ sub dumpArgs
     $repacker->quit;
 }
 
+# A dump of the whole database leaves the records behind: their relation
+# OIDs and transaction IDs mean nothing in another database
+# (doc/installation.md, "Dump and Restore").
+{
+    isnt($node->safe_psql('postgres',
+            'SELECT count(*) FROM pg_repack_safe_rewrites'),
+        '0', 'the record table holds records');
+    my ($out, $err) = run_command(
+        [ 'pg_dump', '--dbname=' . $node->connstr('postgres') ]);
+    like($out, qr/^CREATE EXTENSION IF NOT EXISTS pg_repack_safe\b/m,
+        'a full dump creates the extension');
+    unlike($out, qr/pg_repack_safe_rewrites/,
+        'a full dump does not carry the records');
+}
+
 # The table itself is intact; only the dumps above were wrong.
 is($node->safe_psql('postgres', 'SELECT count(*) FROM customers'), $rows,
     'customers still holds every row');

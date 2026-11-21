@@ -434,12 +434,17 @@ lookupRecordTable(RecordTableUse use)
  * @brief Tell whether the record table has one of its triggers, firing ALWAYS
  * @param rel The record table
  * @param functionName The trigger function the trigger must call
- * @param before True for a BEFORE trigger, false for AFTER
- * @param events TRIGGER_TYPE_* event bits the trigger must fire on
+ * @param timing TRIGGER_TYPE_BEFORE or TRIGGER_TYPE_AFTER
+ * @param events TRIGGER_TYPE_* event bits, all of which the trigger must
+ *        fire on
  * @return True if a statement-level trigger with those properties exists
+ *
+ * TRIGGER_TYPE_MATCHES compares the level, the timing and the given event
+ * bits exactly (pg_trigger.h), so a trigger firing on only some of the
+ * events does not match; one firing on more does.
  */
 static bool
-hasRecordTrigger(Relation rel, const char *functionName, bool before,
+hasRecordTrigger(Relation rel, const char *functionName, int16 timing,
                  int16 events)
 {
     TriggerDesc *trigdesc = rel->trigdesc;
@@ -451,9 +456,8 @@ hasRecordTrigger(Relation rel, const char *functionName, bool before,
         Trigger    *trigger = &trigdesc->triggers[i];
 
         if (trigger->tgenabled == TRIGGER_FIRES_ALWAYS &&
-            !TRIGGER_FOR_ROW(trigger->tgtype) &&
-            (TRIGGER_FOR_BEFORE(trigger->tgtype) != 0) == before &&
-            (trigger->tgtype & events) == events &&
+            TRIGGER_TYPE_MATCHES(trigger->tgtype, TRIGGER_TYPE_STATEMENT,
+                                 timing, events) &&
             isRecordTriggerFunction(trigger->tgfoid, functionName))
             return true;
     }
@@ -485,10 +489,11 @@ checkRecordTableDefinition(Relation rel, RecordTableUse use)
      * the table but not yet its triggers.
      */
     if (!exemptInBinaryUpgrade(use) &&
-        (!hasRecordTrigger(rel, CHANGED_TRIGGER_FUNCTION, false,
+        (!hasRecordTrigger(rel, CHANGED_TRIGGER_FUNCTION, TRIGGER_TYPE_AFTER,
                            TRIGGER_TYPE_INSERT | TRIGGER_TYPE_UPDATE |
                            TRIGGER_TYPE_DELETE | TRIGGER_TYPE_TRUNCATE) ||
-         !hasRecordTrigger(rel, PROTECTED_TRIGGER_FUNCTION, true,
+         !hasRecordTrigger(rel, PROTECTED_TRIGGER_FUNCTION,
+                           TRIGGER_TYPE_BEFORE,
                            TRIGGER_TYPE_UPDATE | TRIGGER_TYPE_DELETE)))
         ereport(ERROR,
                 (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),

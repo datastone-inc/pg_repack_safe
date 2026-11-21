@@ -88,6 +88,22 @@ each record still names the table and the rewrite it was written for. No
 snapshot survives an upgrade, so the old records refuse nothing in the new
 cluster.
 
+## Dump and Restore
+
+`pg_dump` does not dump the records, and a restore starts with an empty
+record table (`t/001_repack_pg_dump.pl`). This is deliberate: the install
+script does not mark the table with `pg_extension_config_dump()`. A record
+is a relation OID and a transaction ID, and a restore keeps neither. The
+restored tables get new OIDs, and the old transaction IDs name other
+transactions in the new cluster, or none yet. Loaded there, an old record
+would refuse reads of whichever table now has its OID. Nothing is lost by
+leaving the records behind, because no snapshot survives a dump and
+restore.
+
+For the same reason, do not copy rows of `pg_repack_safe_rewrites` from one
+database to another by hand, even within one cluster: relation OIDs differ
+between databases.
+
 ## Other Extensions
 
 The library chains its `object_access_hook`, `ProcessUtility_hook` and

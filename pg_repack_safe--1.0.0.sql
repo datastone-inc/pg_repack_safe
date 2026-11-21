@@ -18,6 +18,12 @@
 -- transaction after about 2^31 transactions. The reader scans the table with
 -- heap semantics (SnapshotAny), so the access method is fixed here rather
 -- than taken from default_table_access_method.
+--
+-- The table is deliberately not marked with pg_extension_config_dump(): a
+-- record's relation OID and transaction ID mean something only in the
+-- database and cluster that wrote it, so pg_dump must not carry the rows
+-- into another one, where they would refuse reads of unrelated tables. No
+-- snapshot survives a dump and restore, so no record is needed there.
 CREATE TABLE pg_repack_safe_rewrites
 (
     relid oid NOT NULL,
