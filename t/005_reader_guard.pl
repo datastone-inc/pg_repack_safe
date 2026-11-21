@@ -22,11 +22,11 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use FindBin;
+use lib $FindBin::RealBin;
+use RepackSafeTest;
 
-my $node = PostgreSQL::Test::Cluster->new('main');
-$node->init(allows_streaming => 1);
-$node->append_conf('postgresql.conf',
-    "shared_preload_libraries = 'pg_repack_safe'\n");
+my $node = preloadedNode('main');
 $node->start;
 
 $node->safe_psql('postgres', q{
@@ -40,24 +40,13 @@ $node->safe_psql('postgres', q{
 my @readers;
 foreach my $i (0 .. 1)
 {
-    my $reader = $node->background_psql('postgres', on_error_stop => 0);
+    my $reader = oldSnapshot($node);
     $reader->query_safe('\set VERBOSITY verbose');
-    $reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
-    $reader->query_safe('SELECT count(*) FROM other');
     push @readers, $reader;
 }
 
 $node->safe_psql('postgres',
     'REPACK (CONCURRENTLY) t USING INDEX t_pkey');
-
-# Run one statement in a reader session and return (stdout, stderr).
-sub runIn
-{
-    my ($reader, $sql) = @_;
-    $reader->{stderr} = '';
-    my $out = $reader->query($sql);
-    return ($out, $reader->{stderr});
-}
 
 my ($out, $err) = runIn($readers[0], 'EXPLAIN SELECT count(*) FROM t');
 is($err, '', 'EXPLAIN without ANALYZE passes with the old snapshot');
@@ -84,10 +73,8 @@ is($out, '5', 'new snapshot: every row');
 
 # The TOAST relation, read directly by an old snapshot.
 $readers[1]->quit;
-my $toastReader = $node->background_psql('postgres', on_error_stop => 0);
+my $toastReader = oldSnapshot($node);
 $toastReader->query_safe('\set VERBOSITY verbose');
-$toastReader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
-$toastReader->query_safe('SELECT count(*) FROM other');
 $node->safe_psql('postgres',
     'REPACK (CONCURRENTLY) t USING INDEX t_pkey');
 my $toast = $node->safe_psql('postgres',

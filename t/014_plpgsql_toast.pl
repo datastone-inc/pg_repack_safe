@@ -19,12 +19,12 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use FindBin;
+use lib $FindBin::RealBin;
+use RepackSafeTest;
 use IPC::Run;
 
-my $node = PostgreSQL::Test::Cluster->new('main');
-$node->init(allows_streaming => 1);
-$node->append_conf('postgresql.conf',
-    "shared_preload_libraries = 'pg_repack_safe'\n");
+my $node = preloadedNode('main');
 $node->start;
 $node->safe_psql('postgres', q{
     CREATE EXTENSION pg_repack_safe;

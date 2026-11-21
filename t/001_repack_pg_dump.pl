@@ -21,14 +21,14 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use FindBin;
+use lib $FindBin::RealBin;
+use RepackSafeTest;
 use IPC::Run;
 
 my $rows = 5;
 
-my $node = PostgreSQL::Test::Cluster->new('main');
-$node->init(allows_streaming => 1);
-$node->append_conf('postgresql.conf',
-    "shared_preload_libraries = 'pg_repack_safe'\n");
+my $node = preloadedNode('main');
 $node->start;
 
 $node->safe_psql('postgres', qq{
@@ -100,20 +100,14 @@ sub dumpArgs
     $repacker->query_until(qr/repack_started/,
         "\\echo repack_started\n$repack_sql\n");
 
-    $node->poll_query_until('postgres', q{
-        SELECT EXISTS (SELECT 1 FROM pg_locks
-                       WHERE relation = 'customers'::regclass
-                         AND mode = 'AccessExclusiveLock' AND NOT granted)
-    }) or die 'REPACK never queued for ACCESS EXCLUSIVE on customers';
+    # REPACK queues for its swap.
+    waitForLockRequest($node, 'customers', 'AccessExclusiveLock');
 
     my ($out, $err) = ('', '');
     my $dump = IPC::Run::start([dumpArgs()], '>', \$out, '2>', \$err);
 
-    $node->poll_query_until('postgres', q{
-        SELECT EXISTS (SELECT 1 FROM pg_locks
-                       WHERE relation = 'customers'::regclass
-                         AND mode = 'AccessShareLock' AND NOT granted)
-    }) or die 'pg_dump never queued for ACCESS SHARE on customers';
+    # pg_dump queues behind it.
+    waitForLockRequest($node, 'customers', 'AccessShareLock');
 
     $blocker->query_safe('COMMIT');
     $blocker->quit;

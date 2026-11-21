@@ -25,16 +25,14 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use FindBin;
+use lib $FindBin::RealBin;
+use RepackSafeTest;
 
-my $primary = PostgreSQL::Test::Cluster->new('primary');
-$primary->init(allows_streaming => 1);
 # Autovacuum off: its statistics updates of the record table carry their own
 # relcache invalidation, which would reload a warm cache for an unrelated
 # reason and hide a missing invalidation from the writer.
-$primary->append_conf('postgresql.conf', q{
-shared_preload_libraries = 'pg_repack_safe'
-autovacuum = off
-});
+my $primary = preloadedNode('primary', conf => "autovacuum = off\n");
 $primary->start;
 $primary->safe_psql('postgres', q{
     CREATE EXTENSION pg_repack_safe;
@@ -52,17 +50,6 @@ max_standby_streaming_delay = 200ms
 });
 $standby->start;
 $primary->wait_for_catchup($standby);
-
-# Run a query in a standby session; return (stdout, stderr).
-sub runIn
-{
-    my ($session, $sql) = @_;
-    $session->{stderr} = '';
-    my $out = $session->query($sql);
-    my $err = $session->{stderr};
-    $session->{stderr} = '';
-    return ($out, $err);
-}
 
 my $guardError = qr/cannot read table "t" with this snapshot/;
 
@@ -90,9 +77,7 @@ $warm->quit;
 
 # A standby snapshot taken before a REPACK, without touching t, read after
 # the primary has also vacuumed the record table.
-my $reader = $standby->background_psql('postgres', on_error_stop => 0);
-$reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
-$reader->query_safe('SELECT count(*) FROM other');
+my $reader = oldSnapshot($standby);
 
 $primary->safe_psql('postgres', 'REPACK (CONCURRENTLY) t');
 $primary->safe_psql('postgres', 'VACUUM pg_repack_safe_rewrites');

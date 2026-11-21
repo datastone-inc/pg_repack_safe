@@ -28,11 +28,11 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use FindBin;
+use lib $FindBin::RealBin;
+use RepackSafeTest;
 
-my $publisher = PostgreSQL::Test::Cluster->new('publisher');
-$publisher->init(allows_streaming => 'logical');
-$publisher->append_conf('postgresql.conf',
-    "shared_preload_libraries = 'pg_repack_safe'\n");
+my $publisher = preloadedNode('publisher', allows_streaming => 'logical');
 $publisher->start;
 $publisher->safe_psql('postgres', q{
     CREATE EXTENSION pg_repack_safe;
@@ -55,11 +55,8 @@ $blocker->query_safe('SELECT count(*) FROM t');
 my $repacker = $publisher->background_psql('postgres');
 $repacker->query_until(qr/repack_started/,
     "\\echo repack_started\nREPACK (CONCURRENTLY) t;\n");
-$publisher->poll_query_until('postgres', q{
-    SELECT EXISTS (SELECT 1 FROM pg_locks
-                   WHERE relation = 't'::regclass
-                     AND mode = 'AccessExclusiveLock' AND NOT granted)
-}) or die 'REPACK never queued for ACCESS EXCLUSIVE on t';
+# REPACK queues for its swap.
+waitForLockRequest($publisher, 't', 'AccessExclusiveLock');
 
 # The sync worker's COPY queues behind the REPACK.
 $sync->query_until(qr/copy_started/, "\\echo copy_started\nCOPY t TO STDOUT;\n");
@@ -75,10 +72,9 @@ $blocker->query_safe('COMMIT');
 $blocker->quit;
 
 # Collect the COPY's outcome. Stock PostgreSQL 19: no error and no rows.
-$sync->{stderr} = '';
-my $out = $sync->query('\\echo copy_done');
+my ($out, $err) = runIn($sync, '\\echo copy_done');
 $out =~ s/^copy_done$//m;
-like($sync->{stderr}, qr/cannot read table "t" with this snapshot/,
+like($err, qr/cannot read table "t" with this snapshot/,
     'the sync COPY with a pre-REPACK snapshot is refused');
 my $rows = () = $out =~ /^\d+$/mg;
 is($rows, 0, 'the sync COPY wrote no rows');

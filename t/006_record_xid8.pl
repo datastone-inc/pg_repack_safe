@@ -17,11 +17,11 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use FindBin;
+use lib $FindBin::RealBin;
+use RepackSafeTest;
 
-my $node = PostgreSQL::Test::Cluster->new('main');
-$node->init(allows_streaming => 1);
-$node->append_conf('postgresql.conf',
-    "shared_preload_libraries = 'pg_repack_safe'\n");
+my $node = preloadedNode('main');
 command_ok([ 'pg_resetwal', '--epoch' => '1', $node->data_dir ],
     'move the cluster to XID epoch 1');
 $node->start;
@@ -39,34 +39,24 @@ $holder->query_safe('BEGIN');
 my $x = $holder->query_safe('SELECT pg_current_xact_id()');
 cmp_ok($x, '>', 4294967296, "X ($x) is in epoch 1");
 
-my $reader = $node->background_psql('postgres', on_error_stop => 0);
-$reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
-$reader->query_safe('SELECT count(*) FROM other');
+my $reader = oldSnapshot($node);
 $holder->query_safe('COMMIT');
 $holder->quit;
-
-sub readT
-{
-    $reader->{stderr} = '';
-    my $out = $reader->query('SELECT count(*) FROM t');
-    return ($out, $reader->{stderr});
-}
 
 $node->safe_psql('postgres', qq{
     INSERT INTO pg_repack_safe_rewrites
         VALUES ('t'::regclass, '@{[ $x - 4294967296 ]}');
 });
-my ($out, $err) = readT();
+my ($out, $err) = runIn($reader, 'SELECT count(*) FROM t');
 is($err, '', "epoch-0 record with X's low 32 bits: no error");
 is($out, '5', "epoch-0 record with X's low 32 bits: every row");
 
 $node->safe_psql('postgres', qq{
     INSERT INTO pg_repack_safe_rewrites VALUES ('t'::regclass, '$x');
 });
-($out, $err) = readT();
+($out, $err) = runIn($reader, 'SELECT count(*) FROM t');
 like($err, qr/cannot read table "t" with this snapshot/,
     "record with X's full XID refuses the reader");
-$reader->{stderr} = '';
 $reader->query_safe('ROLLBACK');
 $reader->quit;
 

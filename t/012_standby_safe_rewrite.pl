@@ -25,17 +25,16 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use FindBin;
+use lib $FindBin::RealBin;
+use RepackSafeTest;
 
 # Each setting gets its own primary: a feedback standby's xmin holds back
 # the primary's horizon for every standby attached to it.
 foreach my $feedback ('off', 'on')
 {
-    my $primary = PostgreSQL::Test::Cluster->new("primary_$feedback");
-    $primary->init(allows_streaming => 1);
-    $primary->append_conf('postgresql.conf', q{
-shared_preload_libraries = 'pg_repack_safe'
-autovacuum = off
-});
+    my $primary =
+      preloadedNode("primary_$feedback", conf => "autovacuum = off\n");
     $primary->start;
     $primary->safe_psql('postgres', q{
         CREATE EXTENSION pg_repack_safe;
@@ -63,10 +62,7 @@ max_standby_streaming_delay = 200ms
 
         # A standby snapshot taken before the DELETE, without touching the
         # table.
-        my $reader = $standby->background_psql('postgres',
-            on_error_stop => 0);
-        $reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
-        $reader->query_safe('SELECT count(*) FROM other');
+        my $reader = oldSnapshot($standby);
         if ($feedback eq 'on')
         {
             # The primary has the standby's xmin before it deletes.

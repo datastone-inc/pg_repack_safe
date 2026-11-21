@@ -16,6 +16,9 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use FindBin;
+use lib $FindBin::RealBin;
+use RepackSafeTest;
 
 my %orders = (
     observer_first => 'oat_observer, pg_repack_safe',
@@ -23,10 +26,7 @@ my %orders = (
 
 foreach my $name (sort keys %orders)
 {
-    my $node = PostgreSQL::Test::Cluster->new($name);
-    $node->init(allows_streaming => 1);
-    $node->append_conf('postgresql.conf',
-        "shared_preload_libraries = '$orders{$name}'\n");
+    my $node = preloadedNode($name, libraries => $orders{$name});
     $node->start;
     $node->safe_psql('postgres', q{
         CREATE EXTENSION pg_repack_safe;

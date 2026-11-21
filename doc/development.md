@@ -45,7 +45,9 @@ binaries.
   run leaves its diffs under `output_iso/`.
 - `t/*.pl` (`TAP_TESTS`): cases that need their own server setup or separate
   client programs such as `pg_dump`. Each creates its own clusters under
-  `tmp_check/`.
+  `tmp_check/`. Helpers they share (a preloaded cluster, a session holding
+  an old snapshot, running a statement and collecting its errors, waiting
+  for a queued lock request) are in `t/RepackSafeTest.pm`.
 
 The `REGRESS` and `ISOLATION` instances get the settings in
 `test/temp_instance.conf`: the library in `shared_preload_libraries`, which

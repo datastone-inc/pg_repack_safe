@@ -22,6 +22,9 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use FindBin;
+use lib $FindBin::RealBin;
+use RepackSafeTest;
 
 my %orders = (
     stats_first => 'pg_stat_statements, pg_repack_safe',
@@ -30,10 +33,7 @@ my %orders = (
 foreach my $name (sort keys %orders)
 {
     # REPACK (CONCURRENTLY) needs wal_level = replica or higher.
-    my $node = PostgreSQL::Test::Cluster->new($name);
-    $node->init(allows_streaming => 1);
-    $node->append_conf('postgresql.conf',
-        "shared_preload_libraries = '$orders{$name}'\n");
+    my $node = preloadedNode($name, libraries => $orders{$name});
     $node->start;
 
     $node->safe_psql('postgres', q{
@@ -46,9 +46,7 @@ foreach my $name (sort keys %orders)
     });
 
     # A snapshot taken before the REPACK, without touching chain_t.
-    my $reader = $node->background_psql('postgres', on_error_stop => 0);
-    $reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
-    $reader->query_safe('SELECT count(*) FROM chain_other');
+    my $reader = oldSnapshot($node, table => 'chain_other');
 
     # ProcessUtility: both modules see the same REPACK.
     my ($ret, $stdout, $stderr) = $node->psql('postgres', q{
@@ -76,14 +74,11 @@ foreach my $name (sort keys %orders)
 
     # The old snapshot's read of chain_t is refused only if
     # pg_repack_safe's ExecutorStart hook ran.
-    $reader->{stderr} = '';
-    $reader->query('SELECT count(*) FROM chain_t');
+    my ($out, $err) = runIn($reader, 'SELECT count(*) FROM chain_t');
     like(
-        $reader->{stderr},
+        $err,
         qr/cannot read table "chain_t" with this snapshot/,
         "$name: pg_repack_safe refused the old snapshot's query");
-    # BackgroundPsql keeps stderr across queries; clear the expected error.
-    $reader->{stderr} = '';
     $reader->query_safe('ROLLBACK');
     $reader->quit;
 

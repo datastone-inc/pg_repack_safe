@@ -22,12 +22,12 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use FindBin;
+use lib $FindBin::RealBin;
+use RepackSafeTest;
 use Time::HiRes qw(sleep);
 
-my $primary = PostgreSQL::Test::Cluster->new('primary');
-$primary->init(allows_streaming => 1);
-$primary->append_conf('postgresql.conf',
-    "shared_preload_libraries = 'pg_repack_safe'\n");
+my $primary = preloadedNode('primary');
 $primary->start;
 $primary->safe_psql('postgres', q{
     CREATE EXTENSION pg_repack_safe;
@@ -51,9 +51,7 @@ $primary->wait_for_catchup($guarded);
 is($bare->safe_psql('postgres', 'SELECT count(*) FROM t'), '5',
     'standby without the library serves reads before any REPACK');
 
-my $reader = $guarded->background_psql('postgres', on_error_stop => 0);
-$reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
-$reader->query_safe('SELECT count(*) FROM other');
+my $reader = oldSnapshot($guarded);
 
 my $beforeRepack = $primary->safe_psql('postgres',
     'SELECT pg_current_wal_insert_lsn()');
@@ -64,9 +62,8 @@ my $afterRepack = $primary->safe_psql('postgres',
 # The standby with the library replays past the REPACK and refuses the old
 # snapshot's read.
 $primary->wait_for_catchup($guarded);
-$reader->{stderr} = '';
-my $out = $reader->query('SELECT count(*) FROM t');
-like($reader->{stderr}, qr/cannot read table "t" with this snapshot/,
+my ($out, $err) = runIn($reader, 'SELECT count(*) FROM t');
+like($err, qr/cannot read table "t" with this snapshot/,
     'standby with the library: old snapshot gets the error');
 $reader->quit;
 

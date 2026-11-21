@@ -15,13 +15,12 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
-
-my $preload = "shared_preload_libraries = 'pg_repack_safe'\n";
+use FindBin;
+use lib $FindBin::RealBin;
+use RepackSafeTest;
 
 # REPACK (CONCURRENTLY) needs wal_level = replica or higher.
-my $old = PostgreSQL::Test::Cluster->new('old');
-$old->init(allows_streaming => 1);
-$old->append_conf('postgresql.conf', $preload);
+my $old = preloadedNode('old');
 $old->start;
 $old->safe_psql('postgres', q{
     CREATE EXTENSION pg_repack_safe;
@@ -35,9 +34,7 @@ my $recordsQuery = q{
 my $oldRecords = $old->safe_psql('postgres', $recordsQuery);
 $old->stop;
 
-my $new = PostgreSQL::Test::Cluster->new('new');
-$new->init(allows_streaming => 1);
-$new->append_conf('postgresql.conf', $preload);
+my $new = preloadedNode('new');
 
 my $bindir = $new->config_data('--bindir');
 
