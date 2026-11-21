@@ -662,6 +662,24 @@ order unless noted.
   partitioned table wait for the COPY. `specs/copy_attach_race.spec` pins
   the interleaving; without the lock the ATTACH completes during the COPY,
   which then returns without an error.
+  Replaced (2026-11-21): the lock applied to every partitioned COPY on a
+  server with the library loaded, also in databases without the extension,
+  and could not be skipped when no record exists, because a record written
+  after the check (REPACK, then ATTACH, while the COPY waits for a
+  partition's lock) must be seen too. The hook now turns
+  `COPY partitioned TO` into `COPY (SELECT columns FROM partitioned) TO`,
+  as stock does for row-level security (`copy.c:244-345`): the planner
+  lists the partitions once and `ExecutorStart` checks what the plan scans.
+  The column list comes from `CopyGetAttnums`, so dropped and generated
+  columns are left out and the relation form's column errors are kept.
+  Probed before building: byte-identical output in text, csv and binary
+  (dropped, stored and virtual generated columns, a partition with another
+  column order, a partitioned partition); about 4-7% slower on 4 million
+  rows; a foreign-table partition is read where the relation form errors;
+  pg_dump copies leaves only; tablesync copies a partitioned root in the
+  relation form (`tablesync.c:1109-1114`). `specs/copy_attach_race.spec`
+  now expects the ATTACH not to wait and the COPY to read the partitions it
+  planned; `sql/copy_partitioned.sql` pins the output and errors.
 - [x] **9. Refusals.** REPACK (CONCURRENTLY) refused when the library is not
   preloaded (the refusals for a missing extension, a missing record table
   and a redefined record table exist, step 3 and §6b); DROP, TRUNCATE and

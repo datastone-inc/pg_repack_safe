@@ -10,7 +10,7 @@ count
 step p_repack_p2: REPACK (CONCURRENTLY) p2;
 step o_lock: BEGIN; LOCK TABLE p1 IN ACCESS EXCLUSIVE MODE;
 step r_copy: SELECT copy_p(); <waiting ...>
-step p_attach: ALTER TABLE p ATTACH PARTITION p2 FOR VALUES FROM (100) TO (200); <waiting ...>
+step p_attach: ALTER TABLE p ATTACH PARTITION p2 FOR VALUES FROM (100) TO (200);
 step o_commit: COMMIT;
 step r_copy: <... completed>
 copy_p
@@ -21,7 +21,6 @@ copy_p
 
 (1 row)
 
-step p_attach: <... completed>
 step r_commit: COMMIT;
 step p_count: SELECT count(*) FROM p;
 count

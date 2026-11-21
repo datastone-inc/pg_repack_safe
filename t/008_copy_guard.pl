@@ -3,9 +3,11 @@
 #
 # The reader guard for COPY ... TO (doc/research/fix-design.md, step 8).
 #
-# COPY relation TO scans the relation, or each partition of a partitioned
-# table, with the active snapshot and without the executor, so the guard
-# checks it in the ProcessUtility hook. Each case pins what stock
+# COPY relation TO scans the relation with the active snapshot and without
+# the executor, so the guard checks it in the ProcessUtility hook. For a
+# partitioned table the hook turns the statement into COPY (query) TO, which
+# is checked in ExecutorStart (specs/copy_attach_race.spec,
+# sql/copy_partitioned.sql). Each case pins what stock
 # PostgreSQL 19 would do in a comment and asserts the guard's error:
 # - interleaving 8: a REPEATABLE READ snapshot from before the REPACK;
 # - READ COMMITTED: COPY takes its statement snapshot, then waits for its

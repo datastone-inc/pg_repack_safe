@@ -1,0 +1,205 @@
+/*
+ * Copyright (c) 2026 dataStone Inc.
+ * SPDX-License-Identifier: MIT
+ */
+/**
+ * @file copy_partitioned.sql
+ * @brief COPY of a partitioned table gives what stock PostgreSQL 19 gives
+ *
+ * The library runs COPY partitioned_table TO as COPY (SELECT ...) TO, so
+ * that the reader check covers exactly the partitions that are scanned
+ * (specs/copy_attach_race.spec). Everything here is stock PostgreSQL 19's
+ * output and errors for the relation form, which the query form must keep:
+ * - the default column list leaves out dropped and generated columns;
+ * - a partition with another physical column order, and a partition that
+ *   is itself partitioned, give rows in the parent's column order;
+ * - a column list is validated as for a relation: a generated, repeated or
+ *   unknown column is an error;
+ * - privileges are those of the relation, also column by column;
+ * - a table with row-level security is left to PostgreSQL, which turns it
+ *   into a query itself; that query is SELECT *, generated columns
+ *   included.
+ * One difference is accepted and documented in the README: a partition that
+ * is a foreign table is read, where the relation form raises an error.
+ */
+CREATE TABLE cp (id int, gone int, a text,
+                 g int GENERATED ALWAYS AS (id * 2) STORED,
+                 v int GENERATED ALWAYS AS (id + 1) VIRTUAL,
+                 b numeric) PARTITION BY RANGE (id);
+CREATE TABLE cp1 PARTITION OF cp FOR VALUES FROM (0) TO (10);
+CREATE TABLE cp2 (b numeric, junk int, a text, id int, gone int,
+                  g int GENERATED ALWAYS AS (id * 2) STORED,
+                  v int GENERATED ALWAYS AS (id + 1) VIRTUAL);
+ALTER TABLE cp2 DROP COLUMN junk;
+ALTER TABLE cp ATTACH PARTITION cp2 FOR VALUES FROM (10) TO (20);
+CREATE TABLE cp3 PARTITION OF cp FOR VALUES FROM (20) TO (30)
+    PARTITION BY RANGE (id);
+CREATE TABLE cp3a PARTITION OF cp3 FOR VALUES FROM (20) TO (30);
+INSERT INTO cp (id, gone, a, b)
+SELECT g, g, 'row ' || g, g / 4.0 FROM generate_series(8, 21) g;
+ALTER TABLE cp DROP COLUMN gone;
+-- Default column list, with and without options.
+COPY cp TO STDOUT;
+8	row 8	2.0000000000000000
+9	row 9	2.2500000000000000
+10	row 10	2.5000000000000000
+11	row 11	2.7500000000000000
+12	row 12	3.0000000000000000
+13	row 13	3.2500000000000000
+14	row 14	3.5000000000000000
+15	row 15	3.7500000000000000
+16	row 16	4.0000000000000000
+17	row 17	4.2500000000000000
+18	row 18	4.5000000000000000
+19	row 19	4.7500000000000000
+20	row 20	5.0000000000000000
+21	row 21	5.2500000000000000
+COPY cp TO STDOUT WITH (FORMAT csv, HEADER);
+id,a,b
+8,row 8,2.0000000000000000
+9,row 9,2.2500000000000000
+10,row 10,2.5000000000000000
+11,row 11,2.7500000000000000
+12,row 12,3.0000000000000000
+13,row 13,3.2500000000000000
+14,row 14,3.5000000000000000
+15,row 15,3.7500000000000000
+16,row 16,4.0000000000000000
+17,row 17,4.2500000000000000
+18,row 18,4.5000000000000000
+19,row 19,4.7500000000000000
+20,row 20,5.0000000000000000
+21,row 21,5.2500000000000000
+COPY public.cp TO STDOUT WITH (FORMAT csv, FORCE_QUOTE (a), NULL 'none');
+8,"row 8",2.0000000000000000
+9,"row 9",2.2500000000000000
+10,"row 10",2.5000000000000000
+11,"row 11",2.7500000000000000
+12,"row 12",3.0000000000000000
+13,"row 13",3.2500000000000000
+14,"row 14",3.5000000000000000
+15,"row 15",3.7500000000000000
+16,"row 16",4.0000000000000000
+17,"row 17",4.2500000000000000
+18,"row 18",4.5000000000000000
+19,"row 19",4.7500000000000000
+20,"row 20",5.0000000000000000
+21,"row 21",5.2500000000000000
+-- A column list, in another order than the table's.
+COPY cp (b, id) TO STDOUT;
+2.0000000000000000	8
+2.2500000000000000	9
+2.5000000000000000	10
+2.7500000000000000	11
+3.0000000000000000	12
+3.2500000000000000	13
+3.5000000000000000	14
+3.7500000000000000	15
+4.0000000000000000	16
+4.2500000000000000	17
+4.5000000000000000	18
+4.7500000000000000	19
+5.0000000000000000	20
+5.2500000000000000	21
+-- Column lists the relation form refuses.
+COPY cp (id, g) TO STDOUT;
+ERROR:  column "g" is a generated column
+DETAIL:  Generated columns cannot be used in COPY.
+COPY cp (id, v) TO STDOUT;
+ERROR:  column "v" is a generated column
+DETAIL:  Generated columns cannot be used in COPY.
+COPY cp (id, id) TO STDOUT;
+ERROR:  column "id" specified more than once
+COPY cp (id, missing) TO STDOUT;
+ERROR:  column "missing" of relation "cp" does not exist
+COPY cp (id, gone) TO STDOUT;
+ERROR:  column "gone" of relation "cp" does not exist
+-- A partition that is itself partitioned, and a leaf, named directly.
+COPY cp3 TO STDOUT;
+20	row 20	5.0000000000000000
+21	row 21	5.2500000000000000
+COPY cp2 TO STDOUT;
+2.5000000000000000	row 10	10
+2.7500000000000000	row 11	11
+3.0000000000000000	row 12	12
+3.2500000000000000	row 13	13
+3.5000000000000000	row 14	14
+3.7500000000000000	row 15	15
+4.0000000000000000	row 16	16
+4.2500000000000000	row 17	17
+4.5000000000000000	row 18	18
+4.7500000000000000	row 19	19
+-- Privileges are the relation's.
+CREATE ROLE cp_reader;
+SET ROLE cp_reader;
+COPY cp TO STDOUT;
+ERROR:  permission denied for table cp
+RESET ROLE;
+GRANT SELECT (id) ON cp TO cp_reader;
+SET ROLE cp_reader;
+COPY cp (id) TO STDOUT;
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+COPY cp TO STDOUT;
+ERROR:  permission denied for table cp
+COPY cp (id, a) TO STDOUT;
+ERROR:  permission denied for table cp
+RESET ROLE;
+-- Row-level security: PostgreSQL's own query form.
+GRANT SELECT ON cp TO cp_reader;
+ALTER TABLE cp ENABLE ROW LEVEL SECURITY;
+CREATE POLICY cp_some ON cp USING (id < 10);
+SET ROLE cp_reader;
+COPY cp TO STDOUT;
+8	row 8	16	9	2.0000000000000000
+9	row 9	18	10	2.2500000000000000
+COPY cp (b, id) TO STDOUT;
+2.0000000000000000	8
+2.2500000000000000	9
+SET row_security = off;
+COPY cp TO STDOUT;
+ERROR:  query would be affected by row-level security policy for table "cp"
+RESET row_security;
+RESET ROLE;
+-- A partitioned table without partitions.
+CREATE TABLE cp_empty (id int) PARTITION BY RANGE (id);
+COPY cp_empty TO STDOUT;
+-- Inside a function, whose cached statement tree is read-only and is run
+-- twice. PL/pgSQL cannot COPY to the client, so the rows go to a file.
+CREATE FUNCTION cp_copy() RETURNS bigint LANGUAGE plpgsql
+AS $$
+DECLARE
+    n bigint;
+BEGIN
+    COPY cp (id) TO '/dev/null';
+    GET DIAGNOSTICS n = ROW_COUNT;
+    RETURN n;
+END
+$$;
+SELECT cp_copy();
+ cp_copy 
+---------
+      14
+(1 row)
+
+SELECT cp_copy();
+ cp_copy 
+---------
+      14
+(1 row)
+
+DROP FUNCTION cp_copy();
+DROP TABLE cp, cp_empty;
+DROP ROLE cp_reader;

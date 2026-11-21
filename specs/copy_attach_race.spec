@@ -3,18 +3,21 @@
 #
 # COPY of a partitioned table must not scan a partition it has not checked.
 #
-# The COPY guard lists the partitions and checks each; DoCopy then lists them
-# again (copyto.c, BeginCopyTo) and scans that second list. ATTACH PARTITION
-# takes ShareUpdateExclusiveLock on the parent (tablecmds.c,
-# AlterTableGetLockLevel), which the reader's AccessShareLock does not block.
-# A table repacked after the reader's snapshot and attached between the two
-# listings would be scanned unchecked and read as empty.
+# COPY relation TO lists a partitioned table's partitions when it starts and
+# scans that list (copyto.c, BeginCopyTo). A check made on a list taken
+# before that could miss a table repacked after the reader's snapshot and
+# attached in between, which would then be read as empty. The library
+# instead runs the statement as COPY (SELECT ...) TO, so the partitions are
+# listed once, by the planner, and the reader check in ExecutorStart sees
+# exactly the relations the plan scans. No lock beyond COPY's own
+# AccessShareLock is taken, so ATTACH PARTITION does not wait for the COPY.
 #
-# - attach_during: the reader's COPY waits for a lock on p1 while it lists
-#   the partitions. The ATTACH of the repacked p2 must wait for the COPY to
-#   end, so the COPY reads p as it was: p1's rows, and p2 is not scanned.
+# - attach_during: the reader's COPY has listed the partitions and waits for
+#   a lock on p1. The ATTACH of the repacked p2 does not wait and commits.
+#   The COPY then reads p as it was planned: p1's rows, and p2 is not
+#   scanned.
 # - attach_before: the ATTACH commits before the COPY starts, so the COPY
-#   finds p2 among the partitions and is refused.
+#   plans p2 among the partitions and is refused.
 #
 # isolationtester cannot receive COPY ... TO STDOUT, so the COPY writes a
 # server file, which the same function reads back.
@@ -62,6 +65,6 @@ step o_lock      { BEGIN; LOCK TABLE p1 IN ACCESS EXCLUSIVE MODE; }
 step o_commit    { COMMIT; }
 
 # attach_during
-permutation r_begin p_repack_p2 o_lock r_copy p_attach o_commit r_commit(p_attach) p_count
+permutation r_begin p_repack_p2 o_lock r_copy p_attach o_commit r_commit p_count
 # attach_before
 permutation r_begin p_repack_p2 p_attach r_copy r_commit p_count

@@ -29,7 +29,8 @@
  *   REPACK with the CONCURRENTLY option counts as an unsafe rewriter, and it
  *   is refused unless the record table exists and is locked first. COPY
  *   relation TO, which reads outside the executor, gets the reader check
- *   here.
+ *   here; for a partitioned table it is turned into COPY (query) TO, which
+ *   the executor hook checks.
  * - ExecutorStart_hook: after the executor holds its relation locks, looks
  *   for unsafe-rewrite records.
  *
@@ -62,17 +63,19 @@
 #include "catalog/objectaddress.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_index.h"
-#include "catalog/pg_inherits.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
 #include "catalog/storage.h"
+#include "commands/copy.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
 #include "commands/trigger.h"
 #include "executor/executor.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
+#include "nodes/value.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "storage/lock.h"
@@ -86,6 +89,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/rls.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/xid8.h"
@@ -798,100 +802,117 @@ checkUnsafeRewriteRecords(QueryDesc *queryDesc)
 }
 
 /**
- * @brief List a partitioned table's partitions so that the list cannot grow
- * @param relid A partitioned table, on which the caller holds a lock
- * @param attachLocked Output: the partitioned tables locked here with
- *        ShareUpdateExclusiveLock, appended to the list; the caller releases
- *        those locks once the statement has scanned the partitions
- * @return relid and every relation below it, each locked with
- *         AccessShareLock
+ * @brief Turn COPY partitioned_table TO into COPY (SELECT ...) TO
+ * @param stmt The statement, which the caller may modify
+ * @param relid The partitioned table, on which the caller holds
+ *        AccessShareLock
  *
- * Invariant: until the locks in attachLocked are released, listing the
- * partitions again returns no relation that is not in the returned list.
- * A relation joins the tree only as a partition of one of its partitioned
- * tables, through CREATE TABLE ... PARTITION OF or ALTER TABLE ... ATTACH
- * PARTITION, and both take at least ShareUpdateExclusiveLock on that parent
- * (tablecmds.c, DefineRelation and AlterTableGetLockLevel), which conflicts
- * with itself. So every partitioned table in the tree is locked in that mode
- * and the tree is listed again until a listing finds each of them locked
- * before it began.
+ * Invariant: the rewritten statement writes what the relation form writes,
+ * and reads only relations that are in a plan's range table, which the
+ * reader check in ExecutorStart covers.
+ *
+ * The relation form lists the partitions when DoCopy starts and scans that
+ * list outside the executor (copyto.c, BeginCopyTo and DoCopyTo). A check
+ * made here would use a list taken earlier, and a table repacked after the
+ * reader's snapshot and attached between the two listings would be scanned
+ * unchecked (specs/copy_attach_race.spec). The query form has one listing,
+ * the planner's, and the executor scans exactly the relations it locked.
+ *
+ * The select list is the column list the relation form uses: CopyGetAttnums
+ * gives the columns named in the statement, or every column that is neither
+ * dropped nor generated, and raises the relation form's errors for a
+ * generated, repeated or unknown column (copy.c). The table is named with
+ * its schema and the caller's lock keeps that name from being dropped or
+ * renamed, so the query reads the relation examined here. Privileges are
+ * checked by the executor for the same columns.
+ *
+ * One difference from the relation form: a partition that is a foreign
+ * table is read, where BeginCopyTo raises an error.
  */
-static List *
-listStablePartitions(Oid relid, List **attachLocked)
+static void
+copyPartitionedAsQuery(CopyStmt *stmt, Oid relid)
 {
-    LockRelationOid(relid, ShareUpdateExclusiveLock);
-    *attachLocked = lappend_oid(*attachLocked, relid);
+    Relation    rel = table_open(relid, NoLock);
+    TupleDesc   desc = RelationGetDescr(rel);
+    List       *attnums = CopyGetAttnums(desc, rel, stmt->attlist);
+    SelectStmt *select = makeNode(SelectStmt);
+    RangeVar   *from;
 
-    for (;;)
+    foreach_int(attnum, attnums)
     {
-        List       *relids;
-        bool        lockedMore = false;
+        ColumnRef  *column = makeNode(ColumnRef);
+        ResTarget  *target = makeNode(ResTarget);
 
-        CHECK_FOR_INTERRUPTS();
-
-        relids = find_all_inheritors(relid, AccessShareLock, NULL);
-        foreach_oid(child, relids)
-        {
-            if (get_rel_relkind(child) != RELKIND_PARTITIONED_TABLE ||
-                list_member_oid(*attachLocked, child))
-                continue;
-            LockRelationOid(child, ShareUpdateExclusiveLock);
-            *attachLocked = lappend_oid(*attachLocked, child);
-            lockedMore = true;
-        }
-        if (!lockedMore)
-            return relids;
-        list_free(relids);
+        column->fields =
+            list_make1(makeString(pstrdup(NameStr(TupleDescAttr(desc, attnum - 1)->attname))));
+        column->location = -1;
+        target->val = (Node *) column;
+        target->location = -1;
+        select->targetList = lappend(select->targetList, target);
     }
+
+    from = makeRangeVar(get_namespace_name(RelationGetNamespace(rel)),
+                        pstrdup(RelationGetRelationName(rel)), -1);
+    from->inh = true;
+    select->fromClause = list_make1(from);
+    table_close(rel, NoLock);
+
+    stmt->relation = NULL;
+    stmt->attlist = NIL;
+    stmt->query = (Node *) select;
 }
 
 /**
  * @brief Reader check for COPY relation TO
  * @param pstmt Planned statement wrapping a CopyStmt
  * @param readOnlyTree Whether pstmt must not be modified
- * @param attachLocked Output: see listStablePartitions
- * @return The statement to run: pstmt, or a copy naming the checked
- *         relation with its schema
+ * @return The statement to run: a copy of pstmt if it was read-only,
+ *         changed as described below
  *
- * COPY relation TO scans the relation, or every partition of a partitioned
- * table, with the active snapshot, outside the executor (copy.c, DoCopy;
- * copyto.c, CopyRelationTo). COPY (query) TO, and COPY of a relation with
- * row-level security, run a query and are checked in ExecutorStart.
+ * COPY relation TO scans the relation with the active snapshot, outside the
+ * executor (copy.c, DoCopy; copyto.c, DoCopyTo). COPY (query) TO runs a
+ * query and is checked in ExecutorStart.
  *
- * The relation and its partitions are locked here with the AccessShareLock
- * DoCopy takes, then checked against the active snapshot. Under READ
- * COMMITTED that snapshot was taken before the lock, so a REPACK that
- * committed while this COPY waited for the lock is caught too. The returned
- * statement names the relation with its schema, and the lock keeps that name
- * from being dropped or renamed, so DoCopy opens the relation checked here.
- * For a partitioned table, DoCopy lists the partitions again and scans that
- * list (copyto.c, BeginCopyTo); listStablePartitions keeps it equal to the
- * list checked here.
+ * The relation is locked here with the AccessShareLock DoCopy takes. Then:
+ * - A partitioned table without row-level security is turned into
+ *   COPY (query) TO (copyPartitionedAsQuery), whether or not this database
+ *   has records: a record written after this point must be seen too, and
+ *   only the executor's check runs late enough.
+ * - A partitioned table with row-level security is left as it is: DoCopy
+ *   turns it into a query itself, or raises an error when row_security is
+ *   off (copy.c, check_enable_rls). Both calls of check_enable_rls run in
+ *   this statement, for the same user and settings, so they agree.
+ * - Any other relation is checked here against the active snapshot. Under
+ *   READ COMMITTED that snapshot was taken before the lock, so a REPACK that
+ *   committed while this COPY waited for the lock is caught too. The
+ *   statement is made to name the relation with its schema, and the lock
+ *   keeps that name from being dropped or renamed, so DoCopy opens the
+ *   relation checked here.
  */
 static PlannedStmt *
-checkCopyTo(PlannedStmt *pstmt, bool readOnlyTree, List **attachLocked)
+checkCopyTo(PlannedStmt *pstmt, bool readOnlyTree)
 {
     CopyStmt   *stmt = (CopyStmt *) pstmt->utilityStmt;
     Oid         relid;
-    List       *relids;
-    Snapshot    snapshot;
 
     relid = RangeVarGetRelid(stmt->relation, AccessShareLock, false);
-    if (get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE)
-        relids = listStablePartitions(relid, attachLocked);
-    else
-        relids = list_make1_oid(relid);
-
-    if (recordCacheHasRecords())
-    {
-        snapshot = ActiveSnapshotSet() ? GetActiveSnapshot() : InvalidSnapshot;
-        foreach_oid(child, relids)
-            checkRelationRecords(child, snapshot);
-    }
 
     if (readOnlyTree)
         pstmt = copyObject(pstmt);
     stmt = (CopyStmt *) pstmt->utilityStmt;
+
+    if (get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE)
+    {
+        if (check_enable_rls(relid, InvalidOid, true) != RLS_ENABLED)
+            copyPartitionedAsQuery(stmt, relid);
+        return pstmt;
+    }
+
+    if (recordCacheHasRecords())
+        checkRelationRecords(relid,
+                             ActiveSnapshotSet()
+                             ? GetActiveSnapshot() : InvalidSnapshot);
+
     stmt->relation->schemaname = get_namespace_name(get_rel_namespace(relid));
     stmt->relation->relname = get_rel_name(relid);
     stmt->relation->catalogname = NULL;
@@ -1981,7 +2002,6 @@ processUtilityHook(PlannedStmt *pstmt, const char *queryString,
     Oid         recordTable = InvalidOid;
     bool        unsafeRewriter = isConcurrentRepack(pstmt->utilityStmt);
     bool        mvccSafeRewriter;
-    List       *attachLocked = NIL;
 
     /*
      * An unsafe rewrite must be recorded, so it runs only once the record
@@ -2010,7 +2030,7 @@ processUtilityHook(PlannedStmt *pstmt, const char *queryString,
         !((CopyStmt *) pstmt->utilityStmt)->is_from &&
         ((CopyStmt *) pstmt->utilityStmt)->relation != NULL)
     {
-        pstmt = checkCopyTo(pstmt, readOnlyTree, &attachLocked);
+        pstmt = checkCopyTo(pstmt, readOnlyTree);
         /* The statement is now checkCopyTo's copy, or was modifiable. */
         readOnlyTree = false;
     }
@@ -2027,13 +2047,6 @@ processUtilityHook(PlannedStmt *pstmt, const char *queryString,
 
     runUtilityAs(recordTable, mvccSafeRewriter, pstmt, queryString,
                  readOnlyTree, context, params, queryEnv, dest, qc);
-
-    /*
-     * The COPY has scanned its partitions, so partitions may be attached
-     * again. After an error, the transaction's abort releases these locks.
-     */
-    foreach_oid(parent, attachLocked)
-        UnlockRelationOid(parent, ShareUpdateExclusiveLock);
 }
 
 /**

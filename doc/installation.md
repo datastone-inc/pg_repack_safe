@@ -113,6 +113,8 @@ order (`t/004_hook_chain.pl` with `pg_stat_statements`,
 `ProcessUtility_hook` (`REPACK (CONCURRENTLY)` without the preload or the
 extension, the optional pre-check, a refused `COPY ... TO`) is not passed on
 to the hooks of libraries loaded before it: it must not run at all.
+Libraries loaded before it also see `COPY partitioned_table TO` in the form
+it is run in, `COPY (SELECT ...) TO` (README, "How it works").
 
 It registers a custom WAL resource manager with ID 149, reserved for
 `pg_repack_safe` on the PostgreSQL wiki

@@ -27,11 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend keeps a copy of the records, so a query does not read the record
   table; the writer, and a statement trigger on the record table for changes
   made by hand, invalidate it.
-- `COPY relation TO` of a partitioned table holds `ShareUpdateExclusiveLock`
-  on it and on every partitioned table below it while the statement runs, so
-  a partition attached during the COPY cannot be scanned unchecked. `ALTER
-  TABLE ... ATTACH PARTITION`, `ANALYZE` and a second `COPY ... TO` of the
-  same partitioned table wait for the COPY to end.
+- `COPY partitioned_table TO` is run as `COPY (SELECT columns FROM
+  partitioned_table) TO`, so that a partition attached during the COPY
+  cannot be scanned unchecked and no lock beyond COPY's own is taken. The
+  output is unchanged; a partition that is a foreign table is read where
+  stock PostgreSQL raises an error, and the statement is about 5% slower.
 - `REPACK (CONCURRENTLY)` is refused unless the library was loaded through
   `shared_preload_libraries`, in a database without the extension, and when
   the record table cannot be found or does not have the definition the
@@ -69,7 +69,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extensions.
 - Tests, run by `make installcheck` on temporary instances:
   - regression: `doc_examples`, `storage_change`, `reader_check`, `writer`,
-    `protection`;
+    `protection`, `copy_partitioned`;
   - isolation: `repack_concurrently_snapshot`, `repack_concurrently_cursor`,
     `reader_guard_edges`, `reader_cache`, `precheck`, `copy_attach_race`, and
     `known_gaps`, which pins what the extension does not cover (TRUNCATE,

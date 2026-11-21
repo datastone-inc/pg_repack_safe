@@ -90,12 +90,22 @@ records, refreshed by cache invalidation, so the check costs about as much
 as a hash lookup. The design and its evidence are in
 [doc/research/fix-design.md](doc/research/fix-design.md).
 
-`COPY relation TO` of a partitioned table also holds
-`ShareUpdateExclusiveLock` on it, and on any partitioned table below it,
-until the statement ends, so that no partition is attached after the check.
-`ALTER TABLE ... ATTACH PARTITION`, `ANALYZE` and another `COPY ... TO` of
-the same partitioned table wait for it. `COPY (SELECT ...) TO` takes no such
-lock.
+`COPY partitioned_table TO` is run as `COPY (SELECT columns FROM
+partitioned_table) TO`, in every database of a server with the library
+loaded, so that the check covers exactly the partitions that are read. The
+rows and their format are the same and no extra lock is taken. Three things
+differ from stock PostgreSQL 19:
+
+- a partition that is a foreign table is read, where stock raises "cannot
+  copy from foreign table";
+- the statement goes through the executor, which measured about 5% slower
+  (4 million rows in 8 partitions, text and binary);
+- a partitioned table with row-level security is unchanged: PostgreSQL
+  already runs it as a query.
+
+Logical replication's initial copy of a table published through its
+partitioned root is such a statement; `pg_dump` copies each partition by
+itself and is not affected.
 
 The record table is protected:
 
