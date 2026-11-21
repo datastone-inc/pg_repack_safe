@@ -12,12 +12,12 @@
 # A session whose record cache was loaded, holding an earlier REPACK's
 # record, must also get the error once a later REPACK is replayed (step 7).
 #
-# This pins the hazard found while building record cleanup
-# (doc/research/fix-design.md, step 6): when a record was deleted by the
-# transaction that inserted it, the primary's VACUUM removed it and the
-# standby replayed the removal without a recovery conflict
-# (heapam.c, HeapTupleHeaderAdvanceConflictHorizon ignores rows deleted by
-# their inserting transaction), so this snapshot read the table as empty.
+# Records are never deleted, so the primary's VACUUM finds no record to
+# remove. Were a record deleted by the transaction that inserted it, VACUUM
+# would remove it and the standby would replay the removal without a recovery
+# conflict (heapam.c, HeapTupleHeaderAdvanceConflictHorizon ignores rows
+# deleted by their inserting transaction), and this snapshot would read the
+# table as empty (doc/research/fix-design.md, step 6).
 
 use strict;
 use warnings FATAL => 'all';

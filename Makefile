@@ -22,8 +22,9 @@ ISOLATION = repack_concurrently_snapshot repack_concurrently_cursor \
 ISOLATION_OPTS = --temp-instance=./tmp_check_iso \
                  --temp-config=$(srcdir)/test/temp_instance.conf
 
-# t/*.pl: cases that need separate client programs (pg_dump). Each test
-# creates its own temporary cluster from the installed binaries.
+# t/*.pl: cases a spec cannot set up: client programs (pg_dump, pg_upgrade),
+# standbys, logical replication, and other preloaded modules. Each test creates its own temporary clusters from the
+# installed binaries.
 TAP_TESTS = 1
 
 # Compiler flags

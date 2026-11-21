@@ -16,8 +16,7 @@
 # holds ACCESS SHARE on it, so REPACK waits for it and the reader sees 5 rows.
 #
 # The extension is created once and never dropped: the instance is temporary,
-# and dropping it while it holds records is open question 15 of
-# doc/research/fix-design.md.
+# and dropping it while it holds records is refused (sql/protection.sql).
 
 setup
 {

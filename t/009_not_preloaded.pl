@@ -40,6 +40,19 @@ like($stderr,
     qr/REPACK \(CONCURRENTLY\) requires pg_repack_safe in shared_preload_libraries/,
     'library loaded with LOAD: the error names the setting');
 
+# Firing a trigger of the record table loads the library for its C function.
+($ret, $stdout, $stderr) = $node->psql('postgres', q{
+    BEGIN;
+    INSERT INTO pg_repack_safe_rewrites VALUES (0, '1');
+    ROLLBACK;
+    REPACK (CONCURRENTLY) t;
+});
+isnt($ret, 0,
+    'library loaded by a trigger function: REPACK (CONCURRENTLY) refused');
+like($stderr,
+    qr/REPACK \(CONCURRENTLY\) requires pg_repack_safe in shared_preload_libraries/,
+    'library loaded by a trigger function: the error names the setting');
+
 $node->append_conf('postgresql.conf',
     "session_preload_libraries = 'pg_repack_safe'\n");
 $node->reload;
@@ -47,6 +60,9 @@ $node->reload;
   $node->psql('postgres', 'REPACK (CONCURRENTLY) t');
 isnt($ret, 0,
     'library in session_preload_libraries: REPACK (CONCURRENTLY) refused');
+like($stderr,
+    qr/REPACK \(CONCURRENTLY\) requires pg_repack_safe in shared_preload_libraries/,
+    'library in session_preload_libraries: the error names the setting');
 $node->append_conf('postgresql.conf', "session_preload_libraries = ''\n");
 $node->reload;
 

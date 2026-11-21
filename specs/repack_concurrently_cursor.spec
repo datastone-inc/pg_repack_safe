@@ -20,8 +20,7 @@
 # customers and REPACK waits for the cursor's transaction to end.
 #
 # The extension is created once and never dropped: the instance is temporary,
-# and dropping it while it holds records is open question 15 of
-# doc/research/fix-design.md.
+# and dropping it while it holds records is refused (sql/protection.sql).
 
 setup
 {

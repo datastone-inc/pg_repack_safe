@@ -1,4 +1,14 @@
--- Tests for the SQL examples in README.md and doc/*.md.
+/*
+ * Copyright (c) 2026 dataStone Inc.
+ * SPDX-License-Identifier: MIT
+ */
+
+/**
+ * @file doc_examples.sql
+ * @brief A test for every SQL example in README.md and the files in doc
+ *
+ * Each block is headed by the document and section its example comes from.
+ */
 
 -- README.md, Installation; doc/installation.md, Enabling the Extension
 CREATE EXTENSION pg_repack_safe;

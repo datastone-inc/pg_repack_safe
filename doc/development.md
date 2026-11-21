@@ -7,6 +7,13 @@
 - Git
 - Make
 
+`make installcheck` also needs:
+
+- a PostgreSQL 19 build configured with TAP tests enabled
+  (`--enable-tap-tests`), and the Perl module `IPC::Run`;
+- the contrib modules `pg_stat_statements` (`t/004_hook_chain.pl`) and
+  `pageinspect` (`t/002_standby_record_removal.pl`) installed.
+
 ## Clone and Build
 
 ```bash

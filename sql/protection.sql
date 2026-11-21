@@ -87,6 +87,18 @@ ALTER TABLE pg_repack_safe_rewrites
     ENABLE REPLICA TRIGGER pg_repack_safe_rewrites_changed;
 DROP TRIGGER pg_repack_safe_rewrites_changed ON pg_repack_safe_rewrites;
 DROP TRIGGER pg_repack_safe_rewrites_protected ON pg_repack_safe_rewrites;
+-- Dropping a trigger function with CASCADE would drop its trigger: refused.
+-- (PostgreSQL itself refuses to drop a member of the extension, so the
+-- function is detached first.)
+ALTER EXTENSION pg_repack_safe DROP FUNCTION pg_repack_safe_records_protected();
+DROP FUNCTION pg_repack_safe_records_protected();
+DROP FUNCTION pg_repack_safe_records_protected() CASCADE;
+ALTER EXTENSION pg_repack_safe ADD FUNCTION pg_repack_safe_records_protected();
+-- Dropping the extension's schema with CASCADE would drop the extension:
+-- refused.
+DROP SCHEMA public CASCADE;
+SELECT count(*) AS triggers FROM pg_trigger
+WHERE tgrelid = 'pg_repack_safe_rewrites'::regclass;
 -- Renaming a trigger changes nothing it does: allowed.
 ALTER TRIGGER pg_repack_safe_rewrites_changed ON pg_repack_safe_rewrites
     RENAME TO pr_renamed;

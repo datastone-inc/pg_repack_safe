@@ -9,87 +9,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Repository skeleton: PGXS build, extension control file, empty install
-  script, and a `doc_examples` regression test that creates the extension.
-- Loadable library with `object_access`, `ProcessUtility` and `ExecutorStart`
-  hooks. It detects replacement of a table's storage and classifies
-  `REPACK (CONCURRENTLY)` as the unsafe rewriter.
-- With the library loaded, a query is refused when the extension exists but
-  its record table cannot be found
-  (renamed, moved to another schema, or dropped). The missing-table refusal
-  is skipped in binary-upgrade mode so that `pg_upgrade` works.
-- `REPACK (CONCURRENTLY)` is refused when the extension exists but its record
-  table cannot be found, in binary-upgrade mode too.
-- With the library loaded, `REPACK (CONCURRENTLY)` of a table whose storage
-  has blocks records the table and its post-swap TOAST relation, with the
-  rewriting transaction's ID, in `pg_repack_safe_rewrites`.
+- `pg_repack_safe` extension and library for PostgreSQL 19, built with PGXS.
+  The library installs `object_access`, `ProcessUtility` and `ExecutorStart`
+  hooks, each chained to the previous one. It detects replacement of a
+  table's storage and classifies `REPACK (CONCURRENTLY)` as the unsafe
+  rewriter. It builds against PostgreSQL with or without assertions.
+- `pg_repack_safe_rewrites` record table, created by the extension, always
+  with the `heap` access method. `REPACK (CONCURRENTLY)` of a table whose
+  storage has blocks records the table and its post-swap TOAST relation
+  there, with the rewriting transaction's full ID (`xid8`), so a record
+  never comes to name a newer transaction.
 - Reader check: a query whose snapshot does not see a committed
   `REPACK (CONCURRENTLY)` of a table it reads fails with SQLSTATE 40001,
   "cannot read table ... with this snapshot", instead of reading the table
   as empty. Checked in the executor and for `COPY relation TO` (including
-  partitioned tables), so `pg_dump` fails instead of dumping no rows.
+  partitioned tables), so `pg_dump` fails instead of dumping no rows. Each
+  backend keeps a copy of the records, so a query does not read the record
+  table; the writer, and a statement trigger on the record table for changes
+  made by hand, invalidate it.
 - `COPY relation TO` of a partitioned table holds `ShareUpdateExclusiveLock`
   on it and on every partitioned table below it while the statement runs, so
   a partition attached during the COPY cannot be scanned unchecked. `ALTER
   TABLE ... ATTACH PARTITION`, `ANALYZE` and a second `COPY ... TO` of the
   same partitioned table wait for the COPY to end.
-- Per-backend cache of the records, so a query no longer reads the record
-  table. The writer, and a statement trigger on the record table for changes
-  made by hand, invalidate it.
 - `REPACK (CONCURRENTLY)` is refused unless the library was loaded through
-  `shared_preload_libraries`.
-- Optional pre-check, `pg_repack_safe.precheck_snapshot_age` (off by
-  default): `REPACK (CONCURRENTLY)` refuses to run, at its start and at the
-  swap, while a session in the database holds a snapshot that outlives a
-  statement, has not locked the table, and is at least that old.
+  `shared_preload_libraries`, in a database without the extension, and when
+  the record table cannot be found or does not have the definition the
+  extension created.
+- A query is refused when the extension exists but its record table cannot
+  be found (renamed, moved to another schema, or dropped) or lacks either of
+  its triggers firing ALWAYS. Both refusals are skipped in binary-upgrade
+  mode so that `pg_upgrade` works; `REPACK (CONCURRENTLY)` stays refused
+  there. `pg_upgrade` carries the records over unchanged.
+- The record table is protected. `UPDATE` and `DELETE` of records,
+  `REPACK (CONCURRENTLY)` and rewriting `ALTER TABLE` of the table, and
+  changes to when its triggers fire are refused (`VACUUM FULL`, `CLUSTER`
+  and `REPACK` are allowed). While it holds records, `DROP` of the table,
+  its triggers or the extension, and `TRUNCATE`, are refused unless a
+  superuser sets `pg_repack_safe.allow_unprotected_drop`. The README
+  describes how to remove the extension safely.
 - Custom WAL resource manager (`RM_EXPERIMENTAL_ID` for now): each
   `REPACK (CONCURRENTLY)` logs a record before its commit, so a standby
   without the library stops replay instead of serving the repacked table to
   old snapshots.
-- The record table is protected while it holds records: `DROP` of the
-  table, its triggers or the extension, and `TRUNCATE`, are refused unless a
-  superuser sets `pg_repack_safe.allow_unprotected_drop`; `UPDATE`, `DELETE`,
-  `REPACK (CONCURRENTLY)` and rewriting `ALTER TABLE` of it, and changes to
-  when its triggers fire are refused (`VACUUM FULL`, `CLUSTER` and `REPACK`
-  are allowed). The README describes how to remove the extension safely. A
-  record table without both triggers firing ALWAYS refuses every read and
-  `REPACK (CONCURRENTLY)`.
-- `REPACK (CONCURRENTLY)` is refused in a database without the extension, and
-  when the record table does not have the definition the extension created.
-- `pg_repack_safe_rewrites` record table, created by the extension, always
-  with the `heap` access method. `rewrite_xid` is a full transaction ID
-  (`xid8`), so a record never comes to name a newer transaction.
+- Optional pre-check, `pg_repack_safe.precheck_snapshot_age` (off by
+  default): `REPACK (CONCURRENTLY)` refuses to run, at its start and at the
+  swap, while a session in the database holds a snapshot that outlives a
+  statement, has not locked the table, and is at least that old.
 - `pg_repack_safe.trace_storage_changes` setting (superuser), which reports
   each detected replacement of storage that existed before the current
   transaction as a NOTICE.
-- Tests: `reader_guard_edges` isolation spec (edge cases and read paths of
-  the reader guard), `reader_cache` isolation spec (a loaded cache learns of
-  later records), `storage_change`, `reader_check` and `writer`
-  regression tests,
-  `t/002_standby_record_removal.pl`, `t/003_pg_upgrade.pl`,
-  `t/004_hook_chain.pl` (hook chaining with `pg_stat_statements`) and
-  `t/005_reader_guard.pl` (the error as a client sees it) and
-  `t/006_record_xid8.pl` (records across an XID epoch) and
-  `t/007_standby_reader.pl` (the guard on a hot standby) and
-  `t/008_copy_guard.pl` (COPY ... TO), `protection` regression test,
-  `t/009_not_preloaded.pl`, `t/010_standby_wal_record.pl`, `precheck`
-  isolation spec and `t/011_precheck.pl`.
-- Known-gap tests that pin today's behaviour: `known_gaps` isolation spec
-  (TRUNCATE, rewriting ALTER TABLE, REFRESH MATERIALIZED VIEW, the
-  foreign-key check), `t/012_standby_safe_rewrite.pl` (VACUUM FULL and
-  REPACK against hot standbys without feedback); and `t/013_tablesync.pl`
-  and `t/014_plpgsql_toast.pl` for paths found protected. README "Known
-  gaps" lists them.
-- `t/015_oat_hook_chain.pl` (object access hook chaining), with the
-  test-only module `test/modules/oat_observer`, installed by
-  `make installcheck` and not by `make install`.
-
-### Changed
-
-- Builds against release (non-assert) PostgreSQL builds: unused parameters
-  in PostgreSQL's headers are no longer errors.
-
-- README rewritten around what is unsafe in stock PostgreSQL 19, what the
-  extension guarantees and what it does not; `doc/installation.md` covers
-  server and standby configuration, settings, `pg_upgrade` and other
+- Documentation: the README covers what is unsafe in stock PostgreSQL 19,
+  what the extension guarantees and what it does not; `doc/installation.md`
+  covers server and standby configuration, settings, `pg_upgrade` and other
   extensions.
+- Tests, run by `make installcheck` on temporary instances:
+  - regression: `doc_examples`, `storage_change`, `reader_check`, `writer`,
+    `protection`;
+  - isolation: `repack_concurrently_snapshot`, `repack_concurrently_cursor`,
+    `reader_guard_edges`, `reader_cache`, `precheck`, `copy_attach_race`, and
+    `known_gaps`, which pins what the extension does not cover (TRUNCATE,
+    rewriting ALTER TABLE, REFRESH MATERIALIZED VIEW, the foreign-key
+    check);
+  - TAP (`t/001` to `t/015`): `pg_dump`, `pg_upgrade`, hot standbys, hook
+    chaining with `pg_stat_statements` and with the test-only module
+    `test/modules/oat_observer` (installed by `make installcheck`, not by
+    `make install`), COPY, the pre-check, logical replication's initial
+    copy, and PL/pgSQL procedures that commit in a loop.

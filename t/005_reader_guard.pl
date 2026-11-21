@@ -49,8 +49,6 @@ foreach my $i (0 .. 1)
 
 $node->safe_psql('postgres',
     'REPACK (CONCURRENTLY) t USING INDEX t_pkey');
-my $toast = $node->safe_psql('postgres',
-    q{SELECT reltoastrelid::regclass FROM pg_class WHERE oid = 't'::regclass});
 
 # Run one statement in a reader session and return (stdout, stderr).
 sub runIn
@@ -80,7 +78,7 @@ runIn($readers[1], 'ROLLBACK');
 runIn($readers[1], 'BEGIN ISOLATION LEVEL REPEATABLE READ');
 
 # A fresh transaction, but its snapshot is taken now: it sees the REPACK.
-($out, $err) = runIn($readers[0], 'SELECT count(*) FROM t');
+($out, $err) = runIn($readers[1], 'SELECT count(*) FROM t');
 is($err, '', 'new snapshot: no error');
 is($out, '5', 'new snapshot: every row');
 
@@ -92,7 +90,7 @@ $toastReader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
 $toastReader->query_safe('SELECT count(*) FROM other');
 $node->safe_psql('postgres',
     'REPACK (CONCURRENTLY) t USING INDEX t_pkey');
-$toast = $node->safe_psql('postgres',
+my $toast = $node->safe_psql('postgres',
     q{SELECT reltoastrelid::regclass FROM pg_class WHERE oid = 't'::regclass});
 (my $toastName = $toast) =~ s/^pg_toast\.//;
 ($out, $err) = runIn($toastReader, "SELECT count(*) FROM $toast");

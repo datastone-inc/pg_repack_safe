@@ -399,12 +399,17 @@ Probe results, 2026-11-15, skeleton library `src/pg_repack_safe.c`:
   (CONCURRENTLY) when the record table does not exist in the current
   database. A reader in such a database passes, which is sound only because
   of that refusal.
-- **Tampering with the record table (Q15).** DELETE is harmless (see record
+- **Tampering with the record table (Q15).** *Superseded by step 9: UPDATE
+  and DELETE of records are refused by trigger, and VACUUM FULL, CLUSTER and
+  REPACK without CONCURRENTLY of the record table are allowed.* As first
+  designed: DELETE is harmless (see record
   lifetime). Refuse DROP (`OAT_DROP`), TRUNCATE (`OAT_TRUNCATE`) and any
   rewrite (REPACK, CLUSTER, VACUUM FULL) of the record table; a rewrite drops
   dead rows a standby may still need (open question 1). A superuser UPDATE of
   a record is not defended against.
-- **Cost (Q8).** The fast path is one open-and-size check of the record
+- **Cost (Q8).** *Superseded by step 7: each backend keeps a copy of the
+  records, and a query does not open the record table.* As first designed:
+  the fast path is one open-and-size check of the record
   table per `ExecutorStart`, not per relation; see the probe results above
   for its cost and the proposed cache.
 

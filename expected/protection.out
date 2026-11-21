@@ -151,6 +151,36 @@ DROP TRIGGER pg_repack_safe_rewrites_protected ON pg_repack_safe_rewrites;
 ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
 DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
 HINT:  First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, "Removing the extension"); then a superuser can set pg_repack_safe.allow_unprotected_drop.
+-- Dropping a trigger function with CASCADE would drop its trigger: refused.
+-- (PostgreSQL itself refuses to drop a member of the extension, so the
+-- function is detached first.)
+ALTER EXTENSION pg_repack_safe DROP FUNCTION pg_repack_safe_records_protected();
+DROP FUNCTION pg_repack_safe_records_protected();
+ERROR:  cannot drop function pg_repack_safe_records_protected() because other objects depend on it
+DETAIL:  trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites depends on function pg_repack_safe_records_protected()
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+DROP FUNCTION pg_repack_safe_records_protected() CASCADE;
+NOTICE:  drop cascades to trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites
+ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
+DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+HINT:  First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, "Removing the extension"); then a superuser can set pg_repack_safe.allow_unprotected_drop.
+ALTER EXTENSION pg_repack_safe ADD FUNCTION pg_repack_safe_records_protected();
+-- Dropping the extension's schema with CASCADE would drop the extension:
+-- refused.
+DROP SCHEMA public CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to extension pg_repack_safe
+drop cascades to table pr_t
+ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
+DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+HINT:  First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, "Removing the extension"); then a superuser can set pg_repack_safe.allow_unprotected_drop.
+SELECT count(*) AS triggers FROM pg_trigger
+WHERE tgrelid = 'pg_repack_safe_rewrites'::regclass;
+ triggers 
+----------
+        2
+(1 row)
+
 -- Renaming a trigger changes nothing it does: allowed.
 ALTER TRIGGER pg_repack_safe_rewrites_changed ON pg_repack_safe_rewrites
     RENAME TO pr_renamed;

@@ -158,8 +158,12 @@ Each has a test that pins today's behaviour.
   extension could also guard these rewrites on standbys, as it does
   `REPACK (CONCURRENTLY)`.
 - **A standby without the library** whose replay starts in the moment
-  between a `REPACK (CONCURRENTLY)`'s WAL record and its commit, and **a
-  session that never loads the library**: see the requirements above.
+  between a `REPACK (CONCURRENTLY)`'s WAL record and its commit: see
+  [Requirements](#requirements).
+- **A session that never loads the library** has no hooks: its
+  `REPACK (CONCURRENTLY)` runs unrecorded and its reads are not checked
+  (`t/009_not_preloaded.pl`). Setting `shared_preload_libraries`, as the
+  requirements say, leaves no such session.
 
 Covered, for the record: `pg_dump`, `COPY ... TO`, logical replication's
 initial table copy (refused, and the sync worker retries;

@@ -1,13 +1,15 @@
 # Copyright (c) 2026 dataStone Inc.
 # SPDX-License-Identifier: MIT
 #
-# Design assumption behind the unsafe-rewrite record table, on a hot standby
-# without hot_standby_feedback (doc/research/fix-design.md, section 6c,
-# "Record lifetime").
+# Design probe of PostgreSQL's behaviour, for the rule that would let records
+# be deleted (doc/research/fix-design.md, section 6c, "Record lifetime", and
+# step 6). The extension does not delete records, and refuses DELETE on its
+# record table; this test shows what a deletion would rely on, on a hot
+# standby without hot_standby_feedback.
 #
-# The primary cannot see standby snapshots, so it may DELETE and VACUUM a
+# The primary cannot see standby snapshots, so it could DELETE and VACUUM a
 # record while a standby transaction still needs it. The reader check scans
-# the record table with SnapshotAny, so the design holds only if both of
+# the record table with SnapshotAny, so deleting is safe only if both of
 # these are true:
 #
 #   1. After the DELETE is replayed, the row is still physically present on
@@ -16,8 +18,9 @@
 #      that predates the row's inserter is alive: replaying the VACUUM
 #      cancels that snapshot's query instead.
 #
-# This test uses a plain table with the record table's shape; it does not
-# load the extension.
+# This test uses a plain two-column table in place of the record table (its
+# transaction ID column is xid, where the record table's is xid8); it does
+# not load the extension.
 
 use strict;
 use warnings FATAL => 'all';

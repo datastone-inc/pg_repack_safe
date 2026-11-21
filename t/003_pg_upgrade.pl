@@ -7,7 +7,7 @@
 # record table in a later statement, with queries in between. The reader
 # check must not refuse those queries, or pg_upgrade cannot restore a
 # database that has the extension. After the upgrade the check must be in
-# force again.
+# force again, and the old cluster's records must have come along unchanged.
 
 use strict;
 use warnings FATAL => 'all';
@@ -18,18 +18,23 @@ use Test::More;
 
 my $preload = "shared_preload_libraries = 'pg_repack_safe'\n";
 
+# REPACK (CONCURRENTLY) needs wal_level = replica or higher.
 my $old = PostgreSQL::Test::Cluster->new('old');
-$old->init;
+$old->init(allows_streaming => 1);
 $old->append_conf('postgresql.conf', $preload);
 $old->start;
 $old->safe_psql('postgres', q{
     CREATE EXTENSION pg_repack_safe;
     CREATE TABLE customers (id int PRIMARY KEY, name text NOT NULL);
     INSERT INTO customers SELECT g, 'customer ' || g FROM generate_series(1, 5) g;
+    REPACK (CONCURRENTLY) customers USING INDEX customers_pkey;
 });
+my $recordsQuery = q{
+    SELECT relid::regclass, rewrite_xid FROM pg_repack_safe_rewrites
+    ORDER BY relid::regclass::text};
+my $oldRecords = $old->safe_psql('postgres', $recordsQuery);
 $old->stop;
 
-# REPACK (CONCURRENTLY) needs wal_level = replica or higher.
 my $new = PostgreSQL::Test::Cluster->new('new');
 $new->init(allows_streaming => 1);
 $new->append_conf('postgresql.conf', $preload);
@@ -71,8 +76,14 @@ is( $new->safe_psql('postgres', q{
     'public.pg_repack_safe_rewrites',
     'record table belongs to the extension after the upgrade');
 
+# The records come along: pg_upgrade keeps relation OIDs and transaction
+# IDs, so each still names the relation and the rewrite it was written for.
+# No snapshot from before the upgrade exists, so they refuse nothing.
+isnt($oldRecords, '', 'the old cluster holds records');
+is($new->safe_psql('postgres', $recordsQuery),
+    $oldRecords, 'records are carried over unchanged');
 is($new->safe_psql('postgres', 'SELECT count(*) FROM customers'),
-    '5', 'user data survives the upgrade');
+    '5', 'user data survives the upgrade, and a recorded table can be read');
 
 # Outside binary-upgrade mode the refusal is in force.
 $new->safe_psql('postgres',

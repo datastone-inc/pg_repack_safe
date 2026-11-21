@@ -82,8 +82,11 @@ It needs a superuser to create. Its settings:
 (`t/003_pg_upgrade.pl`). While a server runs in binary-upgrade mode,
 queries pass when the record table is missing or lacks its triggers,
 because `pg_restore` creates them in several steps;
-`REPACK (CONCURRENTLY)` is refused in that state. Records are not carried
-over (no snapshot survives an upgrade).
+`REPACK (CONCURRENTLY)` is refused in that state. Records are carried
+over unchanged: `pg_upgrade` keeps relation OIDs and transaction IDs, so
+each record still names the table and the rewrite it was written for. No
+snapshot survives an upgrade, so the old records refuse nothing in the new
+cluster.
 
 ## Other Extensions
 
