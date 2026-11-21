@@ -20,6 +20,13 @@
  * dropping them follows the DROP rule: they carry the cache invalidation and
  * the UPDATE/DELETE refusal. A record table without both triggers, firing
  * ALWAYS, refuses every read and REPACK (CONCURRENTLY).
+ * Refused always, with or without records and whatever the override says:
+ * - creating an index on the record table, in any spelling (CREATE INDEX,
+ *   a PRIMARY KEY or UNIQUE constraint): the writer inserts records without
+ *   maintaining indexes, so an index would miss every later record;
+ * - adding, dropping or altering a column of the record table (its type,
+ *   default, name or any other property): with any other column list every
+ *   query in the database would be refused.
  */
 CREATE EXTENSION pg_repack_safe;
 -- No record yet: dropping the extension is allowed.
@@ -90,11 +97,16 @@ SELECT relid = 'pr_t'::regclass AS pr_t_record FROM pg_repack_safe_rewrites;
  t
 (1 row)
 
-ALTER TABLE pg_repack_safe_rewrites
-    ALTER COLUMN relid TYPE oid USING (relid::text)::oid;
+ALTER TABLE pg_repack_safe_rewrites SET UNLOGGED;
 ERROR:  cannot rewrite the pg_repack_safe record table with this command
 DETAIL:  Only VACUUM FULL, CLUSTER and REPACK without CONCURRENTLY keep every record unchanged.
 HINT:  Use VACUUM FULL or REPACK.
+-- A rewriting column type change is refused as a column change, before it
+-- reaches the rewrite.
+ALTER TABLE pg_repack_safe_rewrites
+    ALTER COLUMN relid TYPE oid USING (relid::text)::oid;
+ERROR:  cannot change the columns of the pg_repack_safe record table
+DETAIL:  The extension reads and writes records as the two columns it created. With any other column list, every query in this database would be refused.
 -- PostgreSQL refuses this one itself (no identity index); were it to run,
 -- the hook would refuse its swap like the ALTER TABLE rewrite above.
 REPACK (CONCURRENTLY) pg_repack_safe_rewrites;
@@ -189,6 +201,130 @@ ALTER TRIGGER pr_renamed ON pg_repack_safe_rewrites
 -- Re-enabling as ALWAYS is a no-op: allowed.
 ALTER TABLE pg_repack_safe_rewrites
     ENABLE ALWAYS TRIGGER pg_repack_safe_rewrites_changed;
+-- Indexes: refused in every spelling, and none is left behind. The writer
+-- inserts records without maintaining indexes.
+CREATE INDEX pr_idx ON pg_repack_safe_rewrites (relid);
+ERROR:  cannot create an index on the pg_repack_safe record table
+DETAIL:  Records are inserted without maintaining indexes, so an index would miss every later record and a query using it would return stale results.
+CREATE UNIQUE INDEX pr_idx ON pg_repack_safe_rewrites (relid, rewrite_xid);
+ERROR:  cannot create an index on the pg_repack_safe record table
+DETAIL:  Records are inserted without maintaining indexes, so an index would miss every later record and a query using it would return stale results.
+CREATE INDEX CONCURRENTLY pr_idx ON pg_repack_safe_rewrites (relid);
+ERROR:  cannot create an index on the pg_repack_safe record table
+DETAIL:  Records are inserted without maintaining indexes, so an index would miss every later record and a query using it would return stale results.
+ALTER TABLE pg_repack_safe_rewrites ADD UNIQUE (relid, rewrite_xid);
+ERROR:  cannot create an index on the pg_repack_safe record table
+DETAIL:  Records are inserted without maintaining indexes, so an index would miss every later record and a query using it would return stale results.
+ALTER TABLE pg_repack_safe_rewrites ADD PRIMARY KEY (relid, rewrite_xid);
+ERROR:  cannot create an index on the pg_repack_safe record table
+DETAIL:  Records are inserted without maintaining indexes, so an index would miss every later record and a query using it would return stale results.
+SELECT count(*) AS indexes FROM pg_index
+WHERE indrelid = 'pg_repack_safe_rewrites'::regclass;
+ indexes 
+---------
+       0
+(1 row)
+
+-- An index on any other table is not affected.
+CREATE INDEX pr_t_idx ON pr_t (id);
+DROP INDEX pr_t_idx;
+-- Columns: adding, dropping or altering one is refused. Accepted, each of
+-- the first three would make every query in the database fail.
+ALTER TABLE pg_repack_safe_rewrites ADD COLUMN x text;
+ERROR:  cannot change the columns of the pg_repack_safe record table
+DETAIL:  The extension reads and writes records as the two columns it created. With any other column list, every query in this database would be refused.
+ALTER TABLE pg_repack_safe_rewrites DROP COLUMN relid;
+ERROR:  cannot change the columns of the pg_repack_safe record table
+DETAIL:  The extension reads and writes records as the two columns it created. With any other column list, every query in this database would be refused.
+ALTER TABLE pg_repack_safe_rewrites ALTER COLUMN relid TYPE regclass;
+ERROR:  cannot change the columns of the pg_repack_safe record table
+DETAIL:  The extension reads and writes records as the two columns it created. With any other column list, every query in this database would be refused.
+ALTER TABLE pg_repack_safe_rewrites ALTER COLUMN relid SET DEFAULT 0;
+ERROR:  cannot change the columns of the pg_repack_safe record table
+DETAIL:  The extension reads and writes records as the two columns it created. With any other column list, every query in this database would be refused.
+ALTER TABLE pg_repack_safe_rewrites RENAME COLUMN relid TO pr_renamed;
+ERROR:  cannot change the columns of the pg_repack_safe record table
+DETAIL:  The extension reads and writes records as the two columns it created. With any other column list, every query in this database would be refused.
+ALTER TABLE pg_repack_safe_rewrites ALTER COLUMN relid DROP NOT NULL;
+ERROR:  cannot change the columns of the pg_repack_safe record table
+DETAIL:  The extension reads and writes records as the two columns it created. With any other column list, every query in this database would be refused.
+ALTER TABLE pg_repack_safe_rewrites ALTER COLUMN relid SET STATISTICS 0;
+ERROR:  cannot change the columns of the pg_repack_safe record table
+DETAIL:  The extension reads and writes records as the two columns it created. With any other column list, every query in this database would be refused.
+SELECT attname, atttypid::regtype, atthasdef, attnotnull, attisdropped
+FROM pg_attribute
+WHERE attrelid = 'pg_repack_safe_rewrites'::regclass AND attnum > 0
+ORDER BY attnum;
+   attname   | atttypid | atthasdef | attnotnull | attisdropped 
+-------------+----------+-----------+------------+--------------
+ relid       | oid      | f         | t          | f
+ rewrite_xid | xid8     | f         | t          | f
+(2 rows)
+
+SELECT count(*) AS passes FROM pr_t;
+ passes 
+--------
+      5
+(1 row)
+
+-- No column of the record table is an object some other object's drop
+-- could take with it, so a drop of the whole table or of the extension
+-- drops no column separately.
+SELECT count(*) AS column_dependencies FROM pg_depend
+WHERE classid = 'pg_class'::regclass
+  AND objid = 'pg_repack_safe_rewrites'::regclass AND objsubid <> 0;
+ column_dependencies 
+---------------------
+                   0
+(1 row)
+
+-- The extension can be moved to another schema; the record table is still
+-- found there, with its records, and still protected.
+CREATE SCHEMA pr_s;
+ALTER EXTENSION pg_repack_safe SET SCHEMA pr_s;
+SELECT count(*) AS records FROM pr_s.pg_repack_safe_rewrites;
+ records 
+---------
+       2
+(1 row)
+
+CREATE INDEX pr_idx ON pr_s.pg_repack_safe_rewrites (relid);
+ERROR:  cannot create an index on the pg_repack_safe record table
+DETAIL:  Records are inserted without maintaining indexes, so an index would miss every later record and a query using it would return stale results.
+ALTER TABLE pr_s.pg_repack_safe_rewrites ADD UNIQUE (relid, rewrite_xid);
+ERROR:  cannot create an index on the pg_repack_safe record table
+DETAIL:  Records are inserted without maintaining indexes, so an index would miss every later record and a query using it would return stale results.
+ALTER TABLE pr_s.pg_repack_safe_rewrites ADD COLUMN x text;
+ERROR:  cannot change the columns of the pg_repack_safe record table
+DETAIL:  The extension reads and writes records as the two columns it created. With any other column list, every query in this database would be refused.
+ALTER TABLE pr_s.pg_repack_safe_rewrites DROP COLUMN relid;
+ERROR:  cannot change the columns of the pg_repack_safe record table
+DETAIL:  The extension reads and writes records as the two columns it created. With any other column list, every query in this database would be refused.
+ALTER TABLE pr_s.pg_repack_safe_rewrites ALTER COLUMN relid TYPE regclass;
+ERROR:  cannot change the columns of the pg_repack_safe record table
+DETAIL:  The extension reads and writes records as the two columns it created. With any other column list, every query in this database would be refused.
+DELETE FROM pr_s.pg_repack_safe_rewrites;
+ERROR:  cannot update or delete pg_repack_safe records
+DETAIL:  A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on a standby, relies on the record.
+DROP SCHEMA pr_s CASCADE;
+NOTICE:  drop cascades to extension pg_repack_safe
+ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
+DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_protected on table pr_s.pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+HINT:  First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, "Removing the extension"); then a superuser can set pg_repack_safe.allow_unprotected_drop.
+SELECT count(*) AS passes FROM pr_t;
+ passes 
+--------
+      5
+(1 row)
+
+ALTER EXTENSION pg_repack_safe SET SCHEMA public;
+DROP SCHEMA pr_s;
+SELECT count(*) AS records FROM pg_repack_safe_rewrites;
+ records 
+---------
+       2
+(1 row)
+
 -- The override is for superusers only.
 CREATE ROLE pr_user;
 SET ROLE pr_user;
@@ -197,13 +333,50 @@ ERROR:  permission denied to set parameter "pg_repack_safe.allow_unprotected_dro
 RESET ROLE;
 DROP ROLE pr_user;
 -- With the override, DROP and TRUNCATE are allowed; ALTER TABLE rewrites,
--- UPDATE, DELETE and the triggers stay refused.
+-- UPDATE, DELETE, the triggers, indexes and column changes stay refused.
 SET pg_repack_safe.allow_unprotected_drop = on;
-ALTER TABLE pg_repack_safe_rewrites
-    ALTER COLUMN relid TYPE oid USING (relid::text)::oid;
+ALTER TABLE pg_repack_safe_rewrites SET UNLOGGED;
 ERROR:  cannot rewrite the pg_repack_safe record table with this command
 DETAIL:  Only VACUUM FULL, CLUSTER and REPACK without CONCURRENTLY keep every record unchanged.
 HINT:  Use VACUUM FULL or REPACK.
+ALTER TABLE pg_repack_safe_rewrites
+    ALTER COLUMN relid TYPE oid USING (relid::text)::oid;
+ERROR:  cannot change the columns of the pg_repack_safe record table
+DETAIL:  The extension reads and writes records as the two columns it created. With any other column list, every query in this database would be refused.
+CREATE INDEX pr_idx ON pg_repack_safe_rewrites (relid);
+ERROR:  cannot create an index on the pg_repack_safe record table
+DETAIL:  Records are inserted without maintaining indexes, so an index would miss every later record and a query using it would return stale results.
+ALTER TABLE pg_repack_safe_rewrites ADD UNIQUE (relid, rewrite_xid);
+ERROR:  cannot create an index on the pg_repack_safe record table
+DETAIL:  Records are inserted without maintaining indexes, so an index would miss every later record and a query using it would return stale results.
+ALTER TABLE pg_repack_safe_rewrites ADD COLUMN x text;
+ERROR:  cannot change the columns of the pg_repack_safe record table
+DETAIL:  The extension reads and writes records as the two columns it created. With any other column list, every query in this database would be refused.
+ALTER TABLE pg_repack_safe_rewrites DROP COLUMN relid;
+ERROR:  cannot change the columns of the pg_repack_safe record table
+DETAIL:  The extension reads and writes records as the two columns it created. With any other column list, every query in this database would be refused.
+ALTER TABLE pg_repack_safe_rewrites ALTER COLUMN relid TYPE regclass;
+ERROR:  cannot change the columns of the pg_repack_safe record table
+DETAIL:  The extension reads and writes records as the two columns it created. With any other column list, every query in this database would be refused.
+ALTER TABLE pg_repack_safe_rewrites ALTER COLUMN relid SET DEFAULT 0;
+ERROR:  cannot change the columns of the pg_repack_safe record table
+DETAIL:  The extension reads and writes records as the two columns it created. With any other column list, every query in this database would be refused.
+ALTER TABLE pg_repack_safe_rewrites RENAME COLUMN relid TO pr_renamed;
+ERROR:  cannot change the columns of the pg_repack_safe record table
+DETAIL:  The extension reads and writes records as the two columns it created. With any other column list, every query in this database would be refused.
+SELECT count(*) AS indexes FROM pg_index
+WHERE indrelid = 'pg_repack_safe_rewrites'::regclass;
+ indexes 
+---------
+       0
+(1 row)
+
+SELECT count(*) AS passes FROM pr_t;
+ passes 
+--------
+      5
+(1 row)
+
 DELETE FROM pg_repack_safe_rewrites;
 ERROR:  cannot update or delete pg_repack_safe records
 DETAIL:  A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on a standby, relies on the record.

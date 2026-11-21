@@ -45,9 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The record table is protected. `UPDATE` and `DELETE` of records,
   `REPACK (CONCURRENTLY)` and rewriting `ALTER TABLE` of the table, and
   changes to when its triggers fire are refused (`VACUUM FULL`, `CLUSTER`
-  and `REPACK` are allowed). While it holds records, `DROP` of the table,
-  its triggers or the extension, and `TRUNCATE`, are refused unless a
-  superuser sets `pg_repack_safe.allow_unprotected_drop`. The README
+  and `REPACK` are allowed). Creating an index on it, which the writer
+  would not maintain, and adding, dropping or altering one of its columns,
+  which would make every query in the database fail, are refused too. While
+  it holds records, `DROP` of the table, its triggers or the extension, and
+  `TRUNCATE`, are refused unless a superuser sets
+  `pg_repack_safe.allow_unprotected_drop`. The README
   describes how to remove the extension safely.
 - Custom WAL resource manager (ID 149, reserved on the PostgreSQL wiki): each
   `REPACK (CONCURRENTLY)` logs a record before its commit, so a standby

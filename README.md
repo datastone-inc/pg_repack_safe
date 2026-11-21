@@ -109,6 +109,13 @@ The record table is protected:
   `ALTER TABLE`, `REPACK (CONCURRENTLY)`), and changes to when its triggers
   fire are always refused. `VACUUM`, `VACUUM FULL`, `CLUSTER` and `REPACK`
   of it, also database-wide, are allowed.
+- Creating an index on it, by `CREATE INDEX` or a `PRIMARY KEY` or `UNIQUE`
+  constraint, is always refused. Records are inserted without maintaining
+  indexes, so an index would miss every later record and a query using it
+  would return stale results.
+- Adding, dropping or altering a column of it (the type, default, name or
+  any other property) is always refused. With any other column list, every
+  query in that database would be refused.
 - If the record table loses its definition or either trigger by a route no
   hook could stop, every query and `REPACK (CONCURRENTLY)` in that database
   is refused until the extension is re-created.

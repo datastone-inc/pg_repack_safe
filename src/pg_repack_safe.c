@@ -22,9 +22,9 @@
  *   did it. Under an unsafe rewriter, the replacement of a pre-existing
  *   table's non-empty storage is recorded (the writer). The same hook
  *   protects the record table: it refuses a rewrite that would not keep the
- *   records and any change to when its triggers fire, and, while the table
- *   holds records, its drop or truncation and the drop of its triggers or
- *   of the extension.
+ *   records, any change to when its triggers fire, any index on it and any
+ *   change to its columns, and, while the table holds records, its drop or
+ *   truncation and the drop of its triggers or of the extension.
  * - ProcessUtility_hook: classifies the innermost utility statement. Only
  *   REPACK with the CONCURRENTLY option counts as an unsafe rewriter, and it
  *   is refused unless the record table exists and is locked first. COPY
@@ -57,9 +57,11 @@
 #include "access/xlogreader.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
+#include "catalog/pg_attrdef.h"
 #include "catalog/pg_class.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_extension.h"
+#include "catalog/pg_index.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
@@ -1386,7 +1388,8 @@ noteRelationAltered(Oid relid)
  * Record table protection
  *
  * Refusals of the statements that would remove records or the triggers
- * that guard them.
+ * that guard them, give the table an index its writer does not maintain, or
+ * change its columns.
  * ----------------------------------------------------------------
  */
 
@@ -1550,8 +1553,9 @@ protectRecordsFromDrop(Oid classId, Oid objectId, int subId)
  * (inMvccSafeRewriter): they copy every row version a snapshot may need with
  * its original xmin and xmax, and the records' values unchanged. Refused:
  * REPACK (CONCURRENTLY), which re-inserts every row under its own XID, and
- * ALTER TABLE, whose rewrites also do that and can change the values (ALTER
- * COLUMN ... USING); ALTER TABLE ... SET TABLESPACE is refused with them.
+ * ALTER TABLE, whose rewrites (such as SET UNLOGGED) also do that; ALTER
+ * TABLE ... SET TABLESPACE is refused with them. A rewriting ALTER COLUMN
+ * does not get this far (protectRecordTableColumns).
  */
 static void
 protectRecordTableFromRewrite(Oid relid)
@@ -1610,6 +1614,144 @@ protectRecordTrigger(Oid triggerOid)
              errmsg("cannot change when %s fires",
                     getObjectDescription(&address, false)),
              errdetail("The record table's triggers keep readers' caches current and its records unchanged, and must fire ALWAYS.")));
+}
+
+/**
+ * @brief Find the table of an index as the current command left it
+ * @param relid OID of a relation
+ * @return indrelid from the relation's pg_index row visible to SnapshotSelf,
+ *         or InvalidOid when no such row exists
+ *
+ * Invariant: if the current transaction inserted the relation's pg_index
+ * row, that row is found, whatever the command counter, and no other
+ * transaction can have changed it (selfVisibleRelfilenode gives the
+ * argument). A relation that is not an index has no pg_index row.
+ */
+static Oid
+selfVisibleIndexTable(Oid relid)
+{
+    Relation    indexRel;
+    ScanKeyData key;
+    SysScanDesc scan;
+    HeapTuple   tuple;
+    Oid         result = InvalidOid;
+
+    indexRel = table_open(IndexRelationId, AccessShareLock);
+    ScanKeyInit(&key, Anum_pg_index_indexrelid, BTEqualStrategyNumber,
+                F_OIDEQ, ObjectIdGetDatum(relid));
+    scan = systable_beginscan(indexRel, IndexRelidIndexId, true,
+                              SnapshotSelf, 1, &key);
+    tuple = systable_getnext(scan);
+    if (HeapTupleIsValid(tuple))
+        result = ((Form_pg_index) GETSTRUCT(tuple))->indrelid;
+    systable_endscan(scan);
+    table_close(indexRel, AccessShareLock);
+
+    return result;
+}
+
+/**
+ * @brief OAT_POST_CREATE of a relation: refuse an index on the record table
+ * @param relid The relation just created
+ *
+ * Invariant: the record table has no index. The writer inserts records with
+ * simple_heap_insert (insertRecord), which maintains no index, so an index
+ * would miss every later record and SQL that uses it would return stale
+ * answers. No setting overrides the refusal.
+ *
+ * Caught by meaning, at the creation of the index, whatever statement
+ * creates it: CREATE INDEX with or without CONCURRENTLY, a PRIMARY KEY,
+ * UNIQUE or EXCLUDE constraint, REINDEX CONCURRENTLY. Only index_create
+ * inserts pg_index rows (index.c:1056, through UpdateIndexRelation, whose
+ * insertion at index.c:669 is the only one into that catalog), and it fires
+ * this hook for the new relation with subId 0 (index.c:1233-1234). It does so
+ * before advancing the command counter (index.c:1240), so the catalog cache
+ * does not yet hold the pg_index row and the row is read with SnapshotSelf.
+ *
+ * The hook also fires for every new table, view and sequence
+ * (heap.c:1832); those have no pg_index row and pass. The transient heap of
+ * a VACUUM FULL, CLUSTER or REPACK of the record table is such a table, and
+ * since the record table has no index and no TOAST table, those commands
+ * create no index for it.
+ */
+static void
+protectRecordTableFromIndex(Oid relid)
+{
+    Oid         tableOid = findRecordTableNoError();
+
+    if (!OidIsValid(tableOid) || selfVisibleIndexTable(relid) != tableOid)
+        return;
+
+    ereport(ERROR,
+            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+             errmsg("cannot create an index on the pg_repack_safe record table"),
+             errdetail("Records are inserted without maintaining indexes, so an index would miss every later record and a query using it would return stale results.")));
+}
+
+/**
+ * @brief Refuse to add, drop or alter a column of the record table
+ * @param access OAT_POST_CREATE, OAT_DROP or OAT_POST_ALTER
+ * @param classId Catalog of the object the hook reports
+ * @param objectId Its OID
+ * @param subId Column number, or 0 for the whole object
+ *
+ * Invariant: the record table's columns are the two the extension created.
+ * The writer forms its rows from that definition and the reader refuses
+ * every query in the database when it finds any other
+ * (checkRecordTableDefinition), a state that dropping the column again does
+ * not undo, since a dropped column still counts. So the change is refused
+ * where it is made, and no setting overrides the refusal:
+ * pg_repack_safe.allow_unprotected_drop is for giving up the records, which
+ * a column change does not do.
+ *
+ * Caught by meaning: PostgreSQL reports a column as (pg_class, the table's
+ * OID, the column number). In tablecmds.c:
+ * - ADD COLUMN: OAT_POST_CREATE (ATExecAddColumn, :8030);
+ * - DROP COLUMN: OAT_DROP. ATExecDropColumn hands the column's address to
+ *   performMultipleDeletions (:10116-10125), and every deleted object is
+ *   reported with its sub-ID (dependency.c:1270-1271);
+ * - OAT_POST_ALTER: RENAME COLUMN (renameatt_internal, :4020), ALTER COLUMN
+ *   TYPE (ATExecAlterColumnType, :16101, in every case, also when the new
+ *   type is binary coercible and nothing is rewritten), DROP NOT NULL
+ *   (:8448), a SET NOT NULL that adds a constraint (:8679; the record
+ *   table's columns have one, so it changes nothing and is not reported),
+ *   ADD, SET and DROP IDENTITY (:8962, :9076, :9180),
+ *   SET and DROP EXPRESSION (:9368, :9485), SET STATISTICS (:9651), SET and
+ *   RESET of attribute options (:9764), SET STORAGE (:9879) and SET
+ *   COMPRESSION (:20110).
+ * A new column default is reported differently, as OAT_POST_CREATE of
+ * (pg_attrdef, the table's OID, the column number), by StoreAttrDefault
+ * (pg_attrdef.c:143-144), which every route to a default goes through; that
+ * is refused as well. DROP DEFAULT then never finds a default to drop.
+ *
+ * Dropping the whole table, or the extension, reports the table with sub-ID
+ * 0 and no column: a column is deleted as an object of its own only when it
+ * is the original target or depends on another object being dropped
+ * (dependency.c:836-846 skips a table's own columns when collecting what
+ * depends on the table). The record table's columns depend on nothing: their
+ * types are pinned, they have no collation, and this function refuses
+ * whatever could add a dependency (protection.sql checks pg_depend).
+ *
+ * Not reported with a column number, and so not refused: COMMENT, SECURITY
+ * LABEL and GRANT on a column, and table constraints. None of them changes
+ * the column list or what the writer and the reader do.
+ */
+static void
+protectRecordTableColumns(ObjectAccessType access, Oid classId, Oid objectId,
+                          int subId)
+{
+    if (subId == 0)
+        return;
+    if (classId != RelationRelationId &&
+        !(classId == AttrDefaultRelationId && access == OAT_POST_CREATE))
+        return;
+    if (!isRecordTable(objectId))
+        return;
+
+    ereport(ERROR,
+            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+             errmsg("cannot change the columns of the pg_repack_safe record table"),
+             errdetail("The extension reads and writes records as the two columns it created. With any other column list, every query in this database would be refused.")));
 }
 
 /* ----------------------------------------------------------------
@@ -1684,6 +1826,12 @@ pg_repack_safe_records_changed(PG_FUNCTION_ARGS)
  * A pg_class alteration is first examined for a storage replacement
  * (noteRelationAltered), then, if it is the record table's, refused unless
  * the rewrite keeps its records (protectRecordTableFromRewrite).
+ *
+ * A column is reported with its number as subId, by OAT_POST_CREATE,
+ * OAT_DROP or OAT_POST_ALTER; protectRecordTableColumns sees all three and
+ * refuses the record table's. A new relation is reported by OAT_POST_CREATE
+ * with subId 0, and is refused if it is an index on the record table
+ * (protectRecordTableFromIndex).
  */
 static void
 objectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
@@ -1694,7 +1842,14 @@ objectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
 
     switch (access)
     {
+        case OAT_POST_CREATE:
+            if (classId == RelationRelationId && subId == 0)
+                protectRecordTableFromIndex(objectId);
+            else
+                protectRecordTableColumns(access, classId, objectId, subId);
+            break;
         case OAT_DROP:
+            protectRecordTableColumns(access, classId, objectId, subId);
             protectRecordsFromDrop(classId, objectId, subId);
             break;
         case OAT_TRUNCATE:
@@ -1716,6 +1871,8 @@ objectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
             }
             else if (classId == TriggerRelationId)
                 protectRecordTrigger(objectId);
+            else
+                protectRecordTableColumns(access, classId, objectId, subId);
             break;
         default:
             break;

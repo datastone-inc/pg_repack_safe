@@ -21,6 +21,13 @@
  * dropping them follows the DROP rule: they carry the cache invalidation and
  * the UPDATE/DELETE refusal. A record table without both triggers, firing
  * ALWAYS, refuses every read and REPACK (CONCURRENTLY).
+ * Refused always, with or without records and whatever the override says:
+ * - creating an index on the record table, in any spelling (CREATE INDEX,
+ *   a PRIMARY KEY or UNIQUE constraint): the writer inserts records without
+ *   maintaining indexes, so an index would miss every later record;
+ * - adding, dropping or altering a column of the record table (its type,
+ *   default, name or any other property): with any other column list every
+ *   query in the database would be refused.
  */
 
 CREATE EXTENSION pg_repack_safe;
@@ -58,6 +65,9 @@ REPACK pg_repack_safe_rewrites;
 VACUUM FULL;
 REPACK;
 SELECT relid = 'pr_t'::regclass AS pr_t_record FROM pg_repack_safe_rewrites;
+ALTER TABLE pg_repack_safe_rewrites SET UNLOGGED;
+-- A rewriting column type change is refused as a column change, before it
+-- reaches the rewrite.
 ALTER TABLE pg_repack_safe_rewrites
     ALTER COLUMN relid TYPE oid USING (relid::text)::oid;
 -- PostgreSQL refuses this one itself (no identity index); were it to run,
@@ -108,6 +118,57 @@ ALTER TRIGGER pr_renamed ON pg_repack_safe_rewrites
 ALTER TABLE pg_repack_safe_rewrites
     ENABLE ALWAYS TRIGGER pg_repack_safe_rewrites_changed;
 
+-- Indexes: refused in every spelling, and none is left behind. The writer
+-- inserts records without maintaining indexes.
+CREATE INDEX pr_idx ON pg_repack_safe_rewrites (relid);
+CREATE UNIQUE INDEX pr_idx ON pg_repack_safe_rewrites (relid, rewrite_xid);
+CREATE INDEX CONCURRENTLY pr_idx ON pg_repack_safe_rewrites (relid);
+ALTER TABLE pg_repack_safe_rewrites ADD UNIQUE (relid, rewrite_xid);
+ALTER TABLE pg_repack_safe_rewrites ADD PRIMARY KEY (relid, rewrite_xid);
+SELECT count(*) AS indexes FROM pg_index
+WHERE indrelid = 'pg_repack_safe_rewrites'::regclass;
+-- An index on any other table is not affected.
+CREATE INDEX pr_t_idx ON pr_t (id);
+DROP INDEX pr_t_idx;
+
+-- Columns: adding, dropping or altering one is refused. Accepted, each of
+-- the first three would make every query in the database fail.
+ALTER TABLE pg_repack_safe_rewrites ADD COLUMN x text;
+ALTER TABLE pg_repack_safe_rewrites DROP COLUMN relid;
+ALTER TABLE pg_repack_safe_rewrites ALTER COLUMN relid TYPE regclass;
+ALTER TABLE pg_repack_safe_rewrites ALTER COLUMN relid SET DEFAULT 0;
+ALTER TABLE pg_repack_safe_rewrites RENAME COLUMN relid TO pr_renamed;
+ALTER TABLE pg_repack_safe_rewrites ALTER COLUMN relid DROP NOT NULL;
+ALTER TABLE pg_repack_safe_rewrites ALTER COLUMN relid SET STATISTICS 0;
+SELECT attname, atttypid::regtype, atthasdef, attnotnull, attisdropped
+FROM pg_attribute
+WHERE attrelid = 'pg_repack_safe_rewrites'::regclass AND attnum > 0
+ORDER BY attnum;
+SELECT count(*) AS passes FROM pr_t;
+-- No column of the record table is an object some other object's drop
+-- could take with it, so a drop of the whole table or of the extension
+-- drops no column separately.
+SELECT count(*) AS column_dependencies FROM pg_depend
+WHERE classid = 'pg_class'::regclass
+  AND objid = 'pg_repack_safe_rewrites'::regclass AND objsubid <> 0;
+
+-- The extension can be moved to another schema; the record table is still
+-- found there, with its records, and still protected.
+CREATE SCHEMA pr_s;
+ALTER EXTENSION pg_repack_safe SET SCHEMA pr_s;
+SELECT count(*) AS records FROM pr_s.pg_repack_safe_rewrites;
+CREATE INDEX pr_idx ON pr_s.pg_repack_safe_rewrites (relid);
+ALTER TABLE pr_s.pg_repack_safe_rewrites ADD UNIQUE (relid, rewrite_xid);
+ALTER TABLE pr_s.pg_repack_safe_rewrites ADD COLUMN x text;
+ALTER TABLE pr_s.pg_repack_safe_rewrites DROP COLUMN relid;
+ALTER TABLE pr_s.pg_repack_safe_rewrites ALTER COLUMN relid TYPE regclass;
+DELETE FROM pr_s.pg_repack_safe_rewrites;
+DROP SCHEMA pr_s CASCADE;
+SELECT count(*) AS passes FROM pr_t;
+ALTER EXTENSION pg_repack_safe SET SCHEMA public;
+DROP SCHEMA pr_s;
+SELECT count(*) AS records FROM pg_repack_safe_rewrites;
+
 -- The override is for superusers only.
 CREATE ROLE pr_user;
 SET ROLE pr_user;
@@ -116,10 +177,21 @@ RESET ROLE;
 DROP ROLE pr_user;
 
 -- With the override, DROP and TRUNCATE are allowed; ALTER TABLE rewrites,
--- UPDATE, DELETE and the triggers stay refused.
+-- UPDATE, DELETE, the triggers, indexes and column changes stay refused.
 SET pg_repack_safe.allow_unprotected_drop = on;
+ALTER TABLE pg_repack_safe_rewrites SET UNLOGGED;
 ALTER TABLE pg_repack_safe_rewrites
     ALTER COLUMN relid TYPE oid USING (relid::text)::oid;
+CREATE INDEX pr_idx ON pg_repack_safe_rewrites (relid);
+ALTER TABLE pg_repack_safe_rewrites ADD UNIQUE (relid, rewrite_xid);
+ALTER TABLE pg_repack_safe_rewrites ADD COLUMN x text;
+ALTER TABLE pg_repack_safe_rewrites DROP COLUMN relid;
+ALTER TABLE pg_repack_safe_rewrites ALTER COLUMN relid TYPE regclass;
+ALTER TABLE pg_repack_safe_rewrites ALTER COLUMN relid SET DEFAULT 0;
+ALTER TABLE pg_repack_safe_rewrites RENAME COLUMN relid TO pr_renamed;
+SELECT count(*) AS indexes FROM pg_index
+WHERE indrelid = 'pg_repack_safe_rewrites'::regclass;
+SELECT count(*) AS passes FROM pr_t;
 DELETE FROM pg_repack_safe_rewrites;
 ALTER TABLE pg_repack_safe_rewrites DISABLE TRIGGER ALL;
 TRUNCATE pg_repack_safe_rewrites;
