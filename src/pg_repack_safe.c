@@ -229,427 +229,14 @@ typedef enum RecordTableUse
     RECORD_TABLE_FOR_WRITER     /* REPACK (CONCURRENTLY) */
 } RecordTableUse;
 
-static Oid  lookupRecordTable(RecordTableUse use);
-static Oid  lockRecordTableForWriter(void);
-static PlannedStmt *checkCopyTo(PlannedStmt *pstmt, bool readOnlyTree,
-                                List **attachLocked);
-
-/**
- * @brief Read a relation's storage as the current transaction left it
- * @param relid OID of the relation
- * @param toastRelid Output, unless NULL: reltoastrelid from the same
- *        pg_class row, or InvalidOid when no such row exists
- * @return Relfilenode from the pg_class row visible to SnapshotSelf, or
- *         InvalidRelFileNumber when no such row exists
+/* ----------------------------------------------------------------
+ * Record table: lookup and definition
  *
- * Invariant: if the current transaction wrote the relation's pg_class row,
- * the row it wrote is returned. SnapshotSelf sees a row version whose xmin
- * is the current transaction and which has no xmax, whatever the command
- * counter (heapam_visibility.c, HeapTupleSatisfiesSelf), and no other
- * transaction can update or delete a row version that has not committed.
- *
- * Otherwise the scan can find no row although one exists: SnapshotSelf is
- * not a consistent snapshot, so when another transaction's update of the row
- * (such as a GRANT, which takes no lock on the relation) commits during the
- * scan, the scan can reach the new version before that commit and the old
- * one after it, and see neither.
+ * Finding the record table, with and without the backend-local OID cache,
+ * and checking that it has the definition the reader and the writer rely
+ * on.
+ * ----------------------------------------------------------------
  */
-static RelFileNumber
-selfVisibleRelfilenode(Oid relid, Oid *toastRelid)
-{
-    Relation    classRel;
-    ScanKeyData key;
-    SysScanDesc scan;
-    HeapTuple   tuple;
-    RelFileNumber result = InvalidRelFileNumber;
-
-    classRel = table_open(RelationRelationId, AccessShareLock);
-    ScanKeyInit(&key, Anum_pg_class_oid, BTEqualStrategyNumber, F_OIDEQ,
-                ObjectIdGetDatum(relid));
-    scan = systable_beginscan(classRel, ClassOidIndexId, true, SnapshotSelf,
-                              1, &key);
-    if (toastRelid != NULL)
-        *toastRelid = InvalidOid;
-    tuple = systable_getnext(scan);
-    if (HeapTupleIsValid(tuple))
-    {
-        result = ((Form_pg_class) GETSTRUCT(tuple))->relfilenode;
-        if (toastRelid != NULL)
-            *toastRelid = ((Form_pg_class) GETSTRUCT(tuple))->reltoastrelid;
-    }
-    systable_endscan(scan);
-    table_close(classRel, AccessShareLock);
-
-    return result;
-}
-
-/**
- * @brief Write one unsafe-rewrite record
- * @param relid Relation that old snapshots must not read
- *
- * The record carries the current transaction's full (64-bit) ID, whose low
- * 32 bits are the ID the rewrite stamped on every row it copied. The record
- * table (rewriterRecordTable) was locked with RowExclusiveLock when the
- * statement started, so it cannot have been dropped, renamed or moved since,
- * provided this is still that transaction. REPACK (CONCURRENTLY, ANALYZE)
- * commits after the swap and runs ANALYZE in a new transaction (repack.c,
- * process_single_relation), so the lock is checked rather than assumed.
- */
-static void
-insertRecord(Oid relid)
-{
-    Relation    rel;
-    Datum       values[2];
-    bool        nulls[2] = {false, false};
-    HeapTuple   tuple;
-
-    if (!CheckRelationOidLockedByMe(rewriterRecordTable, RowExclusiveLock,
-                                    false))
-        ereport(ERROR,
-                (errcode(ERRCODE_INTERNAL_ERROR),
-                 errmsg("pg_repack_safe cannot record an unsafe rewrite outside the transaction that locked its record table")));
-
-    rel = table_open(rewriterRecordTable, NoLock);
-    values[0] = ObjectIdGetDatum(relid);
-    values[1] = FullTransactionIdGetDatum(GetCurrentFullTransactionId());
-    tuple = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-    simple_heap_insert(rel, tuple);
-    heap_freetuple(tuple);
-
-    /*
-     * Readers' record caches must learn of the record. The invalidation is
-     * sent when this transaction commits, before it releases its locks
-     * (xact.c, CommitTransaction), so a reader that locks the rewritten table
-     * after the commit processes it while taking that lock (lmgr.c,
-     * LockRelationOid), before its check runs.
-     */
-    CacheInvalidateRelcache(rel);
-    table_close(rel, NoLock);
-}
-
-/**
- * @brief List the processes holding a lock on a relation
- * @param relid Relation in the current database
- * @return PIDs (int List) of the holders and of their lock group leaders
- */
-static List *
-pidsLockingRelation(Oid relid)
-{
-    LockData   *lockData = GetLockStatusData();
-    List       *pids = NIL;
-
-    for (int i = 0; i < lockData->nelements; i++)
-    {
-        LockInstanceData *instance = &lockData->locks[i];
-
-        if (instance->holdMask == 0 ||
-            instance->locktag.locktag_type != LOCKTAG_RELATION ||
-            instance->locktag.locktag_field1 != MyDatabaseId ||
-            instance->locktag.locktag_field2 != relid)
-            continue;
-        pids = list_append_unique_int(pids, instance->pid);
-        pids = list_append_unique_int(pids, instance->leaderPid);
-    }
-    return pids;
-}
-
-/**
- * @brief Advisory pre-check: refuse REPACK (CONCURRENTLY) while a session
- *        could later read the table with an older snapshot
- * @param relid The table, or InvalidOid if it could not be resolved
- * @param atSwap True at the swap, where this backend holds
- *        AccessExclusiveLock on the table
- *
- * Best-effort and not part of the guarantee: the reader check refuses such a
- * read either way. This spares long transactions the serialization failure
- * by refusing the REPACK instead. A client session in this database counts
- * if all of these hold:
- * - it holds a snapshot (backend_xmin is set);
- * - the snapshot outlives a statement: the session is idle in a
- *   transaction, or its transaction started before its current statement.
- *   A single statement locks every relation of its plan when it starts, so
- *   if it holds no lock on the table it does not read it (except through a
- *   function that locks lazily). A READ COMMITTED transaction between
- *   statements holds no snapshot. A READ COMMITTED statement after the
- *   first of its transaction counts although its next statement takes a
- *   new snapshot: the isolation level is not visible here, so the check
- *   errs towards refusing;
- * - it holds no lock on the table: REPACK waits for such a session at the
- *   swap, so it cannot be hurt. At the swap no other session holds one;
- * - its transaction started at least pg_repack_safe.precheck_snapshot_age
- *   ago. A snapshot is never older than its transaction.
- * Not seen: sessions on standbys, background workers, and snapshots taken
- * after the check.
- */
-static void
-precheckOldSnapshots(Oid relid, bool atSwap)
-{
-    TimestampTz cutoff;
-    List       *lockingPids = NIL;
-    int         nbackends;
-
-    if (precheckSnapshotAge < 0)
-        return;
-
-    cutoff = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
-                                         -precheckSnapshotAge);
-    if (!atSwap && OidIsValid(relid))
-        lockingPids = pidsLockingRelation(relid);
-
-    pgstat_clear_backend_activity_snapshot();
-    nbackends = pgstat_fetch_stat_numbackends();
-    for (int i = 1; i <= nbackends; i++)
-    {
-        LocalPgBackendStatus *local = pgstat_get_local_beentry_by_index(i);
-        PgBackendStatus *status = &local->backendStatus;
-        bool        spansStatements;
-
-        if (status->st_procpid <= 0 || status->st_procpid == MyProcPid ||
-            status->st_backendType != B_BACKEND ||
-            status->st_databaseid != MyDatabaseId ||
-            !TransactionIdIsValid(local->backend_xmin) ||
-            status->st_xact_start_timestamp == 0)
-            continue;
-
-        spansStatements =
-            status->st_state == STATE_IDLEINTRANSACTION ||
-            status->st_state == STATE_IDLEINTRANSACTION_ABORTED ||
-            status->st_xact_start_timestamp <
-            status->st_activity_start_timestamp;
-        if (!spansStatements ||
-            status->st_xact_start_timestamp > cutoff ||
-            list_member_int(lockingPids, status->st_procpid))
-            continue;
-
-        ereport(ERROR,
-                (errcode(ERRCODE_OBJECT_IN_USE),
-                 errmsg("REPACK (CONCURRENTLY) refused: another session holds a snapshot that has not read table \"%s\"",
-                        OidIsValid(relid) ? get_rel_name(relid) : "?"),
-                 atSwap
-                 ? errdetail("Process %d, whose transaction started at %s, would get a serialization failure if it read the table after the REPACK. Checked at the swap.",
-                             status->st_procpid,
-                             timestamptz_to_str(status->st_xact_start_timestamp))
-                 : errdetail("Process %d, whose transaction started at %s, would get a serialization failure if it read the table after the REPACK. Checked before the REPACK started.",
-                             status->st_procpid,
-                             timestamptz_to_str(status->st_xact_start_timestamp)),
-                 errhint("Wait for that transaction to end, or set pg_repack_safe.precheck_snapshot_age to -1 to skip this check.")));
-    }
-    list_free(lockingPids);
-}
-
-/**
- * @brief Write the WAL record that marks an unsafe rewrite
- * @param relid The rewritten table
- *
- * Written at the swap, so it precedes the rewriter's commit record. A
- * standby without this library cannot check reads; replaying this record
- * there fails (rmgr.c, RmgrNotFound), so its replay stops before the commit
- * instead of serving the rewritten table to old snapshots. Known gap (open
- * question 17): a standby whose replay starts at a checkpoint between this
- * record and the commit never sees it.
- */
-static void
-logUnsafeRewrite(Oid relid)
-{
-    xl_pg_repack_safe_rewrite xlrec;
-
-    xlrec.dbOid = MyDatabaseId;
-    xlrec.relid = relid;
-    XLogBeginInsert();
-    XLogRegisterData(&xlrec, sizeof(xlrec));
-    (void) XLogInsert(PG_REPACK_SAFE_RMGR_ID,
-                      XLOG_PG_REPACK_SAFE_UNSAFE_REWRITE);
-}
-
-/**
- * @brief Redo routine: nothing to apply
- * @param record The record being replayed
- *
- * The records reach standbys as rows of the record table. Replaying this
- * record matters only where the library is missing, where it fails.
- */
-static void
-pgRepackSafeRedo(XLogReaderState *record)
-{
-    uint8       info = XLogRecGetInfo(record) & XLR_RMGR_INFO_MASK;
-
-    if (info != XLOG_PG_REPACK_SAFE_UNSAFE_REWRITE)
-        elog(PANIC, "pg_repack_safe redo: unknown op code %u", info);
-}
-
-/**
- * @brief Describe a record for pg_waldump and redo error context
- * @param buf Output buffer
- * @param record The record
- */
-static void
-pgRepackSafeDesc(StringInfo buf, XLogReaderState *record)
-{
-    uint8       info = XLogRecGetInfo(record) & XLR_RMGR_INFO_MASK;
-
-    if (info == XLOG_PG_REPACK_SAFE_UNSAFE_REWRITE)
-    {
-        xl_pg_repack_safe_rewrite *xlrec =
-            (xl_pg_repack_safe_rewrite *) XLogRecGetData(record);
-
-        appendStringInfo(buf, "db %u rel %u", xlrec->dbOid, xlrec->relid);
-    }
-}
-
-/**
- * @brief Name a record type for pg_waldump
- * @param info Record info bits
- * @return The record type's name, or NULL if unknown
- */
-static const char *
-pgRepackSafeIdentify(uint8 info)
-{
-    if ((info & XLR_RMGR_INFO_MASK) == XLOG_PG_REPACK_SAFE_UNSAFE_REWRITE)
-        return "UNSAFE_REWRITE";
-    return NULL;
-}
-
-static const RmgrData pgRepackSafeRmgr = {
-    .rm_name = PG_REPACK_SAFE_RMGR_NAME,
-    .rm_redo = pgRepackSafeRedo,
-    .rm_desc = pgRepackSafeDesc,
-    .rm_identify = pgRepackSafeIdentify,
-};
-
-/**
- * @brief Tell whether a relation storage was created in the current transaction
- * @param locator Storage to look for
- * @return True if the storage is scheduled for deletion should the current
- *         transaction abort
- *
- * Only RelationCreateStorage schedules a deletion at abort (storage.c);
- * storage that existed before the transaction is only ever scheduled for
- * deletion at commit (RelationDropStorage). smgrGetPendingDeletes leaves out
- * temporary relations and entries of enclosing transaction levels, so such
- * storage is reported as not created here, and the caller then treats it as
- * pre-existing: the error is towards recording too much.
- */
-static bool
-storageCreatedInTransaction(RelFileLocator locator)
-{
-    RelFileLocator *created;
-    int         ncreated;
-    bool        found = false;
-
-    ncreated = smgrGetPendingDeletes(false, &created);
-    for (int i = 0; i < ncreated; i++)
-    {
-        if (RelFileLocatorEquals(created[i], locator))
-        {
-            found = true;
-            break;
-        }
-    }
-    if (created != NULL)
-        pfree(created);
-
-    return found;
-}
-
-/**
- * @brief Detect that the current command replaced a relation's storage
- * @param relid OID of the relation that was just altered
- *
- * Runs at OAT_POST_ALTER, before the command counter advances, so the
- * catalog cache and the relation cache still describe the old storage. The
- * relation cache's storage locator is checked against the catalog cache
- * rather than assumed; a mismatch leaves the old storage unknown and is
- * refused.
- *
- * Only the replacement of a table's or materialized view's storage that
- * existed before the current transaction counts. Storage created in this
- * transaction (such as the copy a REPACK writes into its transient heap,
- * which the swap hands back to the transient heap, whatever its name) holds
- * no row that a snapshot from before this transaction could have seen.
- *
- * Under an unsafe rewriter, a counted replacement of non-empty storage is
- * recorded, together with the TOAST relation the table has after the
- * replacement: REPACK (CONCURRENTLY) swaps TOAST by relation, so that TOAST
- * relation was also written by this transaction. An old storage with zero
- * blocks never held a row, so every snapshot sees the table empty either
- * way and nothing is recorded.
- */
-static void
-noteRelationAltered(Oid relid)
-{
-    HeapTuple   oldTuple;
-    Form_pg_class oldForm;
-    RelFileNumber oldNode;
-    RelFileNumber newNode;
-    Oid         newToastRelid;
-    char        relkind;
-    NameData    relname;
-    Relation    rel;
-    bool        oldCreatedHere;
-    BlockNumber oldBlocks = 0;
-
-    oldTuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
-    if (!HeapTupleIsValid(oldTuple))
-        return;
-    oldForm = (Form_pg_class) GETSTRUCT(oldTuple);
-    oldNode = oldForm->relfilenode;
-    relkind = oldForm->relkind;
-    relname = oldForm->relname;
-    ReleaseSysCache(oldTuple);
-
-    /* Mapped relations keep relfilenode 0; REPACK rejects them concurrently. */
-    if (!RelFileNumberIsValid(oldNode))
-        return;
-
-    if (relkind != RELKIND_RELATION && relkind != RELKIND_MATVIEW)
-        return;
-
-    /*
-     * No self-visible row means the current command did not write the
-     * relation's pg_class row (selfVisibleRelfilenode), so it did not
-     * replace the storage and there is nothing to record. A command that
-     * replaced it wrote the row before this hook ran and without advancing
-     * the command counter (repack.c, swap_relation_files).
-     * protectRecordTableFromRewrite treats the same case as unknown and
-     * refuses, which costs only a spurious error.
-     */
-    newNode = selfVisibleRelfilenode(relid, &newToastRelid);
-    if (!RelFileNumberIsValid(newNode) || newNode == oldNode)
-        return;
-
-    /* The caller holds the lock under which it replaced the storage. */
-    rel = relation_open(relid, NoLock);
-    if (rel->rd_locator.relNumber != oldNode)
-        ereport(ERROR,
-                (errcode(ERRCODE_INTERNAL_ERROR),
-                 errmsg("pg_repack_safe cannot determine the previous storage of \"%s\"",
-                        NameStr(relname)),
-                 errdetail("The relation cache no longer describes the storage being replaced.")));
-    oldCreatedHere = storageCreatedInTransaction(rel->rd_locator);
-    if (!oldCreatedHere)
-        oldBlocks = RelationGetNumberOfBlocks(rel);
-    relation_close(rel, NoLock);
-
-    if (oldCreatedHere)
-        return;
-
-    if (traceStorageChanges)
-        ereport(NOTICE,
-                (inUnsafeRewriter()
-                 ? errmsg("pg_repack_safe: storage of \"%s\" replaced, old storage has %u blocks, unsafe rewriter: yes",
-                          NameStr(relname), oldBlocks)
-                 : errmsg("pg_repack_safe: storage of \"%s\" replaced, old storage has %u blocks, unsafe rewriter: no",
-                          NameStr(relname), oldBlocks)));
-
-    if (inUnsafeRewriter() && oldBlocks > 0)
-    {
-        precheckOldSnapshots(relid, true);
-        logUnsafeRewrite(relid);
-        insertRecord(relid);
-        if (OidIsValid(newToastRelid))
-            insertRecord(newToastRelid);
-    }
-}
 
 /**
  * @brief Find the schema the extension is installed in
@@ -724,435 +311,6 @@ isRecordTriggerFunction(Oid funcOid, const char *name)
     return OidIsValid(schemaOid) && get_func_namespace(funcOid) == schemaOid;
 }
 
-/* How a statement would remove the record table's protection. */
-typedef enum RemovalKind
-{
-    REMOVAL_DROP,
-    REMOVAL_TRUNCATE
-} RemovalKind;
-
-/**
- * @brief Refuse to remove protection while the record table holds records
- * @param kind Whether the object is being dropped or truncated
- * @param objectDescription The object being removed, for the message
- *
- * Records are never deleted, and any row version in the table may be the
- * record an older snapshot needs, on this server or on a standby, so any
- * block counts as holding records. A superuser can override with
- * pg_repack_safe.allow_unprotected_drop.
- *
- * Each message is a complete literal, with nothing but the object's
- * description substituted, so that each can be translated as a whole.
- */
-static void
-refuseUnprotectedRemoval(RemovalKind kind, const char *objectDescription)
-{
-    Oid         tableOid;
-    Relation    rel;
-    BlockNumber blocks;
-
-    if (allowUnprotectedDrop)
-        return;
-    tableOid = findRecordTableNoError();
-    if (!OidIsValid(tableOid))
-        return;
-    rel = try_table_open(tableOid, AccessShareLock);
-    if (rel == NULL)
-        return;
-    blocks = RelationGetNumberOfBlocks(rel);
-    table_close(rel, AccessShareLock);
-    if (blocks == 0)
-        return;
-
-    if (kind == REMOVAL_TRUNCATE)
-        ereport(ERROR,
-                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                 errmsg("cannot truncate the pg_repack_safe record table while it holds records"),
-                 errdetail("The statement would truncate %s. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.",
-                           objectDescription),
-                 errhint("First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, \"Removing the extension\"); then a superuser can set pg_repack_safe.allow_unprotected_drop.")));
-    else
-        ereport(ERROR,
-                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                 errmsg("cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records"),
-                 errdetail("The statement would drop %s. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.",
-                           objectDescription),
-                 errhint("First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, \"Removing the extension\"); then a superuser can set pg_repack_safe.allow_unprotected_drop.")));
-}
-
-/**
- * @brief Tell whether a trigger is one of the record table's own triggers
- * @param tgrelid The trigger's table
- * @param tgfoid The trigger's function
- * @return True if the table is the record table and the function is one of
- *         its two trigger functions
- *
- * The trigger's name is not part of its identity, so renaming one changes
- * nothing.
- */
-static bool
-isRecordTrigger(Oid tgrelid, Oid tgfoid)
-{
-    return isRecordTable(tgrelid) && isRecordTriggerFunction(tgfoid, NULL);
-}
-
-/**
- * @brief Read a pg_trigger row as the current command left it
- * @param triggerOid Trigger OID
- * @param tgrelid Output: the trigger's table
- * @param tgfoid Output: the trigger's function
- * @param tgenabled Output: when the trigger fires
- * @return False if no such row is visible
- */
-static bool
-readTrigger(Oid triggerOid, Oid *tgrelid, Oid *tgfoid, char *tgenabled)
-{
-    Relation    triggerRel;
-    ScanKeyData key;
-    SysScanDesc scan;
-    HeapTuple   tuple;
-    bool        found = false;
-
-    triggerRel = table_open(TriggerRelationId, AccessShareLock);
-    ScanKeyInit(&key, Anum_pg_trigger_oid, BTEqualStrategyNumber, F_OIDEQ,
-                ObjectIdGetDatum(triggerOid));
-    scan = systable_beginscan(triggerRel, TriggerOidIndexId, true,
-                              SnapshotSelf, 1, &key);
-    tuple = systable_getnext(scan);
-    if (HeapTupleIsValid(tuple))
-    {
-        Form_pg_trigger form = (Form_pg_trigger) GETSTRUCT(tuple);
-
-        *tgrelid = form->tgrelid;
-        *tgfoid = form->tgfoid;
-        *tgenabled = form->tgenabled;
-        found = true;
-    }
-    systable_endscan(scan);
-    table_close(triggerRel, AccessShareLock);
-
-    return found;
-}
-
-/**
- * @brief OAT_DROP: refuse to drop the record table, its triggers or the
- *        extension while the record table holds records
- * @param classId Catalog of the object being dropped
- * @param objectId Its OID
- * @param subId Column number, or 0 for the whole object
- *
- * Caught by meaning, at the drop of each object, whatever statement drops it:
- * DROP TABLE, DROP EXTENSION (also after the table was detached from it),
- * DROP TRIGGER, DROP FUNCTION ... CASCADE, DROP SCHEMA ... CASCADE.
- */
-static void
-protectRecordsFromDrop(Oid classId, Oid objectId, int subId)
-{
-    bool        protectedObject = false;
-
-    if (classId == RelationRelationId && subId == 0)
-        protectedObject = isRecordTable(objectId);
-    else if (classId == ExtensionRelationId)
-        protectedObject = objectId == get_extension_oid(EXTENSION_NAME, true);
-    else if (classId == TriggerRelationId)
-    {
-        Oid         tgrelid;
-        Oid         tgfoid;
-        char        tgenabled;
-
-        protectedObject = readTrigger(objectId, &tgrelid, &tgfoid,
-                                      &tgenabled) &&
-            isRecordTrigger(tgrelid, tgfoid);
-    }
-
-    if (protectedObject)
-    {
-        ObjectAddress address;
-
-        ObjectAddressSubSet(address, classId, objectId, subId);
-        refuseUnprotectedRemoval(REMOVAL_DROP,
-                                 getObjectDescription(&address, false));
-    }
-}
-
-/**
- * @brief OAT_POST_ALTER of the record table: refuse an unsafe rewrite
- * @param relid The record table
- *
- * A replacement of the table's storage, detected as in noteRelationAltered,
- * is allowed only under VACUUM (FULL), CLUSTER or REPACK without CONCURRENTLY
- * (inMvccSafeRewriter): they copy every row version a snapshot may need with
- * its original xmin and xmax, and the records' values unchanged. Refused:
- * REPACK (CONCURRENTLY), which re-inserts every row under its own XID, and
- * ALTER TABLE, whose rewrites also do that and can change the values (ALTER
- * COLUMN ... USING); ALTER TABLE ... SET TABLESPACE is refused with them.
- */
-static void
-protectRecordTableFromRewrite(Oid relid)
-{
-    HeapTuple   oldTuple;
-    RelFileNumber oldNode;
-
-    oldTuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
-    if (!HeapTupleIsValid(oldTuple))
-        return;
-    oldNode = ((Form_pg_class) GETSTRUCT(oldTuple))->relfilenode;
-    ReleaseSysCache(oldTuple);
-
-    /*
-     * When no self-visible row is found, the comparison fails and the
-     * command is refused: the verdict is unknown. noteRelationAltered
-     * returns in that case instead, and says why it can.
-     */
-    if (!inMvccSafeRewriter &&
-        selfVisibleRelfilenode(relid, NULL) != oldNode)
-        ereport(ERROR,
-                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                 errmsg("cannot rewrite the pg_repack_safe record table with this command"),
-                 errdetail("Only VACUUM FULL, CLUSTER and REPACK without CONCURRENTLY keep every record unchanged."),
-                 errhint("Use VACUUM FULL or REPACK.")));
-}
-
-/**
- * @brief OAT_POST_ALTER of a trigger: keep the record table's triggers
- *        firing ALWAYS
- * @param triggerOid The altered trigger
- *
- * ALTER TABLE ... DISABLE TRIGGER, ENABLE TRIGGER and ENABLE REPLICA
- * TRIGGER, in every spelling (a trigger name, ALL, USER), each fire this for
- * every trigger they change (trigger.c, EnableDisableTrigger). Renaming a
- * trigger also fires it and is allowed: the checks identify the triggers by
- * their function.
- */
-static void
-protectRecordTrigger(Oid triggerOid)
-{
-    Oid         tgrelid;
-    Oid         tgfoid;
-    char        tgenabled;
-    ObjectAddress address;
-
-    if (!readTrigger(triggerOid, &tgrelid, &tgfoid, &tgenabled))
-        return;
-    if (tgenabled == TRIGGER_FIRES_ALWAYS ||
-        !isRecordTrigger(tgrelid, tgfoid))
-        return;
-
-    ObjectAddressSet(address, TriggerRelationId, triggerOid);
-    ereport(ERROR,
-            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-             errmsg("cannot change when %s fires",
-                    getObjectDescription(&address, false)),
-             errdetail("The record table's triggers keep readers' caches current and its records unchanged, and must fire ALWAYS.")));
-}
-
-/**
- * @brief object_access_hook: detect storage replacements and protect the
- *        record table
- * @param access Kind of access being reported
- * @param classId Catalog the object belongs to
- * @param objectId OID of the object
- * @param subId Column number, or 0 for the whole object
- * @param arg Access-type-specific argument
- *
- * A pg_class alteration is first examined for a storage replacement
- * (noteRelationAltered), then, if it is the record table's, refused unless
- * the rewrite keeps its records (protectRecordTableFromRewrite).
- */
-static void
-objectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
-                 int subId, void *arg)
-{
-    if (prevObjectAccessHook != NULL)
-        prevObjectAccessHook(access, classId, objectId, subId, arg);
-
-    switch (access)
-    {
-        case OAT_DROP:
-            protectRecordsFromDrop(classId, objectId, subId);
-            break;
-        case OAT_TRUNCATE:
-            if (isRecordTable(objectId))
-                refuseUnprotectedRemoval(REMOVAL_TRUNCATE,
-                                         "table " RECORD_TABLE_NAME);
-            break;
-        case OAT_POST_ALTER:
-            if (classId == RelationRelationId && subId == 0)
-            {
-                /*
-                 * The detection's consumers are the writer and the trace
-                 * NOTICE.
-                 */
-                if (inUnsafeRewriter() || traceStorageChanges)
-                    noteRelationAltered(objectId);
-                if (isRecordTable(objectId))
-                    protectRecordTableFromRewrite(objectId);
-            }
-            else if (classId == TriggerRelationId)
-                protectRecordTrigger(objectId);
-            break;
-        default:
-            break;
-    }
-}
-
-/**
- * @brief Tell whether a utility statement is REPACK with CONCURRENTLY
- * @param parsetree Utility statement node
- * @return True for REPACK (CONCURRENTLY) in any option spelling
- *
- * Mirrors the option loop in ExecRepack (repack.c), the only place that
- * sets CLUOPT_CONCURRENT.
- *
- * A CONCURRENTLY value that is not a Boolean raises an error here, through
- * the same defGetBoolean call ExecRepack makes. The statement fails either
- * way; when it has a second fault, this error is reported instead of the one
- * ExecRepack would have reached first.
- */
-static bool
-isConcurrentRepack(Node *parsetree)
-{
-    RepackStmt *stmt;
-    bool        concurrently = false;
-
-    if (!IsA(parsetree, RepackStmt))
-        return false;
-
-    stmt = (RepackStmt *) parsetree;
-    foreach_node(DefElem, opt, stmt->params)
-    {
-        if (strcmp(opt->defname, "concurrently") == 0)
-            concurrently = defGetBoolean(opt);
-    }
-
-    return concurrently;
-}
-
-/**
- * @brief Run the rest of the ProcessUtility chain under a classification
- * @param recordTable rewriterRecordTable for the statement
- * @param mvccSafeRewriter inMvccSafeRewriter for the statement
- * @param pstmt Planned statement wrapping the utility statement
- * @param queryString Source text
- * @param readOnlyTree Whether the tree must not be modified
- * @param context Where the statement came from
- * @param params Bound parameters
- * @param queryEnv Query environment
- * @param dest Result receiver
- * @param qc Completion tag output
- *
- * Sets the two classification variables for the statement and restores
- * the enclosing statement's values however it ends. A function of its own
- * so that nothing it uses after the setjmp in PG_TRY is modified before
- * it (the caller replaces pstmt and readOnlyTree for COPY TO).
- */
-static void
-runUtilityAs(Oid recordTable, bool mvccSafeRewriter, PlannedStmt *pstmt,
-             const char *queryString, bool readOnlyTree,
-             ProcessUtilityContext context, ParamListInfo params,
-             QueryEnvironment *queryEnv, DestReceiver *dest,
-             QueryCompletion *qc)
-{
-    Oid         savedRewriterRecordTable = rewriterRecordTable;
-    bool        savedInMvccSafeRewriter = inMvccSafeRewriter;
-
-    Assert(!(OidIsValid(recordTable) && mvccSafeRewriter));
-
-    rewriterRecordTable = recordTable;
-    inMvccSafeRewriter = mvccSafeRewriter;
-
-    PG_TRY();
-    {
-        if (prevProcessUtilityHook != NULL)
-            prevProcessUtilityHook(pstmt, queryString, readOnlyTree, context,
-                                   params, queryEnv, dest, qc);
-        else
-            standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
-                                    params, queryEnv, dest, qc);
-    }
-    PG_FINALLY();
-    {
-        rewriterRecordTable = savedRewriterRecordTable;
-        inMvccSafeRewriter = savedInMvccSafeRewriter;
-    }
-    PG_END_TRY();
-}
-
-/**
- * @brief ProcessUtility_hook: classify the innermost utility statement
- * @param pstmt Planned statement wrapping the utility statement
- * @param queryString Source text
- * @param readOnlyTree Whether the tree must not be modified
- * @param context Where the statement came from
- * @param params Bound parameters
- * @param queryEnv Query environment
- * @param dest Result receiver
- * @param qc Completion tag output
- */
-static void
-processUtilityHook(PlannedStmt *pstmt, const char *queryString,
-                   bool readOnlyTree, ProcessUtilityContext context,
-                   ParamListInfo params, QueryEnvironment *queryEnv,
-                   DestReceiver *dest, QueryCompletion *qc)
-{
-    Oid         recordTable = InvalidOid;
-    bool        unsafeRewriter = isConcurrentRepack(pstmt->utilityStmt);
-    bool        mvccSafeRewriter;
-    List       *attachLocked = NIL;
-
-    /*
-     * An unsafe rewrite must be recorded, so it runs only once the record
-     * table is found and locked. This runs before rewriterRecordTable is set
-     * so that an error leaves it unchanged.
-     *
-     * The refusals here (preload, record table, pre-check, COPY check) run
-     * before the previous ProcessUtility hook, so a refused statement never
-     * reaches the modules loaded before this one: it must not run at all.
-     */
-    if (unsafeRewriter)
-    {
-        RepackStmt *repack = (RepackStmt *) pstmt->utilityStmt;
-
-        recordTable = lockRecordTableForWriter();
-        precheckOldSnapshots(repack->relation != NULL &&
-                             repack->relation->relation != NULL
-                             ? RangeVarGetRelid(repack->relation->relation,
-                                                NoLock, true)
-                             : InvalidOid,
-                             false);
-    }
-
-    /* COPY relation TO reads outside the executor; check it here. */
-    if (IsA(pstmt->utilityStmt, CopyStmt) &&
-        !((CopyStmt *) pstmt->utilityStmt)->is_from &&
-        ((CopyStmt *) pstmt->utilityStmt)->relation != NULL)
-    {
-        pstmt = checkCopyTo(pstmt, readOnlyTree, &attachLocked);
-        /* The statement is now checkCopyTo's copy, or was modifiable. */
-        readOnlyTree = false;
-    }
-
-    /*
-     * Every VacuumStmt counts, not only VACUUM (FULL): plain VACUUM and
-     * ANALYZE parse to the same node and never replace a table's storage
-     * (vacuum.c, vacuum_rel calls cluster_rel only under VACOPT_FULL), so
-     * the classification has nothing to allow for them.
-     */
-    mvccSafeRewriter = !unsafeRewriter &&
-        (IsA(pstmt->utilityStmt, VacuumStmt) ||
-         IsA(pstmt->utilityStmt, RepackStmt));
-
-    runUtilityAs(recordTable, mvccSafeRewriter, pstmt, queryString,
-                 readOnlyTree, context, params, queryEnv, dest, qc);
-
-    /*
-     * The COPY has scanned its partitions, so partitions may be attached
-     * again. After an error, the transaction's abort releases these locks.
-     */
-    foreach_oid(parent, attachLocked)
-        UnlockRelationOid(parent, ShareUpdateExclusiveLock);
-}
-
 /**
  * @brief Syscache callback: forget the cached record table OID
  * @param arg Unused
@@ -1177,20 +335,6 @@ recordTableCacheCallback(Datum arg, int cacheid, uint32 hashvalue)
 
     recordTableOidKnown = false;
     recordCacheState = RECORD_CACHE_INVALID;
-}
-
-/**
- * @brief Relcache callback: forget the record cache when the table changes
- * @param arg Unused
- * @param relid Invalidated relation, or InvalidOid for all relations
- */
-static void
-recordCacheRelcacheCallback(Datum arg, Oid relid)
-{
-    (void) arg;
-
-    if (!OidIsValid(relid) || relid == recordCacheTable)
-        recordCacheState = RECORD_CACHE_INVALID;
 }
 
 /**
@@ -1369,64 +513,26 @@ checkRecordTableDefinition(Relation rel, RecordTableUse use)
                  errhint("Drop and re-create the extension.")));
 }
 
-/**
- * @brief Find and lock the record table for an unsafe rewriter
- * @return OID of the record table, on which this transaction then holds
- *         RowExclusiveLock until it ends
+/* ----------------------------------------------------------------
+ * Reader
  *
- * Refuses the rewrite when the library was not loaded through
- * shared_preload_libraries, and when there is nowhere to record it: the
- * extension is not created in this database, or its record table cannot be
- * found or has another definition. The lock keeps the table from being
- * dropped, renamed or moved to another schema (each needs
- * AccessExclusiveLock) before the swap writes the record. Taking it processes pending invalidation messages, so
- * the OID is accepted only if the cache still holds it once the lock is held.
+ * The backend-local copy of the records, and the check of each relation a
+ * query or COPY reads against the snapshot it reads with.
+ * ----------------------------------------------------------------
  */
-static Oid
-lockRecordTableForWriter(void)
+
+/**
+ * @brief Relcache callback: forget the record cache when the table changes
+ * @param arg Unused
+ * @param relid Invalidated relation, or InvalidOid for all relations
+ */
+static void
+recordCacheRelcacheCallback(Datum arg, Oid relid)
 {
-    /*
-     * A record protects readers only in backends that have the reader
-     * check, and only shared_preload_libraries puts it in every backend.
-     */
-    if (!loadedAtServerStart)
-        ereport(ERROR,
-                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                 errmsg("REPACK (CONCURRENTLY) requires pg_repack_safe in shared_preload_libraries"),
-                 errdetail("The library was loaded in this session only, so other sessions may not check their reads against the rewrite."),
-                 errhint("Add pg_repack_safe to shared_preload_libraries and restart the server.")));
+    (void) arg;
 
-    for (;;)
-    {
-        Oid         tableOid;
-        Relation    rel;
-
-        CHECK_FOR_INTERRUPTS();
-
-        tableOid = lookupRecordTable(RECORD_TABLE_FOR_WRITER);
-
-        if (!OidIsValid(tableOid))
-            ereport(ERROR,
-                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                     errmsg("REPACK (CONCURRENTLY) requires the extension \"%s\" in this database",
-                            EXTENSION_NAME),
-                     errdetail("The extension records each REPACK (CONCURRENTLY) so that readers with older snapshots get an error instead of wrong results."),
-                     errhint("Run CREATE EXTENSION %s.", EXTENSION_NAME)));
-
-        LockRelationOid(tableOid, RowExclusiveLock);
-        if (recordTableOidKnown && recordTableOid == tableOid)
-        {
-            rel = try_table_open(tableOid, NoLock);
-            if (rel != NULL)
-            {
-                checkRecordTableDefinition(rel, RECORD_TABLE_FOR_WRITER);
-                table_close(rel, NoLock);
-                return tableOid;
-            }
-        }
-        UnlockRelationOid(tableOid, RowExclusiveLock);
-        recordTableOidKnown = false;
-    }
+    if (!OidIsValid(relid) || relid == recordCacheTable)
+        recordCacheState = RECORD_CACHE_INVALID;
 }
 
 /**
@@ -1785,6 +891,726 @@ checkCopyTo(PlannedStmt *pstmt, bool readOnlyTree, List **attachLocked)
     return pstmt;
 }
 
+/* ----------------------------------------------------------------
+ * Writer
+ *
+ * What REPACK (CONCURRENTLY) does before it runs (lock the record table,
+ * the optional pre-check) and at its swap (the WAL record, the records).
+ * ----------------------------------------------------------------
+ */
+
+/**
+ * @brief Find and lock the record table for an unsafe rewriter
+ * @return OID of the record table, on which this transaction then holds
+ *         RowExclusiveLock until it ends
+ *
+ * Refuses the rewrite when the library was not loaded through
+ * shared_preload_libraries, and when there is nowhere to record it: the
+ * extension is not created in this database, or its record table cannot be
+ * found or has another definition. The lock keeps the table from being
+ * dropped, renamed or moved to another schema (each needs
+ * AccessExclusiveLock) before the swap writes the record. Taking it processes pending invalidation messages, so
+ * the OID is accepted only if the cache still holds it once the lock is held.
+ */
+static Oid
+lockRecordTableForWriter(void)
+{
+    /*
+     * A record protects readers only in backends that have the reader
+     * check, and only shared_preload_libraries puts it in every backend.
+     */
+    if (!loadedAtServerStart)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("REPACK (CONCURRENTLY) requires pg_repack_safe in shared_preload_libraries"),
+                 errdetail("The library was loaded in this session only, so other sessions may not check their reads against the rewrite."),
+                 errhint("Add pg_repack_safe to shared_preload_libraries and restart the server.")));
+
+    for (;;)
+    {
+        Oid         tableOid;
+        Relation    rel;
+
+        CHECK_FOR_INTERRUPTS();
+
+        tableOid = lookupRecordTable(RECORD_TABLE_FOR_WRITER);
+
+        if (!OidIsValid(tableOid))
+            ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                     errmsg("REPACK (CONCURRENTLY) requires the extension \"%s\" in this database",
+                            EXTENSION_NAME),
+                     errdetail("The extension records each REPACK (CONCURRENTLY) so that readers with older snapshots get an error instead of wrong results."),
+                     errhint("Run CREATE EXTENSION %s.", EXTENSION_NAME)));
+
+        LockRelationOid(tableOid, RowExclusiveLock);
+        if (recordTableOidKnown && recordTableOid == tableOid)
+        {
+            rel = try_table_open(tableOid, NoLock);
+            if (rel != NULL)
+            {
+                checkRecordTableDefinition(rel, RECORD_TABLE_FOR_WRITER);
+                table_close(rel, NoLock);
+                return tableOid;
+            }
+        }
+        UnlockRelationOid(tableOid, RowExclusiveLock);
+        recordTableOidKnown = false;
+    }
+}
+
+/**
+ * @brief List the processes holding a lock on a relation
+ * @param relid Relation in the current database
+ * @return PIDs (int List) of the holders and of their lock group leaders
+ */
+static List *
+pidsLockingRelation(Oid relid)
+{
+    LockData   *lockData = GetLockStatusData();
+    List       *pids = NIL;
+
+    for (int i = 0; i < lockData->nelements; i++)
+    {
+        LockInstanceData *instance = &lockData->locks[i];
+
+        if (instance->holdMask == 0 ||
+            instance->locktag.locktag_type != LOCKTAG_RELATION ||
+            instance->locktag.locktag_field1 != MyDatabaseId ||
+            instance->locktag.locktag_field2 != relid)
+            continue;
+        pids = list_append_unique_int(pids, instance->pid);
+        pids = list_append_unique_int(pids, instance->leaderPid);
+    }
+    return pids;
+}
+
+/**
+ * @brief Advisory pre-check: refuse REPACK (CONCURRENTLY) while a session
+ *        could later read the table with an older snapshot
+ * @param relid The table, or InvalidOid if it could not be resolved
+ * @param atSwap True at the swap, where this backend holds
+ *        AccessExclusiveLock on the table
+ *
+ * Best-effort and not part of the guarantee: the reader check refuses such a
+ * read either way. This spares long transactions the serialization failure
+ * by refusing the REPACK instead. A client session in this database counts
+ * if all of these hold:
+ * - it holds a snapshot (backend_xmin is set);
+ * - the snapshot outlives a statement: the session is idle in a
+ *   transaction, or its transaction started before its current statement.
+ *   A single statement locks every relation of its plan when it starts, so
+ *   if it holds no lock on the table it does not read it (except through a
+ *   function that locks lazily). A READ COMMITTED transaction between
+ *   statements holds no snapshot. A READ COMMITTED statement after the
+ *   first of its transaction counts although its next statement takes a
+ *   new snapshot: the isolation level is not visible here, so the check
+ *   errs towards refusing;
+ * - it holds no lock on the table: REPACK waits for such a session at the
+ *   swap, so it cannot be hurt. At the swap no other session holds one;
+ * - its transaction started at least pg_repack_safe.precheck_snapshot_age
+ *   ago. A snapshot is never older than its transaction.
+ * Not seen: sessions on standbys, background workers, and snapshots taken
+ * after the check.
+ */
+static void
+precheckOldSnapshots(Oid relid, bool atSwap)
+{
+    TimestampTz cutoff;
+    List       *lockingPids = NIL;
+    int         nbackends;
+
+    if (precheckSnapshotAge < 0)
+        return;
+
+    cutoff = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+                                         -precheckSnapshotAge);
+    if (!atSwap && OidIsValid(relid))
+        lockingPids = pidsLockingRelation(relid);
+
+    pgstat_clear_backend_activity_snapshot();
+    nbackends = pgstat_fetch_stat_numbackends();
+    for (int i = 1; i <= nbackends; i++)
+    {
+        LocalPgBackendStatus *local = pgstat_get_local_beentry_by_index(i);
+        PgBackendStatus *status = &local->backendStatus;
+        bool        spansStatements;
+
+        if (status->st_procpid <= 0 || status->st_procpid == MyProcPid ||
+            status->st_backendType != B_BACKEND ||
+            status->st_databaseid != MyDatabaseId ||
+            !TransactionIdIsValid(local->backend_xmin) ||
+            status->st_xact_start_timestamp == 0)
+            continue;
+
+        spansStatements =
+            status->st_state == STATE_IDLEINTRANSACTION ||
+            status->st_state == STATE_IDLEINTRANSACTION_ABORTED ||
+            status->st_xact_start_timestamp <
+            status->st_activity_start_timestamp;
+        if (!spansStatements ||
+            status->st_xact_start_timestamp > cutoff ||
+            list_member_int(lockingPids, status->st_procpid))
+            continue;
+
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_IN_USE),
+                 errmsg("REPACK (CONCURRENTLY) refused: another session holds a snapshot that has not read table \"%s\"",
+                        OidIsValid(relid) ? get_rel_name(relid) : "?"),
+                 atSwap
+                 ? errdetail("Process %d, whose transaction started at %s, would get a serialization failure if it read the table after the REPACK. Checked at the swap.",
+                             status->st_procpid,
+                             timestamptz_to_str(status->st_xact_start_timestamp))
+                 : errdetail("Process %d, whose transaction started at %s, would get a serialization failure if it read the table after the REPACK. Checked before the REPACK started.",
+                             status->st_procpid,
+                             timestamptz_to_str(status->st_xact_start_timestamp)),
+                 errhint("Wait for that transaction to end, or set pg_repack_safe.precheck_snapshot_age to -1 to skip this check.")));
+    }
+    list_free(lockingPids);
+}
+
+/**
+ * @brief Write the WAL record that marks an unsafe rewrite
+ * @param relid The rewritten table
+ *
+ * Written at the swap, so it precedes the rewriter's commit record. A
+ * standby without this library cannot check reads; replaying this record
+ * there fails (rmgr.c, RmgrNotFound), so its replay stops before the commit
+ * instead of serving the rewritten table to old snapshots. Known gap (open
+ * question 17): a standby whose replay starts at a checkpoint between this
+ * record and the commit never sees it.
+ */
+static void
+logUnsafeRewrite(Oid relid)
+{
+    xl_pg_repack_safe_rewrite xlrec;
+
+    xlrec.dbOid = MyDatabaseId;
+    xlrec.relid = relid;
+    XLogBeginInsert();
+    XLogRegisterData(&xlrec, sizeof(xlrec));
+    (void) XLogInsert(PG_REPACK_SAFE_RMGR_ID,
+                      XLOG_PG_REPACK_SAFE_UNSAFE_REWRITE);
+}
+
+/**
+ * @brief Redo routine: nothing to apply
+ * @param record The record being replayed
+ *
+ * The records reach standbys as rows of the record table. Replaying this
+ * record matters only where the library is missing, where it fails.
+ */
+static void
+pgRepackSafeRedo(XLogReaderState *record)
+{
+    uint8       info = XLogRecGetInfo(record) & XLR_RMGR_INFO_MASK;
+
+    if (info != XLOG_PG_REPACK_SAFE_UNSAFE_REWRITE)
+        elog(PANIC, "pg_repack_safe redo: unknown op code %u", info);
+}
+
+/**
+ * @brief Describe a record for pg_waldump and redo error context
+ * @param buf Output buffer
+ * @param record The record
+ */
+static void
+pgRepackSafeDesc(StringInfo buf, XLogReaderState *record)
+{
+    uint8       info = XLogRecGetInfo(record) & XLR_RMGR_INFO_MASK;
+
+    if (info == XLOG_PG_REPACK_SAFE_UNSAFE_REWRITE)
+    {
+        xl_pg_repack_safe_rewrite *xlrec =
+            (xl_pg_repack_safe_rewrite *) XLogRecGetData(record);
+
+        appendStringInfo(buf, "db %u rel %u", xlrec->dbOid, xlrec->relid);
+    }
+}
+
+/**
+ * @brief Name a record type for pg_waldump
+ * @param info Record info bits
+ * @return The record type's name, or NULL if unknown
+ */
+static const char *
+pgRepackSafeIdentify(uint8 info)
+{
+    if ((info & XLR_RMGR_INFO_MASK) == XLOG_PG_REPACK_SAFE_UNSAFE_REWRITE)
+        return "UNSAFE_REWRITE";
+    return NULL;
+}
+
+static const RmgrData pgRepackSafeRmgr = {
+    .rm_name = PG_REPACK_SAFE_RMGR_NAME,
+    .rm_redo = pgRepackSafeRedo,
+    .rm_desc = pgRepackSafeDesc,
+    .rm_identify = pgRepackSafeIdentify,
+};
+
+/**
+ * @brief Write one unsafe-rewrite record
+ * @param relid Relation that old snapshots must not read
+ *
+ * The record carries the current transaction's full (64-bit) ID, whose low
+ * 32 bits are the ID the rewrite stamped on every row it copied. The record
+ * table (rewriterRecordTable) was locked with RowExclusiveLock when the
+ * statement started, so it cannot have been dropped, renamed or moved since,
+ * provided this is still that transaction. REPACK (CONCURRENTLY, ANALYZE)
+ * commits after the swap and runs ANALYZE in a new transaction (repack.c,
+ * process_single_relation), so the lock is checked rather than assumed.
+ */
+static void
+insertRecord(Oid relid)
+{
+    Relation    rel;
+    Datum       values[2];
+    bool        nulls[2] = {false, false};
+    HeapTuple   tuple;
+
+    if (!CheckRelationOidLockedByMe(rewriterRecordTable, RowExclusiveLock,
+                                    false))
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("pg_repack_safe cannot record an unsafe rewrite outside the transaction that locked its record table")));
+
+    rel = table_open(rewriterRecordTable, NoLock);
+    values[0] = ObjectIdGetDatum(relid);
+    values[1] = FullTransactionIdGetDatum(GetCurrentFullTransactionId());
+    tuple = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+    simple_heap_insert(rel, tuple);
+    heap_freetuple(tuple);
+
+    /*
+     * Readers' record caches must learn of the record. The invalidation is
+     * sent when this transaction commits, before it releases its locks
+     * (xact.c, CommitTransaction), so a reader that locks the rewritten table
+     * after the commit processes it while taking that lock (lmgr.c,
+     * LockRelationOid), before its check runs.
+     */
+    CacheInvalidateRelcache(rel);
+    table_close(rel, NoLock);
+}
+
+/**
+ * @brief Read a relation's storage as the current transaction left it
+ * @param relid OID of the relation
+ * @param toastRelid Output, unless NULL: reltoastrelid from the same
+ *        pg_class row, or InvalidOid when no such row exists
+ * @return Relfilenode from the pg_class row visible to SnapshotSelf, or
+ *         InvalidRelFileNumber when no such row exists
+ *
+ * Invariant: if the current transaction wrote the relation's pg_class row,
+ * the row it wrote is returned. SnapshotSelf sees a row version whose xmin
+ * is the current transaction and which has no xmax, whatever the command
+ * counter (heapam_visibility.c, HeapTupleSatisfiesSelf), and no other
+ * transaction can update or delete a row version that has not committed.
+ *
+ * Otherwise the scan can find no row although one exists: SnapshotSelf is
+ * not a consistent snapshot, so when another transaction's update of the row
+ * (such as a GRANT, which takes no lock on the relation) commits during the
+ * scan, the scan can reach the new version before that commit and the old
+ * one after it, and see neither.
+ */
+static RelFileNumber
+selfVisibleRelfilenode(Oid relid, Oid *toastRelid)
+{
+    Relation    classRel;
+    ScanKeyData key;
+    SysScanDesc scan;
+    HeapTuple   tuple;
+    RelFileNumber result = InvalidRelFileNumber;
+
+    classRel = table_open(RelationRelationId, AccessShareLock);
+    ScanKeyInit(&key, Anum_pg_class_oid, BTEqualStrategyNumber, F_OIDEQ,
+                ObjectIdGetDatum(relid));
+    scan = systable_beginscan(classRel, ClassOidIndexId, true, SnapshotSelf,
+                              1, &key);
+    if (toastRelid != NULL)
+        *toastRelid = InvalidOid;
+    tuple = systable_getnext(scan);
+    if (HeapTupleIsValid(tuple))
+    {
+        result = ((Form_pg_class) GETSTRUCT(tuple))->relfilenode;
+        if (toastRelid != NULL)
+            *toastRelid = ((Form_pg_class) GETSTRUCT(tuple))->reltoastrelid;
+    }
+    systable_endscan(scan);
+    table_close(classRel, AccessShareLock);
+
+    return result;
+}
+
+/**
+ * @brief Tell whether a relation storage was created in the current transaction
+ * @param locator Storage to look for
+ * @return True if the storage is scheduled for deletion should the current
+ *         transaction abort
+ *
+ * Only RelationCreateStorage schedules a deletion at abort (storage.c);
+ * storage that existed before the transaction is only ever scheduled for
+ * deletion at commit (RelationDropStorage). smgrGetPendingDeletes leaves out
+ * temporary relations and entries of enclosing transaction levels, so such
+ * storage is reported as not created here, and the caller then treats it as
+ * pre-existing: the error is towards recording too much.
+ */
+static bool
+storageCreatedInTransaction(RelFileLocator locator)
+{
+    RelFileLocator *created;
+    int         ncreated;
+    bool        found = false;
+
+    ncreated = smgrGetPendingDeletes(false, &created);
+    for (int i = 0; i < ncreated; i++)
+    {
+        if (RelFileLocatorEquals(created[i], locator))
+        {
+            found = true;
+            break;
+        }
+    }
+    if (created != NULL)
+        pfree(created);
+
+    return found;
+}
+
+/**
+ * @brief Detect that the current command replaced a relation's storage
+ * @param relid OID of the relation that was just altered
+ *
+ * Runs at OAT_POST_ALTER, before the command counter advances, so the
+ * catalog cache and the relation cache still describe the old storage. The
+ * relation cache's storage locator is checked against the catalog cache
+ * rather than assumed; a mismatch leaves the old storage unknown and is
+ * refused.
+ *
+ * Only the replacement of a table's or materialized view's storage that
+ * existed before the current transaction counts. Storage created in this
+ * transaction (such as the copy a REPACK writes into its transient heap,
+ * which the swap hands back to the transient heap, whatever its name) holds
+ * no row that a snapshot from before this transaction could have seen.
+ *
+ * Under an unsafe rewriter, a counted replacement of non-empty storage is
+ * recorded, together with the TOAST relation the table has after the
+ * replacement: REPACK (CONCURRENTLY) swaps TOAST by relation, so that TOAST
+ * relation was also written by this transaction. An old storage with zero
+ * blocks never held a row, so every snapshot sees the table empty either
+ * way and nothing is recorded.
+ */
+static void
+noteRelationAltered(Oid relid)
+{
+    HeapTuple   oldTuple;
+    Form_pg_class oldForm;
+    RelFileNumber oldNode;
+    RelFileNumber newNode;
+    Oid         newToastRelid;
+    char        relkind;
+    NameData    relname;
+    Relation    rel;
+    bool        oldCreatedHere;
+    BlockNumber oldBlocks = 0;
+
+    oldTuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+    if (!HeapTupleIsValid(oldTuple))
+        return;
+    oldForm = (Form_pg_class) GETSTRUCT(oldTuple);
+    oldNode = oldForm->relfilenode;
+    relkind = oldForm->relkind;
+    relname = oldForm->relname;
+    ReleaseSysCache(oldTuple);
+
+    /* Mapped relations keep relfilenode 0; REPACK rejects them concurrently. */
+    if (!RelFileNumberIsValid(oldNode))
+        return;
+
+    if (relkind != RELKIND_RELATION && relkind != RELKIND_MATVIEW)
+        return;
+
+    /*
+     * No self-visible row means the current command did not write the
+     * relation's pg_class row (selfVisibleRelfilenode), so it did not
+     * replace the storage and there is nothing to record. A command that
+     * replaced it wrote the row before this hook ran and without advancing
+     * the command counter (repack.c, swap_relation_files).
+     * protectRecordTableFromRewrite treats the same case as unknown and
+     * refuses, which costs only a spurious error.
+     */
+    newNode = selfVisibleRelfilenode(relid, &newToastRelid);
+    if (!RelFileNumberIsValid(newNode) || newNode == oldNode)
+        return;
+
+    /* The caller holds the lock under which it replaced the storage. */
+    rel = relation_open(relid, NoLock);
+    if (rel->rd_locator.relNumber != oldNode)
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("pg_repack_safe cannot determine the previous storage of \"%s\"",
+                        NameStr(relname)),
+                 errdetail("The relation cache no longer describes the storage being replaced.")));
+    oldCreatedHere = storageCreatedInTransaction(rel->rd_locator);
+    if (!oldCreatedHere)
+        oldBlocks = RelationGetNumberOfBlocks(rel);
+    relation_close(rel, NoLock);
+
+    if (oldCreatedHere)
+        return;
+
+    if (traceStorageChanges)
+        ereport(NOTICE,
+                (inUnsafeRewriter()
+                 ? errmsg("pg_repack_safe: storage of \"%s\" replaced, old storage has %u blocks, unsafe rewriter: yes",
+                          NameStr(relname), oldBlocks)
+                 : errmsg("pg_repack_safe: storage of \"%s\" replaced, old storage has %u blocks, unsafe rewriter: no",
+                          NameStr(relname), oldBlocks)));
+
+    if (inUnsafeRewriter() && oldBlocks > 0)
+    {
+        precheckOldSnapshots(relid, true);
+        logUnsafeRewrite(relid);
+        insertRecord(relid);
+        if (OidIsValid(newToastRelid))
+            insertRecord(newToastRelid);
+    }
+}
+
+/* ----------------------------------------------------------------
+ * Record table protection
+ *
+ * Refusals of the statements that would remove records or the triggers
+ * that guard them.
+ * ----------------------------------------------------------------
+ */
+
+/* How a statement would remove the record table's protection. */
+typedef enum RemovalKind
+{
+    REMOVAL_DROP,
+    REMOVAL_TRUNCATE
+} RemovalKind;
+
+/**
+ * @brief Refuse to remove protection while the record table holds records
+ * @param kind Whether the object is being dropped or truncated
+ * @param objectDescription The object being removed, for the message
+ *
+ * Records are never deleted, and any row version in the table may be the
+ * record an older snapshot needs, on this server or on a standby, so any
+ * block counts as holding records. A superuser can override with
+ * pg_repack_safe.allow_unprotected_drop.
+ *
+ * Each message is a complete literal, with nothing but the object's
+ * description substituted, so that each can be translated as a whole.
+ */
+static void
+refuseUnprotectedRemoval(RemovalKind kind, const char *objectDescription)
+{
+    Oid         tableOid;
+    Relation    rel;
+    BlockNumber blocks;
+
+    if (allowUnprotectedDrop)
+        return;
+    tableOid = findRecordTableNoError();
+    if (!OidIsValid(tableOid))
+        return;
+    rel = try_table_open(tableOid, AccessShareLock);
+    if (rel == NULL)
+        return;
+    blocks = RelationGetNumberOfBlocks(rel);
+    table_close(rel, AccessShareLock);
+    if (blocks == 0)
+        return;
+
+    if (kind == REMOVAL_TRUNCATE)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("cannot truncate the pg_repack_safe record table while it holds records"),
+                 errdetail("The statement would truncate %s. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.",
+                           objectDescription),
+                 errhint("First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, \"Removing the extension\"); then a superuser can set pg_repack_safe.allow_unprotected_drop.")));
+    else
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records"),
+                 errdetail("The statement would drop %s. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.",
+                           objectDescription),
+                 errhint("First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, \"Removing the extension\"); then a superuser can set pg_repack_safe.allow_unprotected_drop.")));
+}
+
+/**
+ * @brief Tell whether a trigger is one of the record table's own triggers
+ * @param tgrelid The trigger's table
+ * @param tgfoid The trigger's function
+ * @return True if the table is the record table and the function is one of
+ *         its two trigger functions
+ *
+ * The trigger's name is not part of its identity, so renaming one changes
+ * nothing.
+ */
+static bool
+isRecordTrigger(Oid tgrelid, Oid tgfoid)
+{
+    return isRecordTable(tgrelid) && isRecordTriggerFunction(tgfoid, NULL);
+}
+
+/**
+ * @brief Read a pg_trigger row as the current command left it
+ * @param triggerOid Trigger OID
+ * @param tgrelid Output: the trigger's table
+ * @param tgfoid Output: the trigger's function
+ * @param tgenabled Output: when the trigger fires
+ * @return False if no such row is visible
+ */
+static bool
+readTrigger(Oid triggerOid, Oid *tgrelid, Oid *tgfoid, char *tgenabled)
+{
+    Relation    triggerRel;
+    ScanKeyData key;
+    SysScanDesc scan;
+    HeapTuple   tuple;
+    bool        found = false;
+
+    triggerRel = table_open(TriggerRelationId, AccessShareLock);
+    ScanKeyInit(&key, Anum_pg_trigger_oid, BTEqualStrategyNumber, F_OIDEQ,
+                ObjectIdGetDatum(triggerOid));
+    scan = systable_beginscan(triggerRel, TriggerOidIndexId, true,
+                              SnapshotSelf, 1, &key);
+    tuple = systable_getnext(scan);
+    if (HeapTupleIsValid(tuple))
+    {
+        Form_pg_trigger form = (Form_pg_trigger) GETSTRUCT(tuple);
+
+        *tgrelid = form->tgrelid;
+        *tgfoid = form->tgfoid;
+        *tgenabled = form->tgenabled;
+        found = true;
+    }
+    systable_endscan(scan);
+    table_close(triggerRel, AccessShareLock);
+
+    return found;
+}
+
+/**
+ * @brief OAT_DROP: refuse to drop the record table, its triggers or the
+ *        extension while the record table holds records
+ * @param classId Catalog of the object being dropped
+ * @param objectId Its OID
+ * @param subId Column number, or 0 for the whole object
+ *
+ * Caught by meaning, at the drop of each object, whatever statement drops it:
+ * DROP TABLE, DROP EXTENSION (also after the table was detached from it),
+ * DROP TRIGGER, DROP FUNCTION ... CASCADE, DROP SCHEMA ... CASCADE.
+ */
+static void
+protectRecordsFromDrop(Oid classId, Oid objectId, int subId)
+{
+    bool        protectedObject = false;
+
+    if (classId == RelationRelationId && subId == 0)
+        protectedObject = isRecordTable(objectId);
+    else if (classId == ExtensionRelationId)
+        protectedObject = objectId == get_extension_oid(EXTENSION_NAME, true);
+    else if (classId == TriggerRelationId)
+    {
+        Oid         tgrelid;
+        Oid         tgfoid;
+        char        tgenabled;
+
+        protectedObject = readTrigger(objectId, &tgrelid, &tgfoid,
+                                      &tgenabled) &&
+            isRecordTrigger(tgrelid, tgfoid);
+    }
+
+    if (protectedObject)
+    {
+        ObjectAddress address;
+
+        ObjectAddressSubSet(address, classId, objectId, subId);
+        refuseUnprotectedRemoval(REMOVAL_DROP,
+                                 getObjectDescription(&address, false));
+    }
+}
+
+/**
+ * @brief OAT_POST_ALTER of the record table: refuse an unsafe rewrite
+ * @param relid The record table
+ *
+ * A replacement of the table's storage, detected as in noteRelationAltered,
+ * is allowed only under VACUUM (FULL), CLUSTER or REPACK without CONCURRENTLY
+ * (inMvccSafeRewriter): they copy every row version a snapshot may need with
+ * its original xmin and xmax, and the records' values unchanged. Refused:
+ * REPACK (CONCURRENTLY), which re-inserts every row under its own XID, and
+ * ALTER TABLE, whose rewrites also do that and can change the values (ALTER
+ * COLUMN ... USING); ALTER TABLE ... SET TABLESPACE is refused with them.
+ */
+static void
+protectRecordTableFromRewrite(Oid relid)
+{
+    HeapTuple   oldTuple;
+    RelFileNumber oldNode;
+
+    oldTuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+    if (!HeapTupleIsValid(oldTuple))
+        return;
+    oldNode = ((Form_pg_class) GETSTRUCT(oldTuple))->relfilenode;
+    ReleaseSysCache(oldTuple);
+
+    /*
+     * When no self-visible row is found, the comparison fails and the
+     * command is refused: the verdict is unknown. noteRelationAltered
+     * returns in that case instead, and says why it can.
+     */
+    if (!inMvccSafeRewriter &&
+        selfVisibleRelfilenode(relid, NULL) != oldNode)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("cannot rewrite the pg_repack_safe record table with this command"),
+                 errdetail("Only VACUUM FULL, CLUSTER and REPACK without CONCURRENTLY keep every record unchanged."),
+                 errhint("Use VACUUM FULL or REPACK.")));
+}
+
+/**
+ * @brief OAT_POST_ALTER of a trigger: keep the record table's triggers
+ *        firing ALWAYS
+ * @param triggerOid The altered trigger
+ *
+ * ALTER TABLE ... DISABLE TRIGGER, ENABLE TRIGGER and ENABLE REPLICA
+ * TRIGGER, in every spelling (a trigger name, ALL, USER), each fire this for
+ * every trigger they change (trigger.c, EnableDisableTrigger). Renaming a
+ * trigger also fires it and is allowed: the checks identify the triggers by
+ * their function.
+ */
+static void
+protectRecordTrigger(Oid triggerOid)
+{
+    Oid         tgrelid;
+    Oid         tgfoid;
+    char        tgenabled;
+    ObjectAddress address;
+
+    if (!readTrigger(triggerOid, &tgrelid, &tgfoid, &tgenabled))
+        return;
+    if (tgenabled == TRIGGER_FIRES_ALWAYS ||
+        !isRecordTrigger(tgrelid, tgfoid))
+        return;
+
+    ObjectAddressSet(address, TriggerRelationId, triggerOid);
+    ereport(ERROR,
+            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+             errmsg("cannot change when %s fires",
+                    getObjectDescription(&address, false)),
+             errdetail("The record table's triggers keep readers' caches current and its records unchanged, and must fire ALWAYS.")));
+}
+
+/* ----------------------------------------------------------------
+ * Trigger functions of the record table
+ * ----------------------------------------------------------------
+ */
+
 /**
  * @brief Trigger function: refuse UPDATE and DELETE of records
  * @return Does not return
@@ -1835,6 +1661,218 @@ pg_repack_safe_records_changed(PG_FUNCTION_ARGS)
     return PointerGetDatum(NULL);
 }
 
+/* ----------------------------------------------------------------
+ * Hooks
+ * ----------------------------------------------------------------
+ */
+
+/**
+ * @brief object_access_hook: detect storage replacements and protect the
+ *        record table
+ * @param access Kind of access being reported
+ * @param classId Catalog the object belongs to
+ * @param objectId OID of the object
+ * @param subId Column number, or 0 for the whole object
+ * @param arg Access-type-specific argument
+ *
+ * A pg_class alteration is first examined for a storage replacement
+ * (noteRelationAltered), then, if it is the record table's, refused unless
+ * the rewrite keeps its records (protectRecordTableFromRewrite).
+ */
+static void
+objectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
+                 int subId, void *arg)
+{
+    if (prevObjectAccessHook != NULL)
+        prevObjectAccessHook(access, classId, objectId, subId, arg);
+
+    switch (access)
+    {
+        case OAT_DROP:
+            protectRecordsFromDrop(classId, objectId, subId);
+            break;
+        case OAT_TRUNCATE:
+            if (isRecordTable(objectId))
+                refuseUnprotectedRemoval(REMOVAL_TRUNCATE,
+                                         "table " RECORD_TABLE_NAME);
+            break;
+        case OAT_POST_ALTER:
+            if (classId == RelationRelationId && subId == 0)
+            {
+                /*
+                 * The detection's consumers are the writer and the trace
+                 * NOTICE.
+                 */
+                if (inUnsafeRewriter() || traceStorageChanges)
+                    noteRelationAltered(objectId);
+                if (isRecordTable(objectId))
+                    protectRecordTableFromRewrite(objectId);
+            }
+            else if (classId == TriggerRelationId)
+                protectRecordTrigger(objectId);
+            break;
+        default:
+            break;
+    }
+}
+
+/**
+ * @brief Tell whether a utility statement is REPACK with CONCURRENTLY
+ * @param parsetree Utility statement node
+ * @return True for REPACK (CONCURRENTLY) in any option spelling
+ *
+ * Mirrors the option loop in ExecRepack (repack.c), the only place that
+ * sets CLUOPT_CONCURRENT.
+ *
+ * A CONCURRENTLY value that is not a Boolean raises an error here, through
+ * the same defGetBoolean call ExecRepack makes. The statement fails either
+ * way; when it has a second fault, this error is reported instead of the one
+ * ExecRepack would have reached first.
+ */
+static bool
+isConcurrentRepack(Node *parsetree)
+{
+    RepackStmt *stmt;
+    bool        concurrently = false;
+
+    if (!IsA(parsetree, RepackStmt))
+        return false;
+
+    stmt = (RepackStmt *) parsetree;
+    foreach_node(DefElem, opt, stmt->params)
+    {
+        if (strcmp(opt->defname, "concurrently") == 0)
+            concurrently = defGetBoolean(opt);
+    }
+
+    return concurrently;
+}
+
+/**
+ * @brief Run the rest of the ProcessUtility chain under a classification
+ * @param recordTable rewriterRecordTable for the statement
+ * @param mvccSafeRewriter inMvccSafeRewriter for the statement
+ * @param pstmt Planned statement wrapping the utility statement
+ * @param queryString Source text
+ * @param readOnlyTree Whether the tree must not be modified
+ * @param context Where the statement came from
+ * @param params Bound parameters
+ * @param queryEnv Query environment
+ * @param dest Result receiver
+ * @param qc Completion tag output
+ *
+ * Sets the two classification variables for the statement and restores
+ * the enclosing statement's values however it ends. A function of its own
+ * so that nothing it uses after the setjmp in PG_TRY is modified before
+ * it (the caller replaces pstmt and readOnlyTree for COPY TO).
+ */
+static void
+runUtilityAs(Oid recordTable, bool mvccSafeRewriter, PlannedStmt *pstmt,
+             const char *queryString, bool readOnlyTree,
+             ProcessUtilityContext context, ParamListInfo params,
+             QueryEnvironment *queryEnv, DestReceiver *dest,
+             QueryCompletion *qc)
+{
+    Oid         savedRewriterRecordTable = rewriterRecordTable;
+    bool        savedInMvccSafeRewriter = inMvccSafeRewriter;
+
+    Assert(!(OidIsValid(recordTable) && mvccSafeRewriter));
+
+    rewriterRecordTable = recordTable;
+    inMvccSafeRewriter = mvccSafeRewriter;
+
+    PG_TRY();
+    {
+        if (prevProcessUtilityHook != NULL)
+            prevProcessUtilityHook(pstmt, queryString, readOnlyTree, context,
+                                   params, queryEnv, dest, qc);
+        else
+            standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+                                    params, queryEnv, dest, qc);
+    }
+    PG_FINALLY();
+    {
+        rewriterRecordTable = savedRewriterRecordTable;
+        inMvccSafeRewriter = savedInMvccSafeRewriter;
+    }
+    PG_END_TRY();
+}
+
+/**
+ * @brief ProcessUtility_hook: classify the innermost utility statement
+ * @param pstmt Planned statement wrapping the utility statement
+ * @param queryString Source text
+ * @param readOnlyTree Whether the tree must not be modified
+ * @param context Where the statement came from
+ * @param params Bound parameters
+ * @param queryEnv Query environment
+ * @param dest Result receiver
+ * @param qc Completion tag output
+ */
+static void
+processUtilityHook(PlannedStmt *pstmt, const char *queryString,
+                   bool readOnlyTree, ProcessUtilityContext context,
+                   ParamListInfo params, QueryEnvironment *queryEnv,
+                   DestReceiver *dest, QueryCompletion *qc)
+{
+    Oid         recordTable = InvalidOid;
+    bool        unsafeRewriter = isConcurrentRepack(pstmt->utilityStmt);
+    bool        mvccSafeRewriter;
+    List       *attachLocked = NIL;
+
+    /*
+     * An unsafe rewrite must be recorded, so it runs only once the record
+     * table is found and locked. This runs before rewriterRecordTable is set
+     * so that an error leaves it unchanged.
+     *
+     * The refusals here (preload, record table, pre-check, COPY check) run
+     * before the previous ProcessUtility hook, so a refused statement never
+     * reaches the modules loaded before this one: it must not run at all.
+     */
+    if (unsafeRewriter)
+    {
+        RepackStmt *repack = (RepackStmt *) pstmt->utilityStmt;
+
+        recordTable = lockRecordTableForWriter();
+        precheckOldSnapshots(repack->relation != NULL &&
+                             repack->relation->relation != NULL
+                             ? RangeVarGetRelid(repack->relation->relation,
+                                                NoLock, true)
+                             : InvalidOid,
+                             false);
+    }
+
+    /* COPY relation TO reads outside the executor; check it here. */
+    if (IsA(pstmt->utilityStmt, CopyStmt) &&
+        !((CopyStmt *) pstmt->utilityStmt)->is_from &&
+        ((CopyStmt *) pstmt->utilityStmt)->relation != NULL)
+    {
+        pstmt = checkCopyTo(pstmt, readOnlyTree, &attachLocked);
+        /* The statement is now checkCopyTo's copy, or was modifiable. */
+        readOnlyTree = false;
+    }
+
+    /*
+     * Every VacuumStmt counts, not only VACUUM (FULL): plain VACUUM and
+     * ANALYZE parse to the same node and never replace a table's storage
+     * (vacuum.c, vacuum_rel calls cluster_rel only under VACOPT_FULL), so
+     * the classification has nothing to allow for them.
+     */
+    mvccSafeRewriter = !unsafeRewriter &&
+        (IsA(pstmt->utilityStmt, VacuumStmt) ||
+         IsA(pstmt->utilityStmt, RepackStmt));
+
+    runUtilityAs(recordTable, mvccSafeRewriter, pstmt, queryString,
+                 readOnlyTree, context, params, queryEnv, dest, qc);
+
+    /*
+     * The COPY has scanned its partitions, so partitions may be attached
+     * again. After an error, the transaction's abort releases these locks.
+     */
+    foreach_oid(parent, attachLocked)
+        UnlockRelationOid(parent, ShareUpdateExclusiveLock);
+}
+
 /**
  * @brief ExecutorStart_hook: run the reader check once locks are held
  * @param queryDesc Query being started
@@ -1853,6 +1891,11 @@ executorStartHook(QueryDesc *queryDesc, int eflags)
     if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0)
         checkUnsafeRewriteRecords(queryDesc);
 }
+
+/* ----------------------------------------------------------------
+ * Module load
+ * ----------------------------------------------------------------
+ */
 
 /**
  * @brief Module load: define GUCs and install the hooks
