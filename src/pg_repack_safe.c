@@ -99,11 +99,12 @@ PG_FUNCTION_INFO_V1(pg_repack_safe_records_protected);
 #define PROTECTED_TRIGGER_FUNCTION "pg_repack_safe_records_protected"
 
 /*
- * Custom WAL resource manager. RM_EXPERIMENTAL_ID until an ID is claimed on
- * the PostgreSQL wiki, before the first release.
- * TODO(dsharpe 2026-11-16): claim a resource manager ID.
+ * Custom WAL resource manager. The ID is the one reserved for pg_repack_safe
+ * on https://wiki.postgresql.org/wiki/CustomWALResourceManagers. It is part
+ * of the WAL format: a server replaying this WAL finds the resource manager
+ * by this number, so it never changes.
  */
-#define PG_REPACK_SAFE_RMGR_ID RM_EXPERIMENTAL_ID
+#define PG_REPACK_SAFE_RMGR_ID 149
 #define PG_REPACK_SAFE_RMGR_NAME "pg_repack_safe"
 #define XLOG_PG_REPACK_SAFE_UNSAFE_REWRITE 0x00
 

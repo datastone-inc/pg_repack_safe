@@ -70,7 +70,7 @@ problem), and a few configurations the extension cannot see.
   every physical standby**, or anything else that replays the WAL.
   `REPACK (CONCURRENTLY)` is refused in a session that loaded the library
   any other way. A standby without it fails on the extension's WAL record
-  and shuts down ("resource manager with ID 128 not registered").
+  and shuts down ("resource manager with ID 149 not registered").
 - `CREATE EXTENSION pg_repack_safe` in every database where
   `REPACK (CONCURRENTLY)` runs; it is refused elsewhere.
 - Recommended: `hot_standby_feedback = on` on hot standbys that run queries

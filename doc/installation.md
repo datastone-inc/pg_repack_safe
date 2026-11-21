@@ -46,7 +46,7 @@ shared_preload_libraries = 'pg_repack_safe'   # add to any existing list
 and restart. Standbys first: once `REPACK (CONCURRENTLY)` runs on the
 primary, it writes a WAL record of the extension's own, and a standby
 without the library fails on it and shuts down ("resource manager with
-ID 128 not registered"). That is deliberate: such a standby could not check
+ID 149 not registered"). That is deliberate: such a standby could not check
 its reads. Restart it with the library and it resumes replay.
 
 On hot standbys that run queries, also set `hot_standby_feedback = on`,
@@ -114,10 +114,9 @@ order (`t/004_hook_chain.pl` with `pg_stat_statements`,
 extension, the optional pre-check, a refused `COPY ... TO`) is not passed on
 to the hooks of libraries loaded before it: it must not run at all.
 
-It registers a custom WAL resource manager with ID 128
-(`RM_EXPERIMENTAL_ID`), which other extensions under development may also
-use; two such libraries cannot be preloaded together. A permanent ID will
-be registered before the first release.
+It registers a custom WAL resource manager with ID 149, reserved for
+`pg_repack_safe` on the PostgreSQL wiki
+([CustomWALResourceManagers](https://wiki.postgresql.org/wiki/CustomWALResourceManagers)).
 
 ## Verifying the Installation
 

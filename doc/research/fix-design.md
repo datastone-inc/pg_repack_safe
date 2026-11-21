@@ -464,8 +464,8 @@ could raise a recovery conflict (`standby.c:470`).
 6. Emit the custom WAL record (I) at the swap so a standby without the
    library stops replay instead of returning empty tables. Accepted costs:
    every physical standby, and anything else replaying that WAL, needs the
-   library; a resource manager ID must be claimed on the PostgreSQL wiki
-   before the first release (`RM_EXPERIMENTAL_ID` during development).
+   library. The resource manager ID is 149, reserved on the PostgreSQL
+   wiki.
 
 Correctness argument for G: a wrong result needs a read of t with a snapshot S
 that does not see the rewriter's XID R as committed, after the rewrite
@@ -707,15 +707,15 @@ order unless noted.
     purpose (`reader_check`, `writer`, `storage_change`, `t/006`) set the
     override.
 - [x] **10. Standby enforcement.** Custom WAL record at the swap
-  (`RM_EXPERIMENTAL_ID` for now). Check: a TAP test in which a standby
+  (resource manager ID 149). Check: a TAP test in which a standby
   without the library stops replay, and one with it errors the old-snapshot
   reader. Open question 17 is settled or written up as a known gap.
-  Done. The library registers a resource manager (`RM_EXPERIMENTAL_ID`,
+  Done. The library registers a resource manager (ID 149,
   name `pg_repack_safe`, a no-op redo) when preloaded; registering is only
   possible then (`rmgr.c:118`). The writer logs one record per unsafe swap,
   before the table's record is inserted. `t/010_standby_wal_record.pl`: a
   standby without the library serves reads until the REPACK, then its
-  startup process fails with "resource manager with ID 128 not registered"
+  startup process fails with "resource manager with ID 149 not registered"
   (`rmgr.c:93`) and the server shuts down; pg_waldump on the primary shows
   the record in the REPACK's transaction, before its commit; a standby with
   the library errors its old snapshot; the primary's crash recovery replays
@@ -765,6 +765,9 @@ order unless noted.
 - [ ] **13. Productize.** README guarantees and non-guarantees, installation
   and standby requirements, `doc_examples`, hook audit, an optimised-build
   benchmark, the resource manager ID claim.
+  - Resource manager ID (2026-11-21): 149, reserved for `pg_repack_safe` on
+    the PostgreSQL wiki (CustomWALResourceManagers); the library registers
+    it in place of `RM_EXPERIMENTAL_ID`.
   - Hook audit (2026-11-16): no blockers. Fixed at the developer's choice:
     `CHECK_FOR_INTERRUPTS` in `lockRecordTableForWriter`'s retry loop; the
     `object_access_hook` chain is now tested (`t/015_oat_hook_chain.pl`,

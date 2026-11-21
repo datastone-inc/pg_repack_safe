@@ -49,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its triggers or the extension, and `TRUNCATE`, are refused unless a
   superuser sets `pg_repack_safe.allow_unprotected_drop`. The README
   describes how to remove the extension safely.
-- Custom WAL resource manager (`RM_EXPERIMENTAL_ID` for now): each
+- Custom WAL resource manager (ID 149, reserved on the PostgreSQL wiki): each
   `REPACK (CONCURRENTLY)` logs a record before its commit, so a standby
   without the library stops replay instead of serving the repacked table to
   old snapshots.

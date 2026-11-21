@@ -69,7 +69,7 @@ $reader->quit;
 
 # The standby without the library stops at the record.
 ok( $bare->wait_for_log(
-        qr/resource manager with ID 128 not registered/),
+        qr/resource manager with ID 149 not registered/),
     'standby without the library: replay fails on the record');
 my $stopped = 0;
 foreach (1 .. 100)
@@ -90,7 +90,7 @@ my ($waldump) = run_command([
     'pg_waldump', '--path' => $primary->data_dir . '/pg_wal',
     '--start' => $beforeRepack, '--end' => $afterRepack ]);
 my ($recordXid, $recordLsn) =
-  $waldump =~ /rmgr: custom128 .*?tx:\s+(\d+), lsn: (\S+),/;
+  $waldump =~ /rmgr: custom149 .*?tx:\s+(\d+), lsn: (\S+),/;
 ok(defined $recordXid, 'the REPACK wrote the pg_repack_safe record');
 my ($commitLsn) =
   $waldump =~ /rmgr: Transaction .*?tx:\s+$recordXid, lsn: (\S+), .*desc: COMMIT/;
