@@ -63,10 +63,12 @@ not install them.
   every insert into its record table except the one `REPACK (CONCURRENTLY)`
   makes, and that one always records its own transaction. Tests of the
   reader check need records with other transaction IDs (aborted, from
-  another epoch, not yet assigned), and this function writes them the way
+  another epoch, not yet assigned), and this function writes them much as
   the extension's writer does: `simple_heap_insert`, which fires no trigger,
-  and a relcache invalidation of the record table. Used by
-  `sql/reader_check.sql`, `specs/reader_cache.spec` and
+  and a relcache invalidation of the record table. Unlike the writer's, its
+  insert is visible to logical decoding, which `t/016_publication.pl` uses
+  to send a record to a subscriber. Also used by `sql/reader_check.sql`,
+  `sql/records_prune.sql`, `specs/reader_cache.spec` and
   `t/006_record_xid8.pl`.
 
 The `REGRESS` and `ISOLATION` instances get the settings in

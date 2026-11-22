@@ -9,7 +9,15 @@
 # table's, or nobody's, and the transaction ID may not be assigned yet. A
 # record applied there would refuse every read and write of the table that
 # has the OID (the transaction ID "has not been assigned") until the
-# subscriber's transaction counter passed it, and nobody could delete it.
+# subscriber's transaction counter passed it.
+#
+# Two things keep it out. The writer inserts its record without the
+# information logical decoding needs (insertRecord, HEAP_INSERT_NO_LOGICAL),
+# so the record of a REPACK (CONCURRENTLY) is never sent. And the record
+# table's BEFORE INSERT trigger refuses whatever arrives all the same: the
+# rows a new subscription's initial copy reads from the publisher's record
+# table, and a row from any other source, which this test writes with
+# test_insert_record.
 #
 # Setup: the extension on both nodes, and the tables created in such an order
 # that the publisher's repacked table t and the subscriber's unrelated table
@@ -17,9 +25,11 @@
 # ahead of the subscriber's before the REPACK.
 #
 # What must hold:
-# - the subscriber's record table stays empty and victim stays readable and
-#   writable: the record table's BEFORE INSERT trigger refuses the row, in
-#   the apply worker as in any session;
+# - a REPACK (CONCURRENTLY) on the publisher sends no record and does not
+#   disturb the subscription;
+# - when a record is sent all the same, the subscriber's record table stays
+#   empty and victim stays readable and writable: the record table's BEFORE
+#   INSERT trigger refuses the row, in the apply worker as in any session;
 # - the refusal is loud: the apply worker reports it and retries, and until
 #   an operator acts the subscription applies nothing more, neither for the
 #   record table nor for any other published table;
@@ -58,13 +68,20 @@ $publisher->safe_psql('postgres', q{
     CREATE EXTENSION pg_repack_safe;
     CREATE TABLE t (id int PRIMARY KEY);
     CREATE TABLE other (id int PRIMARY KEY);
+    CREATE TABLE progress (id int PRIMARY KEY);
     INSERT INTO t SELECT generate_series(1, 5);
+    CREATE FUNCTION test_insert_record(record_table regclass, relid oid,
+                                       rewrite_xid xid8)
+    RETURNS void
+    AS 'test_record'
+    LANGUAGE C STRICT;
 });
 $subscriber->safe_psql('postgres', q{
     CREATE EXTENSION pg_repack_safe;
     CREATE TABLE victim (id int PRIMARY KEY);
     CREATE TABLE t (id int PRIMARY KEY);
     CREATE TABLE other (id int PRIMARY KEY);
+    CREATE TABLE progress (id int PRIMARY KEY);
     INSERT INTO victim SELECT generate_series(1, 3);
 });
 my $tOid = $publisher->safe_psql('postgres', q{SELECT 't'::regclass::oid});
@@ -95,18 +112,41 @@ cmp_ok(
         'SELECT pg_current_xact_id()::text::bigint') + 2000,
     "the publisher's transaction counter is ahead of the subscriber's");
 
-my $logOffset = -s $subscriber->logfile;
+my $errorCount = q{(SELECT apply_error_count FROM pg_stat_subscription_stats
+                    WHERE subname = 'sub')};
+
+# The writer's record is not sent. A change committed after the REPACK
+# arrives, so the subscription went past the REPACK's transaction, and it
+# did so without an error and without storing anything.
 $publisher->safe_psql('postgres', 'REPACK (CONCURRENTLY) t');
 is($publisher->safe_psql('postgres',
         "SELECT count(*) FROM pg_repack_safe_rewrites WHERE relid = $tOid"),
     '1', 'the publisher recorded the REPACK');
-# A change to another published table, committed after the REPACK.
+$publisher->safe_psql('postgres', 'INSERT INTO progress VALUES (1)');
+$publisher->wait_for_catchup('sub');
+is($subscriber->safe_psql('postgres', 'SELECT count(*) FROM progress'),
+    '1', "a REPACK (CONCURRENTLY) on the publisher does not stop the subscription");
+is($subscriber->safe_psql('postgres',
+        'SELECT count(*) FROM pg_repack_safe_rewrites'),
+    '0', "the writer's record does not reach the subscriber");
+is($subscriber->safe_psql('postgres', "SELECT $errorCount"),
+    '0', 'the apply worker reported no error');
+
+# A record that is sent all the same: one inserted the way the writer
+# inserts except for that (test_insert_record, test/modules/test_record),
+# as a record from any other source would be.
+my $logOffset = -s $subscriber->logfile;
+$publisher->safe_psql('postgres', qq{
+    SELECT test_insert_record('pg_repack_safe_rewrites', $tOid,
+                              pg_current_xact_id())});
+is($publisher->safe_psql('postgres',
+        "SELECT count(*) FROM pg_repack_safe_rewrites WHERE relid = $tOid"),
+    '2', 'the publisher holds a record that logical decoding sees');
+# A change to another published table, committed after that record.
 $publisher->safe_psql('postgres', 'INSERT INTO other VALUES (1)');
 
 # Wait until the subscriber has dealt with the record one way or the other:
 # refused it at least twice (an error and a retry), or stored it.
-my $errorCount = q{(SELECT apply_error_count FROM pg_stat_subscription_stats
-                    WHERE subname = 'sub')};
 $subscriber->poll_query_until('postgres', qq{
     SELECT $errorCount >= 2
         OR EXISTS (SELECT 1 FROM pg_repack_safe_rewrites)
@@ -201,6 +241,7 @@ $subscriber->safe_psql('sync', q{
     CREATE EXTENSION pg_repack_safe;
     CREATE TABLE t (id int PRIMARY KEY);
     CREATE TABLE other (id int PRIMARY KEY);
+    CREATE TABLE progress (id int PRIMARY KEY);
 });
 $logOffset = -s $subscriber->logfile;
 $subscriber->safe_psql('sync',
@@ -264,6 +305,7 @@ $subscriber->safe_psql('truncated', q{
     CREATE EXTENSION pg_repack_safe;
     CREATE TABLE t (id int PRIMARY KEY);
     CREATE TABLE other (id int PRIMARY KEY);
+    CREATE TABLE progress (id int PRIMARY KEY);
     CREATE TABLE local (id int PRIMARY KEY);
     INSERT INTO local SELECT generate_series(1, 3);
 });

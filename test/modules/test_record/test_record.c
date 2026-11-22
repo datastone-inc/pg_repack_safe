@@ -12,10 +12,12 @@
  * its own transaction ID. The reader check has cases no REPACK can set up
  * from a test: a record whose transaction aborted, one from another XID
  * epoch, one whose transaction ID is not assigned yet. test_insert_record
- * writes such a record the way the extension's writer does (insertRecord in
+ * writes such a record much as the extension's writer does (insertRecord in
  * src/pg_repack_safe.c): simple_heap_insert, which fires no trigger, and a
  * relcache invalidation of the record table, which is what makes readers
- * reload their copy of the records.
+ * reload their copy of the records. The writer also keeps its insert from
+ * logical decoding; this one does not, so a publication that includes the
+ * record table sends it (t/016_publication.pl relies on that).
  *
  * A test creates the function itself:
  *

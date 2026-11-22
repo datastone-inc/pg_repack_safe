@@ -58,8 +58,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   other insert with "cannot insert into the pg_repack_safe record table".
   A publication `FOR ALL TABLES` includes the record table, and without the
   refusal a subscriber with the extension stored the publisher's records,
-  which took the subscriber's table with the same OID offline. The refusal
-  stops the subscription instead, until the table is excluded from the
+  which took the subscriber's table with the same OID offline.
+- The record a `REPACK (CONCURRENTLY)` writes is not sent to logical
+  replication subscribers, so a publication that includes the record table
+  does not stop a subscription each time the publisher repacks. A new
+  subscription's initial copy still reads the records already there, and
+  the subscriber refuses them until the table is excluded from the
   publication and the subscription is refreshed; `doc/installation.md`,
   "Logical Replication", gives the steps.
 - `TRUNCATE` of a record table that holds records is refused by its

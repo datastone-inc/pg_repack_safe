@@ -131,19 +131,22 @@ ALTER PUBLICATION my_publication
 extension is installed in, or move the extension to another schema with
 `ALTER EXTENSION pg_repack_safe SET SCHEMA`.
 
-If the table is published all the same, a subscriber that has the extension
-does not store the publisher's records: every insert into its record table
-is refused, in the apply worker too, so none of its tables is affected. The
-refusal is an error, not a silent skip, and it stops the subscription
-(`t/016_publication.pl`):
+If the table is published all the same (`t/016_publication.pl`):
 
-- Once the publisher runs `REPACK (CONCURRENTLY)`, the apply worker logs
-  `ERROR: cannot insert into the pg_repack_safe record table` and retries
-  the same transaction for as long as it is refused. Meanwhile the
-  subscription applies nothing, for any table.
+- A `REPACK (CONCURRENTLY)` on the publisher does not disturb the
+  subscription. The extension writes its record so that logical decoding
+  passes over it, and nothing is sent.
 - If the publisher's record table already holds records when the
-  subscription is created, the initial copy of that one table fails in the
-  same way and is retried; the other tables are copied and replicate.
+  subscription is created, the initial copy of that one table reads them.
+  A subscriber that has the extension refuses every insert into its record
+  table, so the copy fails with `ERROR: cannot insert into the
+  pg_repack_safe record table` and is retried; the other tables are copied
+  and replicate.
+- A record that arrives while the subscription is running, from any other
+  source, is refused in the same way, in the apply worker. That refusal is
+  an error, not a silent skip: the apply worker retries the same
+  transaction for as long as it is refused, and meanwhile the subscription
+  applies nothing, for any table.
 - A `TRUNCATE` of the publisher's record table is refused as well while the
   subscriber's record table holds records of its own, which its old
   snapshots rely on: `ERROR: cannot truncate the pg_repack_safe record table

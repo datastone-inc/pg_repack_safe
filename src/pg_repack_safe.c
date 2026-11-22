@@ -1201,6 +1201,14 @@ static const RmgrData pgRepackSafeRmgr = {
  * provided this is still that transaction. REPACK (CONCURRENTLY, ANALYZE)
  * commits after the swap and runs ANALYZE in a new transaction (repack.c,
  * process_single_relation), so the lock is checked rather than assumed.
+ *
+ * The insert fires no trigger and is not decoded for logical replication:
+ * with HEAP_INSERT_NO_LOGICAL its WAL record is not marked as carrying a
+ * tuple for decoding, and decoding passes over an insert without that mark
+ * (heapam.c, heap_insert; decode.c, DecodeInsert). A publication that
+ * includes the record table therefore does not send it; the record's OID
+ * and transaction ID mean nothing in another cluster. Physical replication
+ * and recovery replay the insert like any other.
  */
 static void
 insertRecord(Oid relid)
@@ -1220,7 +1228,8 @@ insertRecord(Oid relid)
     values[0] = ObjectIdGetDatum(relid);
     values[1] = FullTransactionIdGetDatum(GetCurrentFullTransactionId());
     tuple = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-    simple_heap_insert(rel, tuple);
+    heap_insert(rel, tuple, GetCurrentCommandId(true),
+                HEAP_INSERT_NO_LOGICAL, NULL);
     heap_freetuple(tuple);
 
     /*
@@ -1835,7 +1844,7 @@ selfVisibleIndexTable(Oid relid)
  * @param relid The relation just created
  *
  * Invariant: the record table has no index. The writer inserts records with
- * simple_heap_insert (insertRecord), which maintains no index, so an index
+ * heap_insert (insertRecord), which maintains no index, so an index
  * would miss every later record and SQL that uses it would return stale
  * answers. No setting overrides the refusal.
  *
@@ -2030,7 +2039,10 @@ pg_repack_safe_records_protected(PG_FUNCTION_ARGS)
  * under which a trigger enabled any other way does not fire
  * (trigger.c:3504-3508, TriggerEnabled).
  *
- * insertRecord is not refused: simple_heap_insert fires no trigger. Nor are
+ * insertRecord is not refused: heap_insert fires no trigger, and its record
+ * is not sent to subscribers either, so what reaches this trigger through
+ * logical replication is the initial copy of a publisher's record table or
+ * a row from some other source. Nor are
  * the rewrites that copy the table's rows as they are (VACUUM FULL, CLUSTER,
  * REPACK), pg_upgrade, which copies files, or a standby's replay.
  *

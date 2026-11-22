@@ -107,11 +107,14 @@ Logical replication's initial copy of a table published through its
 partitioned root is such a statement; `pg_dump` copies each partition by
 itself and is not affected.
 
-A publication `FOR ALL TABLES` includes `pg_repack_safe_rewrites`. Exclude
-it: a subscriber that has the extension refuses the publisher's records,
-and its subscription then applies nothing more until the table is excluded
-and the subscription refreshed (`t/016_publication.pl`; see "Logical
-Replication" in [doc/installation.md](doc/installation.md)).
+A publication `FOR ALL TABLES` includes `pg_repack_safe_rewrites`. The
+records a `REPACK (CONCURRENTLY)` writes are not sent to subscribers, so
+replication carries on. Exclude the table all the same: a new
+subscription's initial copy reads the records already there, a subscriber
+that has the extension refuses them, and that one table's copy is retried
+until the table is excluded and the subscription refreshed
+(`t/016_publication.pl`; see "Logical Replication" in
+[doc/installation.md](doc/installation.md)).
 
 The record table is protected:
 
