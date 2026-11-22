@@ -69,6 +69,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the table, emptied a subscriber's record table, and the subscriber's old
   snapshots then read its repacked tables as empty. It now stops the
   subscription like a replicated record.
+- Records are bounded. Each `REPACK (CONCURRENTLY)` deletes every record
+  older than its own, and `pg_repack_safe_prune_records()` does the same on
+  request. A deleted record stays in the table, and readers still obey it,
+  until `VACUUM` finds that no snapshot can need it; on a hot standby,
+  replaying its removal ends the snapshots that still did.
+- `VACUUM FULL`, `CLUSTER` and `REPACK` of the record table, and the
+  database-wide forms when they reach it, are refused while it holds a
+  deleted record, with a hint to run `VACUUM` on it first: they would drop
+  the record without ending the standby snapshots that need it.
+- Removing the extension no longer needs the override or a check of every
+  standby: delete the records with `pg_repack_safe_prune_records()`, vacuum
+  the record table until it is empty, and `DROP EXTENSION` (README,
+  "Removing the extension").
 - Custom WAL resource manager (ID 149, reserved on the PostgreSQL wiki): each
   `REPACK (CONCURRENTLY)` logs a record before its commit, so a standby
   without the library stops replay instead of serving the repacked table to

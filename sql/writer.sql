@@ -11,6 +11,8 @@
  * record for the table and one for the TOAST relation the table has after
  * the swap, both with the rewriter's transaction ID. Nothing else writes a
  * record: not an empty table, not an MVCC-safe rewrite, not a failed REPACK.
+ * Having written its records, the rewrite deletes every older one, so the
+ * record table stays small however often tables are repacked.
  * The transient heap is told apart from the user's table by meaning: the
  * storage the swap gives it was created in the rewriter's transaction. A
  * user table named like the transient heap is still recorded. The old
@@ -36,6 +38,7 @@ REPACK (CONCURRENTLY) wr_t;
 REPACK (CONCURRENTLY true, VERBOSE false) wr_t USING INDEX wr_t_pkey;
 
 CREATE EXTENSION pg_repack_safe;
+CREATE EXTENSION pageinspect;
 
 -- MVCC-safe rewrites: no record.
 VACUUM FULL wr_t;
@@ -53,14 +56,12 @@ REPACK (CONCURRENTLY) wr_missing;
 REPACK (CONCURRENTLY) wr_t USING INDEX wr_missing_idx;
 SELECT count(*) AS records FROM pg_repack_safe_rewrites;
 
--- Unsafe rewrites of non-empty tables: recorded.
-REPACK (CONCURRENTLY) wr_t;
-REPACK (CONCURRENTLY, ANALYZE) public.pg_temp_1;
-REPACK (CONCURRENTLY) wr_deleted;
-
--- Each record names the table or its post-swap TOAST relation, and carries
--- the full XID that wrote it, whose 32-bit form also wrote every row of the
--- repacked table.
+-- Unsafe rewrites of non-empty tables: recorded. Each record names the
+-- table or its post-swap TOAST relation, and carries the full XID that wrote
+-- it, whose 32-bit form also wrote every row of the repacked table. Each
+-- REPACK (CONCURRENTLY) also deletes the records older than its own, so only
+-- its own are visible after it.
+CREATE VIEW wr_records AS
 SELECT CASE r.relid
            WHEN 'wr_t'::regclass THEN 'wr_t'
            WHEN c.reltoastrelid THEN 'wr_t TOAST'
@@ -69,17 +70,46 @@ SELECT CASE r.relid
        END AS recorded,
        r.rewrite_xid::xid = r.xmin AS by_rewriter
 FROM pg_repack_safe_rewrites r, pg_class c
-WHERE c.oid = 'wr_t'::regclass
-ORDER BY recorded;
+WHERE c.oid = 'wr_t'::regclass;
 
+REPACK (CONCURRENTLY) wr_t;
+SELECT * FROM wr_records ORDER BY recorded;
 SELECT count(*) AS rows,
        bool_and(t.xmin = r.rewrite_xid::xid) AS rows_by_rewriter
 FROM wr_t t, pg_repack_safe_rewrites r
 WHERE r.relid = 'wr_t'::regclass;
 
+-- With ANALYZE the statement commits after the swap and analyzes in a new
+-- transaction; the record is written, and the older ones deleted, at the
+-- swap all the same.
+REPACK (CONCURRENTLY, ANALYZE) public.pg_temp_1;
+SELECT * FROM wr_records ORDER BY recorded;
 SELECT bool_and(t.xmin = r.rewrite_xid::xid) AS rows_by_rewriter
 FROM public.pg_temp_1 t, pg_repack_safe_rewrites r
 WHERE r.relid = 'public.pg_temp_1'::regclass;
+
+REPACK (CONCURRENTLY) wr_deleted;
+SELECT * FROM wr_records ORDER BY recorded;
+
+-- The record table does not grow with the number of repacks. A table with a
+-- TOAST relation gets a new one at every REPACK (CONCURRENTLY), and the
+-- records of the dropped ones are deleted with the rest: after any number of
+-- repacks the visible records are the last repack's two, both naming
+-- relations that exist, and after VACUUM, with no snapshot needing the
+-- deleted ones, they are all the table physically holds.
+REPACK (CONCURRENTLY) wr_t;
+REPACK (CONCURRENTLY) wr_t;
+REPACK (CONCURRENTLY) wr_t;
+REPACK (CONCURRENTLY) wr_t;
+SELECT count(*) AS records, count(c.oid) AS naming_a_relation
+FROM pg_repack_safe_rewrites r LEFT JOIN pg_class c ON c.oid = r.relid;
+SELECT * FROM wr_records ORDER BY recorded;
+VACUUM pg_repack_safe_rewrites;
+SELECT count(*) AS row_versions
+FROM heap_page_items(get_raw_page('pg_repack_safe_rewrites', 0))
+WHERE lp_len > 0;
+SELECT pg_relation_size('pg_repack_safe_rewrites') /
+       current_setting('block_size')::int AS blocks;
 
 -- wr_deleted was recorded on its old storage's blocks: its new storage is
 -- empty.
@@ -95,4 +125,6 @@ WHERE c.oid = 'pg_repack_safe_rewrites'::regclass;
 SET pg_repack_safe.allow_unprotected_drop = on;
 DROP EXTENSION pg_repack_safe;
 RESET pg_repack_safe.allow_unprotected_drop;
+DROP VIEW wr_records;
 DROP TABLE wr_t, wr_empty, wr_deleted, public.pg_temp_1;
+DROP EXTENSION pageinspect;

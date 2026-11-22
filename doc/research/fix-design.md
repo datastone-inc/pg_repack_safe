@@ -595,6 +595,60 @@ order unless noted.
   `t/007_standby_reader.pl`, which needs a standby snapshot from before the
   REPACK to get the error after the primary vacuumed the record table; the
   standby check of this step.
+  Probe (2026-11-22, before planning bounded records; `pg_waldump` of
+  `t/007`'s primary and a diagnostic copy of the test, nothing changed):
+  - A plain `VACUUM` of the record table that sets its page all-visible
+    logs `PRUNE_VACUUM_SCAN snapshotConflictHorizon: N`, N being the newest
+    record's inserting transaction (`pruneheap.c:1274-1276`, `:1960-1962`),
+    although it removes nothing.
+  - Replayed on a standby without `hot_standby_feedback`, that record
+    terminates an idle REPEATABLE READ session whose snapshot xmin is N
+    (`FATAL: terminating connection due to conflict with recovery`;
+    `confl_snapshot` = 1), after `max_standby_streaming_delay`. So old
+    standby snapshots are already ended by a vacuum of the record table
+    today, whether or not they read a repacked table.
+  - `t/007` passes only because it does not wait for that replay:
+    `wait_for_catchup` took the primary's write position as its target,
+    `0/0302BCD8`, which was the start of the prune record itself. Its
+    "after the REPACK and a VACUUM" assertion therefore runs before the
+    VACUUM is replayed. With a two-second wait the reader is gone.
+  - The PG19 build has no injection points (`USE_INJECTION_POINTS` is
+    undefined in `pg_config.h`), so the concurrent-deleter path cannot be
+    forced that way.
+  Outcome (developer rulings, 2026-11-22): **records are deleted by the
+  next writer.** At its swap, after writing its own records, each
+  REPACK (CONCURRENTLY) deletes every committed record whose transaction
+  precedes its own (`deleteOlderRecords`), with `heap_delete` called
+  directly, not waiting and not decoded; `pg_repack_safe_prune_records()`
+  does the same on request. The deleter is never the inserter, so the
+  removal carries a conflict horizon. Nothing decides whether a record is
+  still needed: VACUUM does, on the primary by its horizon and on a standby
+  by the conflict.
+  - Rewrites of the record table (ruling 1, option B of three): VACUUM FULL,
+    CLUSTER and REPACK drop a deleted version with no conflict horizon, so
+    they are refused while the old storage holds one, with a hint to run
+    plain VACUUM first. Refusing them always (A) would have made the
+    database-wide forms fail in every database with the extension; a WAL
+    record whose replay raises the conflict (C) was left for the day the
+    user-table gap of `t/012` is taken on.
+  - Removal (ruling 2): prune, VACUUM to zero blocks, DROP EXTENSION
+    without the override; no per-standby check.
+  - Standby cost (ruling 3): accepted and documented in the README's known
+    gaps. The probe above showed it already existed for any vacuum of the
+    record table; deleting records makes autovacuum visit sooner.
+  - Autovacuum (ruling 4): defaults, no reloptions.
+  - Checks: `t/017_standby_record_cleanup.pl` (real table, both nodes;
+    old standby snapshots get the error, are cancelled or are terminated,
+    never a row count), `specs/record_prune.spec`, `sql/records_prune.sql`,
+    `sql/writer.sql` (bounded after repeated repacks), `t/003` (a deleted
+    record crosses pg_upgrade). Mutation run once: with the reader made to
+    skip deleted records, `t/017` reported an old standby snapshot reading
+    0 rows and `record_prune` failed; restored.
+  - Not exercised by any test: a record deleted by another transaction
+    that commits between the deleter's snapshot and its `heap_delete`
+    (`TM_Deleted`; no injection points). The code leaves such a row alone.
+    A REPACK started while a prune transaction is open waits for it, as it
+    waits for any writing transaction, so the two do not meet mid-delete.
 - [x] **7. Cache.** Per-backend "known empty" flag and record hash, cleared
   only by invalidation of the record table (writer and cleanup send it).
   Check: an isolation test and a standby test in which a session with a

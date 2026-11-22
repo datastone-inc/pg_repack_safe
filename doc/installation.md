@@ -73,7 +73,7 @@ It needs a superuser to create. Its settings:
 | Setting | Default | Who | Meaning |
 |---|---|---|---|
 | `pg_repack_safe.precheck_snapshot_age` | `-1` (off) | any user | refuse `REPACK (CONCURRENTLY)` while a session could later read the table with an older snapshot (README, "Optional pre-check") |
-| `pg_repack_safe.allow_unprotected_drop` | `off` | superuser | let `DROP` and `TRUNCATE` remove the record table, its triggers or the extension while records exist (README, "Removing the extension") |
+| `pg_repack_safe.allow_unprotected_drop` | `off` | superuser | let `DROP` and `TRUNCATE` remove the record table, its triggers or the extension while the record table holds records; old snapshots then read repacked tables as empty (README, "Removing the extension") |
 | `pg_repack_safe.trace_storage_changes` | `off` | superuser | report each detected replacement of a table's storage as a NOTICE (diagnostics) |
 
 ## Upgrading PostgreSQL
@@ -202,6 +202,7 @@ record table, which the extension otherwise refuses, so do not run
 
 ## Removing the Extension
 
-See the README, "Removing the extension": dropping it is refused while it
-holds records, and the safe order is to check for old snapshots on the
-primary and every standby first, then drop it, then remove the library.
+See the README, "Removing the extension": dropping it is refused while its
+record table holds records, deleted ones included, and the safe order is to
+delete the records with `pg_repack_safe_prune_records()`, vacuum the record
+table until it is empty, drop the extension, and then remove the library.

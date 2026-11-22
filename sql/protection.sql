@@ -7,15 +7,18 @@
  * @file protection.sql
  * @brief Operations refused on the record table (fix-design.md, step 9)
  *
- * Records are the only protection old snapshots have, and they are never
- * deleted. While the record table holds any row version:
+ * Records are the only protection old snapshots have, and only the library
+ * deletes them (records_prune.sql). While the record table holds any row
+ * version:
  * - DROP of the record table or the extension, by any route, and TRUNCATE
  *   of the record table, by any route (session_replication_role, CASCADE),
  *   are refused unless a superuser sets
  *   pg_repack_safe.allow_unprotected_drop;
  * - rewrites of the record table other than VACUUM FULL, CLUSTER and REPACK
- *   without CONCURRENTLY, which keep every record unchanged, are refused:
- *   REPACK (CONCURRENTLY) and rewriting ALTER TABLE;
+ *   without CONCURRENTLY, which keep every record that is not deleted
+ *   unchanged, are refused: REPACK (CONCURRENTLY) and rewriting ALTER TABLE
+ *   (those three are refused too while a deleted record is in the table:
+ *   records_prune.sql);
  * - UPDATE and DELETE of records are refused, by any route (MERGE, a
  *   writable CTE).
  * Changing when the record table's triggers fire is refused always, and

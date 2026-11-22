@@ -115,16 +115,24 @@ Replication" in [doc/installation.md](doc/installation.md)).
 
 The record table is protected:
 
-- Records are never deleted. Each `REPACK (CONCURRENTLY)` adds one or two
-  rows; the table only grows.
+- Each `REPACK (CONCURRENTLY)` adds one or two records and deletes every
+  older one, so the table stays small. A deleted record still protects: it
+  stays in the table until `VACUUM` finds that no snapshot can need it.
+  `pg_repack_safe_prune_records()` deletes the remaining records in a
+  database that has stopped repacking.
 - While it holds records, `DROP` of the table, its triggers or the
   extension, and `TRUNCATE` of the table, are refused unless a superuser
   sets `pg_repack_safe.allow_unprotected_drop` (see
   [Removing the extension](#removing-the-extension)). `UPDATE` and `DELETE`
   of records, rewrites that do not keep every record unchanged (a rewriting
   `ALTER TABLE`, `REPACK (CONCURRENTLY)`), and changes to when its triggers
-  fire are always refused. `VACUUM`, `VACUUM FULL`, `CLUSTER` and `REPACK`
-  of it, also database-wide, are allowed.
+  fire are always refused. `VACUUM` of it is always allowed.
+- `VACUUM FULL`, `CLUSTER` and `REPACK` of it are refused while it holds a
+  deleted record, because they would drop the record without ending the
+  standby snapshots that still need it. Run `VACUUM
+  pg_repack_safe_rewrites` first and repeat the command. The database-wide
+  `VACUUM FULL` and `REPACK` stop at the record table with the same error
+  and the same remedy.
 - `INSERT` into it is always refused, by any route (`COPY ... FROM`,
   `MERGE`, logical replication) and whatever `session_replication_role` is.
   Only `REPACK (CONCURRENTLY)` writes records. A record names a table by
@@ -186,6 +194,19 @@ Each has a test that pins today's behaviour.
   the primary's cleanup back for every standby. If users ask for it, this
   extension could also guard these rewrites on standbys, as it does
   `REPACK (CONCURRENTLY)`.
+- **Old snapshots on a hot standby without `hot_standby_feedback` are
+  ended** when the primary vacuums the record table after a
+  `REPACK (CONCURRENTLY)`, whether or not they would have read a repacked
+  table: a running query is cancelled with a recovery-conflict error
+  (SQLSTATE 40001), and a session idle in a transaction is terminated. This
+  is how a deleted record is kept from disappearing under a standby
+  snapshot that needs it, and it affects every transaction in that database
+  whose snapshot is older than the latest `REPACK (CONCURRENTLY)`. Autovacuum
+  vacuums the record table once enough records have been deleted (about 50
+  with its default settings); a manual `VACUUM` of the record table causes
+  it at once. With
+  `hot_standby_feedback` on, the primary keeps the records instead
+  (`t/007_standby_reader.pl`, `t/017_standby_record_cleanup.pl`).
 - **A standby without the library** whose replay starts in the moment
   between a `REPACK (CONCURRENTLY)`'s WAL record and its commit: see
   [Requirements](#requirements).
@@ -229,35 +250,45 @@ of a `READ COMMITTED` transaction, which would not have been hurt.
 
 Records protect snapshots taken before a `REPACK (CONCURRENTLY)`, on the
 primary and on every standby. Dropping the extension removes that
-protection, so it is refused while records exist. To remove it safely, in
-this order:
+protection, so it is refused while the record table holds any record,
+deleted ones included. To remove it safely, in this order:
 
 1. Stop running `REPACK (CONCURRENTLY)`. A new one adds a newer record.
-2. In each database with the extension, on the primary **and on every
-   standby**, wait until this query returns no rows. It lists sessions whose
-   snapshot may predate the newest record (on any database, so it errs
-   towards waiting):
+2. In each database with the extension, on the primary, delete the
+   remaining records:
 
    ```sql
-   SELECT pid, datname, backend_xmin
-   FROM pg_stat_activity
-   WHERE backend_xmin IS NOT NULL
-     AND age(backend_xmin) >= (SELECT age(max(rewrite_xid)::xid)
-                               FROM pg_repack_safe_rewrites);
+   SELECT pg_repack_safe_prune_records();
    ```
 
-3. Drop the extension in each database, with the override:
+3. Vacuum the record table until it has no blocks:
 
    ```sql
-   SET pg_repack_safe.allow_unprotected_drop = on;
+   VACUUM pg_repack_safe_rewrites;
+   SELECT pg_relation_size('pg_repack_safe_rewrites') = 0 AS empty;
+   ```
+
+   `VACUUM` keeps a deleted record for as long as a snapshot on the primary
+   could need it, so repeat this once older transactions have ended. On a
+   standby, replaying the removal ends the snapshots that needed the record
+   (see [Known gaps](#known-gaps)), so there is nothing to check there.
+4. Drop the extension in each database. With the record table empty this
+   needs no override:
+
+   ```sql
    DROP EXTENSION pg_repack_safe;
-   RESET pg_repack_safe.allow_unprotected_drop;
    ```
 
-4. Only then remove `pg_repack_safe` from `shared_preload_libraries` and
+5. Only then remove `pg_repack_safe` from `shared_preload_libraries` and
    restart, the primary first, then each standby once it has replayed the
    drops. While the extension exists, a server without the library
    preloaded runs `REPACK (CONCURRENTLY)` unrecorded and checks no reads.
+
+A superuser can skip steps 2 and 3 by setting
+`pg_repack_safe.allow_unprotected_drop`. A snapshot taken before a recorded
+`REPACK (CONCURRENTLY)`, on the primary or on any standby, then reads the
+repacked table as empty, so this is for a server where no such snapshot can
+exist.
 
 ## Documentation
 

@@ -47,16 +47,14 @@ CREATE TABLE de_t (id int PRIMARY KEY);
 INSERT INTO de_t SELECT generate_series(1, 3);
 REPACK (CONCURRENTLY) de_t;
 
--- Step 2: no snapshot here predates the record.
-SELECT pid, datname, backend_xmin
-FROM pg_stat_activity
-WHERE backend_xmin IS NOT NULL
-  AND age(backend_xmin) >= (SELECT age(max(rewrite_xid)::xid)
-                            FROM pg_repack_safe_rewrites);
+-- Step 2.
+SELECT pg_repack_safe_prune_records();
 
--- Step 3.
-SET pg_repack_safe.allow_unprotected_drop = on;
+-- Step 3: no snapshot here needs the record.
+VACUUM pg_repack_safe_rewrites;
+SELECT pg_relation_size('pg_repack_safe_rewrites') = 0 AS empty;
+
+-- Step 4.
 DROP EXTENSION pg_repack_safe;
-RESET pg_repack_safe.allow_unprotected_drop;
 
 DROP TABLE de_t;

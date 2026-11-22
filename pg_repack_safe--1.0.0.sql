@@ -52,8 +52,11 @@ CREATE TRIGGER pg_repack_safe_rewrites_changed
 ALTER TABLE pg_repack_safe_rewrites
     ENABLE ALWAYS TRIGGER pg_repack_safe_rewrites_changed;
 
--- Records are never updated or deleted: an older snapshot, on this server
--- or on a standby, may rely on any of them. TRUNCATE is refused here too
+-- Records are never updated, and deleted only by the library, from C,
+-- without firing triggers (each REPACK (CONCURRENTLY), and
+-- pg_repack_safe_prune_records below): an older snapshot, on this server or
+-- on a standby, may rely on any of them, and the library deletes only in a
+-- way that keeps the record until no such snapshot is left. TRUNCATE is refused here too
 -- while the table holds records, because a trigger is the only check a
 -- replicated TRUNCATE passes. The library also refuses DROP and rewrites of
 -- the table, and changes to its triggers.
@@ -92,3 +95,14 @@ CREATE TRIGGER pg_repack_safe_rewrites_writer_only
 
 ALTER TABLE pg_repack_safe_rewrites
     ENABLE ALWAYS TRIGGER pg_repack_safe_rewrites_writer_only;
+
+-- Each REPACK (CONCURRENTLY) deletes the records older than its own. This
+-- does the same on request, for a database that has stopped repacking and
+-- before removing the extension. A deleted record stays in the table, and
+-- goes on protecting the snapshots that need it, until VACUUM removes it.
+CREATE FUNCTION pg_repack_safe_prune_records()
+RETURNS bigint
+AS 'MODULE_PATHNAME'
+LANGUAGE C VOLATILE;
+
+REVOKE ALL ON FUNCTION pg_repack_safe_prune_records() FROM PUBLIC;

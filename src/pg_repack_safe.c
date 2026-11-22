@@ -102,6 +102,7 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(pg_repack_safe_records_changed);
 PG_FUNCTION_INFO_V1(pg_repack_safe_records_protected);
 PG_FUNCTION_INFO_V1(pg_repack_safe_records_writer_only);
+PG_FUNCTION_INFO_V1(pg_repack_safe_prune_records);
 
 #define EXTENSION_NAME "pg_repack_safe"
 #define RECORD_TABLE_NAME "pg_repack_safe_rewrites"
@@ -166,8 +167,9 @@ static Oid  rewriterRecordTable = InvalidOid;
  * True while the innermost utility statement is one whose rewrites keep
  * every row version a snapshot may need, with its original xmin and xmax:
  * VACUUM (FULL) and REPACK or CLUSTER without CONCURRENTLY (both parse to
- * RepackStmt; gram.y, RepackStmt). They may rewrite the record table. Never
- * true for an unsafe rewriter. processUtilityHook says which statements set
+ * RepackStmt; gram.y, RepackStmt). They may rewrite the record table while
+ * it holds no deleted record (protectRecordTableFromRewrite). Never true
+ * for an unsafe rewriter. processUtilityHook says which statements set
  * it.
  */
 static bool inMvccSafeRewriter = false;
@@ -1233,6 +1235,116 @@ insertRecord(Oid relid)
 }
 
 /**
+ * @brief Delete every committed record older than the current transaction
+ * @param rel The record table, locked by the caller with RowExclusiveLock
+ * @return Number of records deleted
+ *
+ * Deleting marks a row version; it removes nothing. The reader loads every
+ * row version (loadRecordCache scans with SnapshotAny), so a deleted record
+ * protects exactly as before until VACUUM or page pruning removes it.
+ *
+ * Invariant: a record this function deletes is not removed while a snapshot
+ * that does not see the record's rewrite is alive, on this server or on a
+ * standby. Call the record's transaction R, the current one D, and the
+ * snapshot S. The function deletes only where R precedes D, compared as
+ * full transaction IDs, and where the row was not inserted by D.
+ * - S does not see R, so S's xmin does not follow R (snapmgr.c,
+ *   XidInMVCCSnapshot), and R precedes D.
+ * - On this server a row deleted by D is removed only once D precedes the
+ *   oldest xmin of the database's backends (heapam_visibility.c,
+ *   HeapTupleSatisfiesVacuumHorizon; pruneheap.c applies the same test on
+ *   access), which S's backend holds at or below S's xmin.
+ * - On a standby the removal is replayed with a conflict horizon of at
+ *   least D, because the row's xmax is not its xmin (heapam.c,
+ *   HeapTupleHeaderAdvanceConflictHorizon), and replay first ends every
+ *   backend of the database whose xmin does not follow that horizon
+ *   (heapam_xlog.c, standby.c: ResolveRecoveryConflictWithSnapshot). A row
+ *   deleted by its inserter has no such horizon, which is why the row's
+ *   inserter is never the deleter (t/002_standby_record_removal.pl shows
+ *   both cases on a plain table).
+ *
+ * The rewrites that drop a deleted row version without a conflict horizon
+ * (VACUUM FULL, CLUSTER, REPACK) are refused while the table holds one
+ * (protectRecordTableFromRewrite).
+ *
+ * The scan uses a new snapshot, so every row it returns was inserted by a
+ * committed transaction and is not yet deleted by one. The delete does not
+ * wait: a row another transaction is deleting, or has deleted since the
+ * snapshot, is left to that transaction, and any result but success means
+ * the row is left alone. The delete is not decoded for logical replication:
+ * a subscriber's records are its own.
+ */
+static uint64
+deleteOlderRecords(Relation rel)
+{
+    FullTransactionId ownFxid = GetCurrentFullTransactionId();
+    TupleDesc   desc = RelationGetDescr(rel);
+    Snapshot    snapshot = RegisterSnapshot(GetLatestSnapshot());
+    TableScanDesc scan;
+    HeapTuple   tuple;
+    uint64      deleted = 0;
+
+    scan = table_beginscan(rel, snapshot, 0, NULL, SO_NONE);
+    while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+    {
+        FullTransactionId fxid;
+        bool        xidNull;
+        TM_FailureData tmfd;
+
+        CHECK_FOR_INTERRUPTS();
+
+        fxid = DatumGetFullTransactionId(heap_getattr(tuple, 2, desc,
+                                                      &xidNull));
+        if (xidNull || !FullTransactionIdPrecedes(fxid, ownFxid))
+            continue;
+        if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmin(tuple->t_data)))
+            continue;
+
+        if (heap_delete(rel, &tuple->t_self, GetCurrentCommandId(true),
+                        TABLE_DELETE_NO_LOGICAL, InvalidSnapshot,
+                        false, &tmfd) == TM_Ok)
+            deleted++;
+    }
+    table_endscan(scan);
+    UnregisterSnapshot(snapshot);
+
+    return deleted;
+}
+
+/**
+ * @brief Tell whether the record table holds a deleted row version
+ * @param rel The record table, locked by the caller
+ * @return True if any row version has a deleting transaction, committed or
+ *         not, or one that aborted and has not yet been marked so
+ *
+ * A row version whose deleter aborted counts until VACUUM or a visibility
+ * check marks it: the answer errs towards "holds one".
+ */
+static bool
+holdsDeletedRecord(Relation rel)
+{
+    TableScanDesc scan;
+    HeapTuple   tuple;
+    bool        found = false;
+
+    scan = table_beginscan(rel, SnapshotAny, 0, NULL, SO_NONE);
+    while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+    {
+        uint16      infomask = tuple->t_data->t_infomask;
+
+        if (!(infomask & HEAP_XMAX_INVALID) &&
+            !HEAP_XMAX_IS_LOCKED_ONLY(infomask))
+        {
+            found = true;
+            break;
+        }
+    }
+    table_endscan(scan);
+
+    return found;
+}
+
+/**
  * @brief Read a relation's storage as the current transaction left it
  * @param relid OID of the relation
  * @param toastRelid Output, unless NULL: reltoastrelid from the same
@@ -1338,6 +1450,10 @@ storageCreatedInTransaction(RelFileLocator locator)
  * relation was also written by this transaction. An old storage with zero
  * blocks never held a row, so every snapshot sees the table empty either
  * way and nothing is recorded.
+ *
+ * Having written its records, the rewrite deletes every older one
+ * (deleteOlderRecords), which is what keeps the record table from growing
+ * with every REPACK (CONCURRENTLY).
  */
 static void
 noteRelationAltered(Oid relid)
@@ -1408,11 +1524,22 @@ noteRelationAltered(Oid relid)
 
     if (inUnsafeRewriter() && oldBlocks > 0)
     {
+        Relation    recordRel;
+
         precheckOldSnapshots(relid, true);
         logUnsafeRewrite(relid);
         insertRecord(relid);
         if (OidIsValid(newToastRelid))
             insertRecord(newToastRelid);
+
+        /*
+         * Older records are deleted here and nowhere else in a rewrite, so
+         * that a transaction which deletes records has also written one and
+         * holds the lock insertRecord has just checked.
+         */
+        recordRel = table_open(rewriterRecordTable, NoLock);
+        (void) deleteOlderRecords(recordRel);
+        table_close(recordRel, NoLock);
     }
 }
 
@@ -1431,9 +1558,10 @@ noteRelationAltered(Oid relid)
  *        records
  * @param objectDescription The object being dropped, for the message
  *
- * Records are never deleted, and any row version in the table may be the
- * record an older snapshot needs, on this server or on a standby, so any
- * block counts as holding records. A superuser can override with
+ * Any row version in the table, deleted or not, may be the record an older
+ * snapshot needs, on this server or on a standby, so any block counts as
+ * holding records. VACUUM returns the table to zero blocks once every
+ * record is deleted and no snapshot needs one (deleteOlderRecords). A superuser can override with
  * pg_repack_safe.allow_unprotected_drop. TRUNCATE is refused by the same
  * rule in pg_repack_safe_records_protected.
  */
@@ -1462,7 +1590,7 @@ refuseUnprotectedDrop(const char *objectDescription)
              errmsg("cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records"),
              errdetail("The statement would drop %s. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.",
                        objectDescription),
-             errhint("First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, \"Removing the extension\"); then a superuser can set pg_repack_safe.allow_unprotected_drop.")));
+             errhint("Delete the records with pg_repack_safe_prune_records() and run VACUUM on the record table until it is empty (see the README, \"Removing the extension\"). A superuser can set pg_repack_safe.allow_unprotected_drop instead.")));
 }
 
 /**
@@ -1565,18 +1693,33 @@ protectRecordsFromDrop(Oid classId, Oid objectId, int subId)
  *
  * A replacement of the table's storage, detected as in noteRelationAltered,
  * is allowed only under VACUUM (FULL), CLUSTER or REPACK without CONCURRENTLY
- * (inMvccSafeRewriter): they copy every row version a snapshot may need with
- * its original xmin and xmax, and the records' values unchanged. Refused:
- * REPACK (CONCURRENTLY), which re-inserts every row under its own XID, and
- * ALTER TABLE, whose rewrites (such as SET UNLOGGED) also do that; ALTER
- * TABLE ... SET TABLESPACE is refused with them. A rewriting ALTER COLUMN
- * does not get this far (protectRecordTableColumns).
+ * (inMvccSafeRewriter), and only while the old storage holds no deleted row
+ * version.
+ *
+ * Those three copy every row version a snapshot on this server may need,
+ * with its original xmin and xmax and the records' values unchanged, and
+ * drop the versions no snapshot here needs (heapam_handler.c,
+ * heapam_relation_copy_for_cluster). The swap is replayed on a standby
+ * without a conflict horizon, so a deleted record dropped this way would be
+ * gone for a standby snapshot that still needs it. Plain VACUUM removes the
+ * same versions with the horizon (deleteOlderRecords), after which nothing
+ * the rewrite drops was ever a record a snapshot needs. The rewriter holds
+ * AccessExclusiveLock on the table, so no record is deleted between the
+ * check and the swap.
+ *
+ * Refused whatever the table holds: REPACK (CONCURRENTLY), which re-inserts
+ * every row under its own XID, and ALTER TABLE, whose rewrites (such as SET
+ * UNLOGGED) also do that; ALTER TABLE ... SET TABLESPACE is refused with
+ * them. A rewriting ALTER COLUMN does not get this far
+ * (protectRecordTableColumns).
  */
 static void
 protectRecordTableFromRewrite(Oid relid)
 {
     HeapTuple   oldTuple;
     RelFileNumber oldNode;
+    Relation    rel;
+    bool        deleted;
 
     oldTuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
     if (!HeapTupleIsValid(oldTuple))
@@ -1586,16 +1729,38 @@ protectRecordTableFromRewrite(Oid relid)
 
     /*
      * When no self-visible row is found, the comparison fails and the
-     * command is refused: the verdict is unknown. noteRelationAltered
-     * returns in that case instead, and says why it can.
+     * command is treated as a rewrite: the verdict is unknown.
+     * noteRelationAltered returns in that case instead, and says why it can.
      */
-    if (!inMvccSafeRewriter &&
-        selfVisibleRelfilenode(relid, NULL) != oldNode)
+    if (selfVisibleRelfilenode(relid, NULL) == oldNode)
+        return;
+
+    if (!inMvccSafeRewriter)
         ereport(ERROR,
                 (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                  errmsg("cannot rewrite the pg_repack_safe record table with this command"),
                  errdetail("Only VACUUM FULL, CLUSTER and REPACK without CONCURRENTLY keep every record unchanged."),
                  errhint("Use VACUUM FULL or REPACK.")));
+
+    /*
+     * The relation cache still describes the old storage, as in
+     * noteRelationAltered; the caller holds the lock it rewrote under.
+     */
+    rel = relation_open(relid, NoLock);
+    if (rel->rd_locator.relNumber != oldNode)
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("pg_repack_safe cannot determine the previous storage of its record table"),
+                 errdetail("The relation cache no longer describes the storage being replaced.")));
+    deleted = holdsDeletedRecord(rel);
+    relation_close(rel, NoLock);
+
+    if (deleted)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("cannot rewrite the pg_repack_safe record table while it holds deleted records"),
+                 errdetail("The rewrite would drop a deleted record without ending the snapshots on standbys that still need it."),
+                 errhint("Run VACUUM on the record table first, then repeat the command. VACUUM keeps a deleted record for as long as a snapshot on this server needs it.")));
 }
 
 /**
@@ -1799,8 +1964,8 @@ protectRecordTableColumns(ObjectAccessType access, Oid classId, Oid objectId,
  * does (pg_repack_safe_records_writer_only), and the hint gives the same
  * recovery.
  *
- * TODO(dsharpe 2026-11-21): allow deleting records that no snapshot can
- * need, by the rule in doc/research/fix-design.md (step 6).
+ * The library's own deletions (deleteOlderRecords) call the heap directly
+ * and fire no trigger.
  */
 Datum
 pg_repack_safe_records_protected(PG_FUNCTION_ARGS)
@@ -1825,7 +1990,7 @@ pg_repack_safe_records_protected(PG_FUNCTION_ARGS)
                  IsLogicalWorker()
                  ? errhint("On the publisher, exclude the record table from the publication (ALTER PUBLICATION ... SET ALL TABLES EXCEPT (TABLE %s)); then, on the subscriber, run ALTER SUBSCRIPTION ... REFRESH PUBLICATION. See \"Logical Replication\" in doc/installation.md.",
                            RECORD_TABLE_NAME)
-                 : errhint("First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, \"Removing the extension\"); then a superuser can set pg_repack_safe.allow_unprotected_drop.")));
+                 : errhint("Delete the records with pg_repack_safe_prune_records() and run VACUUM on the record table until it is empty (see the README, \"Removing the extension\"). A superuser can set pg_repack_safe.allow_unprotected_drop instead.")));
     }
 
     ereport(ERROR,
@@ -1895,6 +2060,50 @@ pg_repack_safe_records_writer_only(PG_FUNCTION_ARGS)
                      RECORD_TABLE_NAME)));
 
     PG_RETURN_NULL();
+}
+
+/**
+ * @brief SQL function: delete every record older than the calling
+ *        transaction
+ * @return Number of records deleted
+ *
+ * What each REPACK (CONCURRENTLY) does after writing its own record, for a
+ * database that has stopped repacking: the last records would otherwise
+ * never be deleted, and DROP EXTENSION needs the record table empty. The
+ * rule and its argument are deleteOlderRecords'. The deleted records stay
+ * in the table until VACUUM removes them.
+ */
+Datum
+pg_repack_safe_prune_records(PG_FUNCTION_ARGS)
+{
+    Oid         tableOid;
+    Relation    rel;
+    uint64      deleted;
+
+    for (;;)
+    {
+        CHECK_FOR_INTERRUPTS();
+
+        tableOid = lookupRecordTable(RECORD_TABLE_FOR_WRITER);
+        if (!OidIsValid(tableOid))
+            ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                     errmsg("pg_repack_safe cannot find its record table")));
+
+        /* As lockRecordTableForWriter: accept the OID only once locked. */
+        LockRelationOid(tableOid, RowExclusiveLock);
+        if (recordTableOidKnown && recordTableOid == tableOid &&
+            (rel = try_table_open(tableOid, NoLock)) != NULL)
+            break;
+        UnlockRelationOid(tableOid, RowExclusiveLock);
+        recordTableOidKnown = false;
+    }
+
+    checkRecordTableDefinition(rel, RECORD_TABLE_FOR_WRITER);
+    deleted = deleteOlderRecords(rel);
+    table_close(rel, NoLock);
+
+    PG_RETURN_INT64((int64) deleted);
 }
 
 /**

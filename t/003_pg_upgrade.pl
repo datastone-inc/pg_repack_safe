@@ -7,7 +7,8 @@
 # record table in a later statement, with queries in between. The reader
 # check must not refuse those queries, or pg_upgrade cannot restore a
 # database that has the extension. After the upgrade the check must be in
-# force again, and the old cluster's records must have come along unchanged.
+# force again, and the old cluster's records, deleted ones included, must
+# have come along unchanged.
 
 use strict;
 use warnings FATAL => 'all';
@@ -27,7 +28,16 @@ $old->safe_psql('postgres', q{
     CREATE TABLE customers (id int PRIMARY KEY, name text NOT NULL);
     INSERT INTO customers SELECT g, 'customer ' || g FROM generate_series(1, 5) g;
     REPACK (CONCURRENTLY) customers USING INDEX customers_pkey;
+    REPACK (CONCURRENTLY) customers USING INDEX customers_pkey;
+    CREATE EXTENSION pageinspect;
 });
+# Row versions physically in the record table: the second REPACK deleted the
+# first one's record, and nothing has vacuumed it.
+my $versionsQuery = q{
+    SELECT count(*) FROM heap_page_items(
+        get_raw_page('pg_repack_safe_rewrites', 0))
+    WHERE lp_len > 0};
+my $oldVersions = $old->safe_psql('postgres', $versionsQuery);
 my $recordsQuery = q{
     SELECT relid::regclass, rewrite_xid FROM pg_repack_safe_rewrites
     ORDER BY relid::regclass::text};
@@ -81,6 +91,20 @@ is($new->safe_psql('postgres', $recordsQuery),
     $oldRecords, 'records are carried over unchanged');
 is($new->safe_psql('postgres', 'SELECT count(*) FROM customers'),
     '5', 'user data survives the upgrade, and a recorded table can be read');
+
+# The deleted record comes along too: pg_upgrade copies the table's file.
+# Nothing in the new cluster needs it, and VACUUM removes it there.
+my $liveRecords = $new->safe_psql('postgres',
+    'SELECT count(*) FROM pg_repack_safe_rewrites');
+cmp_ok($oldVersions, '>', $liveRecords,
+    'the old cluster held a deleted record');
+is($new->safe_psql('postgres', $versionsQuery),
+    $oldVersions, 'deleted records are carried over as well');
+$new->safe_psql('postgres', 'VACUUM pg_repack_safe_rewrites');
+is($new->safe_psql('postgres', $versionsQuery),
+    $liveRecords, 'VACUUM removes the deleted record in the new cluster');
+is($new->safe_psql('postgres', 'SELECT pg_repack_safe_prune_records()'),
+    $liveRecords, 'the remaining records can be deleted in the new cluster');
 
 # Outside binary-upgrade mode the refusal is in force.
 $new->safe_psql('postgres',
