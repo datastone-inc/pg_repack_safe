@@ -90,6 +90,28 @@ ERROR:  cannot truncate the pg_repack_safe record table while it holds records
 DETAIL:  A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
 HINT:  Delete the records with pg_repack_safe_prune_records() and run VACUUM on the record table until it is empty (see the README, "Removing the extension"). A superuser can set pg_repack_safe.allow_unprotected_drop instead.
 ALTER TABLE pg_repack_safe_rewrites DROP CONSTRAINT pr_fk;
+-- Constraints on the record table are not refused; the writer does not
+-- enforce them. One could reach the records all the same: a foreign key
+-- with ON DELETE CASCADE turns a DELETE on the referenced table into a
+-- DELETE of records, which the record table's trigger refuses like any
+-- other, and a CHECK constraint changes nothing.
+ALTER TABLE pg_repack_safe_rewrites
+    ADD CONSTRAINT pr_fk FOREIGN KEY (relid) REFERENCES pr_referenced
+    ON DELETE CASCADE;
+DELETE FROM pr_referenced;
+ERROR:  cannot update or delete pg_repack_safe records
+DETAIL:  A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on a standby, relies on the record.
+CONTEXT:  SQL statement "DELETE FROM ONLY "public"."pg_repack_safe_rewrites" WHERE $1 OPERATOR(pg_catalog.=) "relid""
+SELECT count(*) AS referenced FROM pr_referenced;
+ referenced 
+------------
+          1
+(1 row)
+
+ALTER TABLE pg_repack_safe_rewrites DROP CONSTRAINT pr_fk;
+ALTER TABLE pg_repack_safe_rewrites
+    ADD CONSTRAINT pr_check CHECK (relid <> 0);
+ALTER TABLE pg_repack_safe_rewrites DROP CONSTRAINT pr_check;
 DROP TABLE pr_referenced;
 SELECT count(*) AS records FROM pg_repack_safe_rewrites;
  records 

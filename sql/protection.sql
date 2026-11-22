@@ -70,6 +70,20 @@ ALTER TABLE pg_repack_safe_rewrites
     ADD CONSTRAINT pr_fk FOREIGN KEY (relid) REFERENCES pr_referenced;
 TRUNCATE pr_referenced CASCADE;
 ALTER TABLE pg_repack_safe_rewrites DROP CONSTRAINT pr_fk;
+-- Constraints on the record table are not refused; the writer does not
+-- enforce them. One could reach the records all the same: a foreign key
+-- with ON DELETE CASCADE turns a DELETE on the referenced table into a
+-- DELETE of records, which the record table's trigger refuses like any
+-- other, and a CHECK constraint changes nothing.
+ALTER TABLE pg_repack_safe_rewrites
+    ADD CONSTRAINT pr_fk FOREIGN KEY (relid) REFERENCES pr_referenced
+    ON DELETE CASCADE;
+DELETE FROM pr_referenced;
+SELECT count(*) AS referenced FROM pr_referenced;
+ALTER TABLE pg_repack_safe_rewrites DROP CONSTRAINT pr_fk;
+ALTER TABLE pg_repack_safe_rewrites
+    ADD CONSTRAINT pr_check CHECK (relid <> 0);
+ALTER TABLE pg_repack_safe_rewrites DROP CONSTRAINT pr_check;
 DROP TABLE pr_referenced;
 SELECT count(*) AS records FROM pg_repack_safe_rewrites;
 DROP EXTENSION pg_repack_safe;
