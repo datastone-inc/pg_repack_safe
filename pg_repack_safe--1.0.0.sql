@@ -35,7 +35,8 @@ REVOKE ALL ON TABLE pg_repack_safe_rewrites FROM PUBLIC;
 -- Readers keep a per-backend copy of the records. The writer invalidates it
 -- itself; this trigger does the same for changes made by hand, and fires
 -- whatever session_replication_role is. The two triggers below refuse every
--- INSERT, UPDATE and DELETE that would change a row, which leaves TRUNCATE.
+-- INSERT, UPDATE and DELETE that would change a row, which leaves a TRUNCATE
+-- that is allowed.
 CREATE FUNCTION pg_repack_safe_records_changed()
 RETURNS trigger
 AS 'MODULE_PATHNAME'
@@ -52,8 +53,10 @@ ALTER TABLE pg_repack_safe_rewrites
     ENABLE ALWAYS TRIGGER pg_repack_safe_rewrites_changed;
 
 -- Records are never updated or deleted: an older snapshot, on this server
--- or on a standby, may rely on any of them. The library also refuses DROP,
--- TRUNCATE and rewrites of the table, and changes to its triggers.
+-- or on a standby, may rely on any of them. TRUNCATE is refused here too
+-- while the table holds records, because a trigger is the only check a
+-- replicated TRUNCATE passes. The library also refuses DROP and rewrites of
+-- the table, and changes to its triggers.
 CREATE FUNCTION pg_repack_safe_records_protected()
 RETURNS trigger
 AS 'MODULE_PATHNAME'
@@ -62,7 +65,7 @@ LANGUAGE C;
 REVOKE ALL ON FUNCTION pg_repack_safe_records_protected() FROM PUBLIC;
 
 CREATE TRIGGER pg_repack_safe_rewrites_protected
-    BEFORE UPDATE OR DELETE ON pg_repack_safe_rewrites
+    BEFORE UPDATE OR DELETE OR TRUNCATE ON pg_repack_safe_rewrites
     FOR EACH STATEMENT
     EXECUTE FUNCTION pg_repack_safe_records_protected();
 

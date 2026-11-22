@@ -62,6 +62,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stops the subscription instead, until the table is excluded from the
   publication and the subscription is refreshed; `doc/installation.md`,
   "Logical Replication", gives the steps.
+- `TRUNCATE` of a record table that holds records is refused by its
+  `BEFORE` trigger, which every route to a truncation passes, where it was
+  refused by a check only the `TRUNCATE` command passes. A `TRUNCATE` of a
+  publisher's record table, replicated through a publication that includes
+  the table, emptied a subscriber's record table, and the subscriber's old
+  snapshots then read its repacked tables as empty. It now stops the
+  subscription like a replicated record.
 - Custom WAL resource manager (ID 149, reserved on the PostgreSQL wiki): each
   `REPACK (CONCURRENTLY)` logs a record before its commit, so a standby
   without the library stops replay instead of serving the repacked table to

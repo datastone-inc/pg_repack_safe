@@ -78,6 +78,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
 #include "nodes/value.h"
+#include "replication/logicalworker.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "storage/lock.h"
@@ -507,7 +508,8 @@ checkRecordTableDefinition(Relation rel, RecordTableUse use)
                            TRIGGER_TYPE_DELETE | TRIGGER_TYPE_TRUNCATE) ||
          !hasRecordTrigger(rel, PROTECTED_TRIGGER_FUNCTION,
                            TRIGGER_TYPE_STATEMENT, TRIGGER_TYPE_BEFORE,
-                           TRIGGER_TYPE_UPDATE | TRIGGER_TYPE_DELETE) ||
+                           TRIGGER_TYPE_UPDATE | TRIGGER_TYPE_DELETE |
+                           TRIGGER_TYPE_TRUNCATE) ||
          !hasRecordTrigger(rel, WRITER_ONLY_TRIGGER_FUNCTION,
                            TRIGGER_TYPE_ROW, TRIGGER_TYPE_BEFORE,
                            TRIGGER_TYPE_INSERT)))
@@ -1424,28 +1426,19 @@ noteRelationAltered(Oid relid)
  * ----------------------------------------------------------------
  */
 
-/* How a statement would remove the record table's protection. */
-typedef enum RemovalKind
-{
-    REMOVAL_DROP,
-    REMOVAL_TRUNCATE
-} RemovalKind;
-
 /**
- * @brief Refuse to remove protection while the record table holds records
- * @param kind Whether the object is being dropped or truncated
- * @param objectDescription The object being removed, for the message
+ * @brief Refuse a DROP that removes protection while the record table holds
+ *        records
+ * @param objectDescription The object being dropped, for the message
  *
  * Records are never deleted, and any row version in the table may be the
  * record an older snapshot needs, on this server or on a standby, so any
  * block counts as holding records. A superuser can override with
- * pg_repack_safe.allow_unprotected_drop.
- *
- * Each message is a complete literal, with nothing but the object's
- * description substituted, so that each can be translated as a whole.
+ * pg_repack_safe.allow_unprotected_drop. TRUNCATE is refused by the same
+ * rule in pg_repack_safe_records_protected.
  */
 static void
-refuseUnprotectedRemoval(RemovalKind kind, const char *objectDescription)
+refuseUnprotectedDrop(const char *objectDescription)
 {
     Oid         tableOid;
     Relation    rel;
@@ -1464,20 +1457,12 @@ refuseUnprotectedRemoval(RemovalKind kind, const char *objectDescription)
     if (blocks == 0)
         return;
 
-    if (kind == REMOVAL_TRUNCATE)
-        ereport(ERROR,
-                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                 errmsg("cannot truncate the pg_repack_safe record table while it holds records"),
-                 errdetail("The statement would truncate %s. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.",
-                           objectDescription),
-                 errhint("First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, \"Removing the extension\"); then a superuser can set pg_repack_safe.allow_unprotected_drop.")));
-    else
-        ereport(ERROR,
-                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                 errmsg("cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records"),
-                 errdetail("The statement would drop %s. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.",
-                           objectDescription),
-                 errhint("First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, \"Removing the extension\"); then a superuser can set pg_repack_safe.allow_unprotected_drop.")));
+    ereport(ERROR,
+            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+             errmsg("cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records"),
+             errdetail("The statement would drop %s. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.",
+                       objectDescription),
+             errhint("First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, \"Removing the extension\"); then a superuser can set pg_repack_safe.allow_unprotected_drop.")));
 }
 
 /**
@@ -1570,8 +1555,7 @@ protectRecordsFromDrop(Oid classId, Oid objectId, int subId)
         ObjectAddress address;
 
         ObjectAddressSubSet(address, classId, objectId, subId);
-        refuseUnprotectedRemoval(REMOVAL_DROP,
-                                 getObjectDescription(&address, false));
+        refuseUnprotectedDrop(getObjectDescription(&address, false));
     }
 }
 
@@ -1791,12 +1775,29 @@ protectRecordTableColumns(ObjectAccessType access, Oid classId, Oid objectId,
  */
 
 /**
- * @brief Trigger function: refuse UPDATE and DELETE of records
- * @return Does not return
+ * @brief Trigger function: refuse UPDATE and DELETE of records, and
+ *        TRUNCATE of a record table that holds any
+ * @return NULL for a TRUNCATE that is allowed; otherwise does not return
  *
- * BEFORE UPDATE OR DELETE, statement level, enabled ALWAYS, so it covers
- * every route to such a change (MERGE, a writable CTE, a function) and
- * session_replication_role.
+ * BEFORE UPDATE OR DELETE OR TRUNCATE, statement level, enabled ALWAYS, so
+ * it covers every route to such a change (MERGE, a writable CTE, a
+ * function) and session_replication_role.
+ *
+ * Invariant for TRUNCATE: while the record table has this trigger, firing
+ * ALWAYS, no caller of ExecuteTruncateGuts empties a record table that has
+ * any block, unless pg_repack_safe.allow_unprotected_drop is set. Any block
+ * counts, as for DROP (refuseUnprotectedDrop). ExecuteTruncateGuts fires
+ * the BEFORE TRUNCATE triggers of every table it is to truncate, those
+ * reached by CASCADE included, before it truncates any
+ * (tablecmds.c:2163-2181), and it has two callers: the TRUNCATE command
+ * (tablecmds.c:2003) and the logical replication apply worker
+ * (worker.c:3803). The apply worker does not pass truncate_check_rel, the
+ * one place that reports OAT_TRUNCATE (tablecmds.c:2460), which is why this
+ * is a trigger and not a case of the object access hook.
+ *
+ * In an apply worker the refusal stops the subscription as a refused record
+ * does (pg_repack_safe_records_writer_only), and the hint gives the same
+ * recovery.
  *
  * TODO(dsharpe 2026-11-21): allow deleting records that no snapshot can
  * need, by the rule in doc/research/fix-design.md (step 6).
@@ -1804,10 +1805,28 @@ protectRecordTableColumns(ObjectAccessType access, Oid classId, Oid objectId,
 Datum
 pg_repack_safe_records_protected(PG_FUNCTION_ARGS)
 {
+    TriggerData *trigdata = (TriggerData *) fcinfo->context;
+
     if (!CALLED_AS_TRIGGER(fcinfo))
         ereport(ERROR,
                 (errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
                  errmsg("pg_repack_safe_records_protected() must be called as a trigger")));
+
+    if (TRIGGER_FIRED_BY_TRUNCATE(trigdata->tg_event))
+    {
+        if (allowUnprotectedDrop ||
+            RelationGetNumberOfBlocks(trigdata->tg_relation) == 0)
+            return PointerGetDatum(NULL);
+
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("cannot truncate the pg_repack_safe record table while it holds records"),
+                 errdetail("A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty."),
+                 IsLogicalWorker()
+                 ? errhint("On the publisher, exclude the record table from the publication (ALTER PUBLICATION ... SET ALL TABLES EXCEPT (TABLE %s)); then, on the subscriber, run ALTER SUBSCRIPTION ... REFRESH PUBLICATION. See \"Logical Replication\" in doc/installation.md.",
+                           RECORD_TABLE_NAME)
+                 : errhint("First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, \"Removing the extension\"); then a superuser can set pg_repack_safe.allow_unprotected_drop.")));
+    }
 
     ereport(ERROR,
             (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -1946,11 +1965,6 @@ objectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
         case OAT_DROP:
             protectRecordTableColumns(access, classId, objectId, subId);
             protectRecordsFromDrop(classId, objectId, subId);
-            break;
-        case OAT_TRUNCATE:
-            if (isRecordTable(objectId))
-                refuseUnprotectedRemoval(REMOVAL_TRUNCATE,
-                                         "table " RECORD_TABLE_NAME);
             break;
         case OAT_POST_ALTER:
             if (classId == RelationRelationId && subId == 0)

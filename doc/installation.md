@@ -144,6 +144,10 @@ refusal is an error, not a silent skip, and it stops the subscription
 - If the publisher's record table already holds records when the
   subscription is created, the initial copy of that one table fails in the
   same way and is retried; the other tables are copied and replicate.
+- A `TRUNCATE` of the publisher's record table is refused as well while the
+  subscriber's record table holds records of its own, which its old
+  snapshots rely on: `ERROR: cannot truncate the pg_repack_safe record table
+  while it holds records`. The subscription stops in the same way.
 
 To recover, in this order:
 
@@ -159,7 +163,7 @@ To recover, in this order:
 
    The apply worker then passes over the record table's changes, the
    refused ones included, and continues with the other tables. Nothing is
-   skipped but the records. A failing initial copy ends as well.
+   skipped but the publisher's records and its `TRUNCATE` of them. A failing initial copy ends as well.
 
 A subscriber without the extension has no such table. Its apply worker
 stops with PostgreSQL's own error, `logical replication target relation

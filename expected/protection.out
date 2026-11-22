@@ -9,7 +9,8 @@
  * Records are the only protection old snapshots have, and they are never
  * deleted. While the record table holds any row version:
  * - DROP of the record table or the extension, by any route, and TRUNCATE
- *   of the record table are refused unless a superuser sets
+ *   of the record table, by any route (session_replication_role, CASCADE),
+ *   are refused unless a superuser sets
  *   pg_repack_safe.allow_unprotected_drop;
  * - rewrites of the record table other than VACUUM FULL, CLUSTER and REPACK
  *   without CONCURRENTLY, which keep every record unchanged, are refused:
@@ -55,12 +56,39 @@ ERROR:  cannot drop table pg_repack_safe_rewrites because extension pg_repack_sa
 HINT:  You can drop extension pg_repack_safe instead.
 TRUNCATE pg_repack_safe_rewrites;
 ERROR:  cannot truncate the pg_repack_safe record table while it holds records
-DETAIL:  The statement would truncate table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+DETAIL:  A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
 HINT:  First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, "Removing the extension"); then a superuser can set pg_repack_safe.allow_unprotected_drop.
 TRUNCATE pr_t, pg_repack_safe_rewrites;
 ERROR:  cannot truncate the pg_repack_safe record table while it holds records
-DETAIL:  The statement would truncate table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+DETAIL:  A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
 HINT:  First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, "Removing the extension"); then a superuser can set pg_repack_safe.allow_unprotected_drop.
+-- TRUNCATE is refused by the BEFORE TRUNCATE trigger, the one check that
+-- every caller of the truncation passes: whatever session_replication_role
+-- is (the trigger fires ALWAYS), and when the record table is only reached
+-- by CASCADE, through a foreign key from it to the truncated table.
+SET session_replication_role = replica;
+TRUNCATE pg_repack_safe_rewrites;
+ERROR:  cannot truncate the pg_repack_safe record table while it holds records
+DETAIL:  A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+HINT:  First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, "Removing the extension"); then a superuser can set pg_repack_safe.allow_unprotected_drop.
+RESET session_replication_role;
+CREATE TABLE pr_referenced (relid oid PRIMARY KEY);
+INSERT INTO pr_referenced SELECT relid FROM pg_repack_safe_rewrites;
+ALTER TABLE pg_repack_safe_rewrites
+    ADD CONSTRAINT pr_fk FOREIGN KEY (relid) REFERENCES pr_referenced;
+TRUNCATE pr_referenced CASCADE;
+NOTICE:  truncate cascades to table "pg_repack_safe_rewrites"
+ERROR:  cannot truncate the pg_repack_safe record table while it holds records
+DETAIL:  A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+HINT:  First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, "Removing the extension"); then a superuser can set pg_repack_safe.allow_unprotected_drop.
+ALTER TABLE pg_repack_safe_rewrites DROP CONSTRAINT pr_fk;
+DROP TABLE pr_referenced;
+SELECT count(*) AS records FROM pg_repack_safe_rewrites;
+ records 
+---------
+       1
+(1 row)
+
 DROP EXTENSION pg_repack_safe;
 ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
 DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.

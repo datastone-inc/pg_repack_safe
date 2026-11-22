@@ -29,7 +29,10 @@
 #   REPACK (CONCURRENTLY) on the publisher no longer stops it;
 # - the initial table synchronization refuses a publisher's existing
 #   records in the same way, for that one table, and the same recovery ends
-#   its retries.
+#   its retries;
+# - a publisher's TRUNCATE of its record table does not empty a
+#   subscriber's: the BEFORE TRUNCATE trigger refuses it in the apply
+#   worker, and the same recovery releases the subscription.
 
 use strict;
 use warnings FATAL => 'all';
@@ -246,6 +249,75 @@ is($subscriber->safe_psql('sync', q{
         SELECT count(*) FROM pg_subscription_rel
         WHERE srrelid = 'pg_repack_safe_rewrites'::regclass}),
     '0', 'after the refresh, the record table is not in the subscription');
+
+# A replicated TRUNCATE. The apply worker truncates without the TRUNCATE
+# command's checks (worker.c:3803 calls ExecuteTruncateGuts directly), so
+# only the record table's BEFORE TRUNCATE trigger stands between a
+# publisher's TRUNCATE of its record table and a subscriber's records.
+# A third subscription, in another database of the subscriber, takes the
+# record table without the initial copy (copy_data = false), so that the
+# table is in the subscription although the publisher's holds records.
+$publisher->safe_psql('postgres',
+    'CREATE PUBLICATION pub_truncate FOR ALL TABLES');
+$subscriber->safe_psql('postgres', 'CREATE DATABASE truncated');
+$subscriber->safe_psql('truncated', q{
+    CREATE EXTENSION pg_repack_safe;
+    CREATE TABLE t (id int PRIMARY KEY);
+    CREATE TABLE other (id int PRIMARY KEY);
+    CREATE TABLE local (id int PRIMARY KEY);
+    INSERT INTO local SELECT generate_series(1, 3);
+});
+$subscriber->safe_psql('truncated', 'REPACK (CONCURRENTLY) local');
+is($subscriber->safe_psql('truncated',
+        'SELECT count(*) FROM pg_repack_safe_rewrites'),
+    '1', 'replicated TRUNCATE: the subscriber has a record of its own');
+$subscriber->safe_psql('truncated', qq{
+    CREATE SUBSCRIPTION sub_truncate CONNECTION '$connstr'
+        PUBLICATION pub_truncate WITH (copy_data = false)
+});
+$logOffset = -s $subscriber->logfile;
+$publisher->safe_psql('postgres', q{
+    SET pg_repack_safe.allow_unprotected_drop = on;
+    TRUNCATE pg_repack_safe_rewrites;
+});
+$publisher->safe_psql('postgres', 'INSERT INTO other VALUES (4)');
+
+my $truncateErrors = q{(SELECT apply_error_count
+                        FROM pg_stat_subscription_stats
+                        WHERE subname = 'sub_truncate')};
+$subscriber->poll_query_until('truncated', qq{
+    SELECT $truncateErrors >= 2
+        OR NOT EXISTS (SELECT 1 FROM pg_repack_safe_rewrites)
+}) or die 'the subscriber neither refused nor applied the TRUNCATE';
+is($subscriber->safe_psql('truncated',
+        'SELECT count(*) FROM pg_repack_safe_rewrites'),
+    '1', "replicated TRUNCATE: the subscriber's record survives");
+$log = slurp_file($subscriber->logfile, $logOffset);
+like($log,
+    qr/ERROR:  cannot truncate the pg_repack_safe record table while it holds records/,
+    'replicated TRUNCATE: the apply worker reports the refusal');
+like($log,
+    qr/HINT:  On the publisher, exclude the record table from the publication/,
+    'replicated TRUNCATE: the hint gives the recovery for a subscription');
+like($log,
+    qr/CONTEXT:  processing remote data for replication origin "[^"]+" during message type "TRUNCATE"/,
+    'replicated TRUNCATE: the report names the TRUNCATE message');
+is($subscriber->safe_psql('truncated', 'SELECT count(*) FROM other'),
+    '0', 'replicated TRUNCATE: the subscription applies nothing after it');
+
+# The same two recovery steps release the subscription.
+$publisher->safe_psql('postgres', q{
+    ALTER PUBLICATION pub_truncate
+        SET ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites)
+});
+$subscriber->safe_psql('truncated',
+    'ALTER SUBSCRIPTION sub_truncate REFRESH PUBLICATION WITH (copy_data = false)');
+$publisher->wait_for_catchup('sub_truncate');
+is($subscriber->safe_psql('truncated', 'SELECT count(*) FROM other'),
+    '1', 'replicated TRUNCATE: after the refresh, the later change arrives');
+is($subscriber->safe_psql('truncated',
+        'SELECT count(*) FROM pg_repack_safe_rewrites'),
+    '1', 'replicated TRUNCATE: after the refresh, the record is still there');
 
 $subscriber->stop;
 $publisher->stop;

@@ -10,7 +10,8 @@
  * Records are the only protection old snapshots have, and they are never
  * deleted. While the record table holds any row version:
  * - DROP of the record table or the extension, by any route, and TRUNCATE
- *   of the record table are refused unless a superuser sets
+ *   of the record table, by any route (session_replication_role, CASCADE),
+ *   are refused unless a superuser sets
  *   pg_repack_safe.allow_unprotected_drop;
  * - rewrites of the record table other than VACUUM FULL, CLUSTER and REPACK
  *   without CONCURRENTLY, which keep every record unchanged, are refused:
@@ -53,6 +54,21 @@ SELECT count(*) AS records FROM pg_repack_safe_rewrites;
 DROP TABLE pg_repack_safe_rewrites;
 TRUNCATE pg_repack_safe_rewrites;
 TRUNCATE pr_t, pg_repack_safe_rewrites;
+-- TRUNCATE is refused by the BEFORE TRUNCATE trigger, the one check that
+-- every caller of the truncation passes: whatever session_replication_role
+-- is (the trigger fires ALWAYS), and when the record table is only reached
+-- by CASCADE, through a foreign key from it to the truncated table.
+SET session_replication_role = replica;
+TRUNCATE pg_repack_safe_rewrites;
+RESET session_replication_role;
+CREATE TABLE pr_referenced (relid oid PRIMARY KEY);
+INSERT INTO pr_referenced SELECT relid FROM pg_repack_safe_rewrites;
+ALTER TABLE pg_repack_safe_rewrites
+    ADD CONSTRAINT pr_fk FOREIGN KEY (relid) REFERENCES pr_referenced;
+TRUNCATE pr_referenced CASCADE;
+ALTER TABLE pg_repack_safe_rewrites DROP CONSTRAINT pr_fk;
+DROP TABLE pr_referenced;
+SELECT count(*) AS records FROM pg_repack_safe_rewrites;
 DROP EXTENSION pg_repack_safe;
 DROP EXTENSION pg_repack_safe CASCADE;
 -- Detached from the extension, then dropped, or the extension dropped:
