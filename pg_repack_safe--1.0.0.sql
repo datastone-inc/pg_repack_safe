@@ -34,7 +34,8 @@ REVOKE ALL ON TABLE pg_repack_safe_rewrites FROM PUBLIC;
 
 -- Readers keep a per-backend copy of the records. The writer invalidates it
 -- itself; this trigger does the same for changes made by hand, and fires
--- whatever session_replication_role is.
+-- whatever session_replication_role is. The two triggers below refuse every
+-- INSERT, UPDATE and DELETE that would change a row, which leaves TRUNCATE.
 CREATE FUNCTION pg_repack_safe_records_changed()
 RETURNS trigger
 AS 'MODULE_PATHNAME'
@@ -52,7 +53,7 @@ ALTER TABLE pg_repack_safe_rewrites
 
 -- Records are never updated or deleted: an older snapshot, on this server
 -- or on a standby, may rely on any of them. The library also refuses DROP,
--- TRUNCATE and rewrites of the table, and changes to these triggers.
+-- TRUNCATE and rewrites of the table, and changes to its triggers.
 CREATE FUNCTION pg_repack_safe_records_protected()
 RETURNS trigger
 AS 'MODULE_PATHNAME'
@@ -67,3 +68,24 @@ CREATE TRIGGER pg_repack_safe_rewrites_protected
 
 ALTER TABLE pg_repack_safe_rewrites
     ENABLE ALWAYS TRIGGER pg_repack_safe_rewrites_protected;
+
+-- Only REPACK (CONCURRENTLY) writes records, from C, without firing
+-- triggers. Every other insert is refused: SQL, COPY, and above all logical
+-- replication, which would otherwise apply another cluster's records here
+-- when a publication FOR ALL TABLES includes this table. Row level, because
+-- the apply worker fires no statement-level triggers; ALWAYS, because it
+-- runs with session_replication_role = replica.
+CREATE FUNCTION pg_repack_safe_records_writer_only()
+RETURNS trigger
+AS 'MODULE_PATHNAME'
+LANGUAGE C;
+
+REVOKE ALL ON FUNCTION pg_repack_safe_records_writer_only() FROM PUBLIC;
+
+CREATE TRIGGER pg_repack_safe_rewrites_writer_only
+    BEFORE INSERT ON pg_repack_safe_rewrites
+    FOR EACH ROW
+    EXECUTE FUNCTION pg_repack_safe_records_writer_only();
+
+ALTER TABLE pg_repack_safe_rewrites
+    ENABLE ALWAYS TRIGGER pg_repack_safe_rewrites_writer_only;

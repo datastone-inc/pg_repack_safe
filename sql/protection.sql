@@ -16,12 +16,18 @@
  *   without CONCURRENTLY, which keep every record unchanged, are refused:
  *   REPACK (CONCURRENTLY) and rewriting ALTER TABLE;
  * - UPDATE and DELETE of records are refused, by any route (MERGE, a
- *   writable CTE); INSERT is allowed.
+ *   writable CTE).
  * Changing when the record table's triggers fire is refused always, and
  * dropping them follows the DROP rule: they carry the cache invalidation and
- * the UPDATE/DELETE refusal. A record table without both triggers, firing
- * ALWAYS, refuses every read and REPACK (CONCURRENTLY).
+ * the UPDATE/DELETE and INSERT refusals. A record table without all three
+ * triggers, firing ALWAYS, refuses every read and REPACK (CONCURRENTLY).
  * Refused always, with or without records and whatever the override says:
+ * - INSERT into the record table, by any route (INSERT ... SELECT, COPY
+ *   FROM, MERGE, a writable CTE) and whatever session_replication_role is:
+ *   only REPACK (CONCURRENTLY) writes records. A row from anywhere else,
+ *   such as another cluster's record arriving by logical replication
+ *   (t/016_publication.pl), would refuse reads of whichever table has its
+ *   OID here;
  * - creating an index on the record table, in any spelling (CREATE INDEX,
  *   a PRIMARY KEY or UNIQUE constraint): the writer inserts records without
  *   maintaining indexes, so an index would miss every later record;
@@ -74,7 +80,7 @@ ALTER TABLE pg_repack_safe_rewrites
 -- the hook would refuse its swap like the ALTER TABLE rewrite above.
 REPACK (CONCURRENTLY) pg_repack_safe_rewrites;
 
--- UPDATE and DELETE: refused by any route. INSERT is allowed.
+-- UPDATE and DELETE: refused by any route.
 UPDATE pg_repack_safe_rewrites SET relid = 0;
 DELETE FROM pg_repack_safe_rewrites;
 WITH d AS (DELETE FROM pg_repack_safe_rewrites RETURNING 1)
@@ -82,8 +88,36 @@ SELECT count(*) FROM d;
 MERGE INTO pg_repack_safe_rewrites r
 USING (VALUES (1)) v(x) ON true
 WHEN MATCHED THEN DELETE;
-INSERT INTO pg_repack_safe_rewrites VALUES (0, '1');
 SELECT count(*) AS records FROM pg_repack_safe_rewrites;
+
+-- INSERT: refused by any route, and whatever session_replication_role is
+-- (a logical replication apply worker runs with replica).
+INSERT INTO pg_repack_safe_rewrites VALUES (0, '1');
+INSERT INTO pg_repack_safe_rewrites SELECT 0, '1'::xid8;
+COPY pg_repack_safe_rewrites FROM STDIN;
+0	1
+\.
+MERGE INTO pg_repack_safe_rewrites r
+USING (VALUES (1)) v(x) ON false
+WHEN NOT MATCHED THEN INSERT VALUES (0, '1');
+INSERT INTO pg_repack_safe_rewrites VALUES (0, '1') ON CONFLICT DO NOTHING;
+WITH i AS (INSERT INTO pg_repack_safe_rewrites VALUES (0, '1') RETURNING 1)
+SELECT count(*) FROM i;
+SET session_replication_role = replica;
+INSERT INTO pg_repack_safe_rewrites VALUES (0, '1');
+INSERT INTO pg_repack_safe_rewrites SELECT 0, '1'::xid8;
+COPY pg_repack_safe_rewrites FROM STDIN;
+0	1
+\.
+MERGE INTO pg_repack_safe_rewrites r
+USING (VALUES (1)) v(x) ON false
+WHEN NOT MATCHED THEN INSERT VALUES (0, '1');
+RESET session_replication_role;
+SELECT count(*) AS records FROM pg_repack_safe_rewrites;
+-- REPACK (CONCURRENTLY) still records.
+REPACK (CONCURRENTLY) pr_t;
+SELECT count(*) AS records, count(DISTINCT relid) AS tables
+FROM pg_repack_safe_rewrites;
 
 -- The triggers: disabling, changing when they fire, or dropping them is
 -- refused, whatever the spelling.
@@ -95,8 +129,15 @@ ALTER TABLE pg_repack_safe_rewrites
     ENABLE TRIGGER pg_repack_safe_rewrites_protected;
 ALTER TABLE pg_repack_safe_rewrites
     ENABLE REPLICA TRIGGER pg_repack_safe_rewrites_changed;
+ALTER TABLE pg_repack_safe_rewrites
+    DISABLE TRIGGER pg_repack_safe_rewrites_writer_only;
+ALTER TABLE pg_repack_safe_rewrites
+    ENABLE TRIGGER pg_repack_safe_rewrites_writer_only;
+ALTER TABLE pg_repack_safe_rewrites
+    ENABLE REPLICA TRIGGER pg_repack_safe_rewrites_writer_only;
 DROP TRIGGER pg_repack_safe_rewrites_changed ON pg_repack_safe_rewrites;
 DROP TRIGGER pg_repack_safe_rewrites_protected ON pg_repack_safe_rewrites;
+DROP TRIGGER pg_repack_safe_rewrites_writer_only ON pg_repack_safe_rewrites;
 -- Dropping a trigger function with CASCADE would drop its trigger: refused.
 -- (PostgreSQL itself refuses to drop a member of the extension, so the
 -- function is detached first.)
@@ -104,6 +145,9 @@ ALTER EXTENSION pg_repack_safe DROP FUNCTION pg_repack_safe_records_protected();
 DROP FUNCTION pg_repack_safe_records_protected();
 DROP FUNCTION pg_repack_safe_records_protected() CASCADE;
 ALTER EXTENSION pg_repack_safe ADD FUNCTION pg_repack_safe_records_protected();
+ALTER EXTENSION pg_repack_safe DROP FUNCTION pg_repack_safe_records_writer_only();
+DROP FUNCTION pg_repack_safe_records_writer_only() CASCADE;
+ALTER EXTENSION pg_repack_safe ADD FUNCTION pg_repack_safe_records_writer_only();
 -- Dropping the extension's schema with CASCADE would drop the extension:
 -- refused.
 DROP SCHEMA public CASCADE;
@@ -177,7 +221,8 @@ RESET ROLE;
 DROP ROLE pr_user;
 
 -- With the override, DROP and TRUNCATE are allowed; ALTER TABLE rewrites,
--- UPDATE, DELETE, the triggers, indexes and column changes stay refused.
+-- UPDATE, DELETE, INSERT, the triggers, indexes and column changes stay
+-- refused.
 SET pg_repack_safe.allow_unprotected_drop = on;
 ALTER TABLE pg_repack_safe_rewrites SET UNLOGGED;
 ALTER TABLE pg_repack_safe_rewrites
@@ -193,9 +238,17 @@ SELECT count(*) AS indexes FROM pg_index
 WHERE indrelid = 'pg_repack_safe_rewrites'::regclass;
 SELECT count(*) AS passes FROM pr_t;
 DELETE FROM pg_repack_safe_rewrites;
+INSERT INTO pg_repack_safe_rewrites VALUES (0, '1');
+COPY pg_repack_safe_rewrites FROM STDIN;
+0	1
+\.
 ALTER TABLE pg_repack_safe_rewrites DISABLE TRIGGER ALL;
 TRUNCATE pg_repack_safe_rewrites;
 INSERT INTO pg_repack_safe_rewrites VALUES (0, '1');
+SELECT count(*) AS records FROM pg_repack_safe_rewrites;
+-- The extension is dropped while its table holds a record again.
+REPACK (CONCURRENTLY) pr_t;
+SELECT count(*) AS records FROM pg_repack_safe_rewrites;
 DROP EXTENSION pg_repack_safe;
 RESET pg_repack_safe.allow_unprotected_drop;
 
@@ -204,6 +257,13 @@ RESET pg_repack_safe.allow_unprotected_drop;
 -- the same state a backend without the library could leave behind.
 CREATE EXTENSION pg_repack_safe;
 DROP TRIGGER pg_repack_safe_rewrites_protected ON pg_repack_safe_rewrites;
+SELECT count(*) AS refused FROM pr_t;
+REPACK (CONCURRENTLY) pr_t;
+DROP EXTENSION pg_repack_safe;
+SELECT count(*) AS passes FROM pr_t;
+-- The same without the trigger that refuses INSERT.
+CREATE EXTENSION pg_repack_safe;
+DROP TRIGGER pg_repack_safe_rewrites_writer_only ON pg_repack_safe_rewrites;
 SELECT count(*) AS refused FROM pr_t;
 REPACK (CONCURRENTLY) pr_t;
 DROP EXTENSION pg_repack_safe;

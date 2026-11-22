@@ -49,6 +49,24 @@ binaries.
   an old snapshot, running a statement and collecting its errors, waiting
   for a queued lock request) are in `t/RepackSafeTest.pm`.
 
+`make installcheck` first installs two test-only modules from
+`test/modules/` into the PostgreSQL library directory; `make install` does
+not install them.
+
+- `oat_observer`: a second `object_access_hook`, loaded next to the library
+  by `t/015_oat_hook_chain.pl`.
+- `test_record`: the C function `test_insert_record(record_table regclass,
+  relid oid, rewrite_xid xid8)`, which each test that uses it creates with
+  `CREATE FUNCTION ... AS 'test_record' LANGUAGE C`. The extension refuses
+  every insert into its record table except the one `REPACK (CONCURRENTLY)`
+  makes, and that one always records its own transaction. Tests of the
+  reader check need records with other transaction IDs (aborted, from
+  another epoch, not yet assigned), and this function writes them the way
+  the extension's writer does: `simple_heap_insert`, which fires no trigger,
+  and a relcache invalidation of the record table. Used by
+  `sql/reader_check.sql`, `specs/reader_cache.spec` and
+  `t/006_record_xid8.pl`.
+
 The `REGRESS` and `ISOLATION` instances get the settings in
 `test/temp_instance.conf`: the library in `shared_preload_libraries`, which
 the reader guard needs and without which `REPACK (CONCURRENTLY)` is refused,

@@ -38,9 +38,11 @@
  *
  * - a custom WAL resource manager, whose record at the swap of an unsafe
  *   rewrite stops replay on a standby that does not have this library;
- * - the record table's two trigger functions:
- *   pg_repack_safe_records_changed invalidates readers' record caches, and
- *   pg_repack_safe_records_protected refuses UPDATE and DELETE of records.
+ * - the record table's three trigger functions:
+ *   pg_repack_safe_records_changed invalidates readers' record caches,
+ *   pg_repack_safe_records_protected refuses UPDATE and DELETE of records,
+ *   and pg_repack_safe_records_writer_only refuses every INSERT, so that
+ *   only the writer in this file, which fires no trigger, adds records.
  */
 
 #include "postgres.h"
@@ -98,11 +100,13 @@ PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(pg_repack_safe_records_changed);
 PG_FUNCTION_INFO_V1(pg_repack_safe_records_protected);
+PG_FUNCTION_INFO_V1(pg_repack_safe_records_writer_only);
 
 #define EXTENSION_NAME "pg_repack_safe"
 #define RECORD_TABLE_NAME "pg_repack_safe_rewrites"
 #define CHANGED_TRIGGER_FUNCTION "pg_repack_safe_records_changed"
 #define PROTECTED_TRIGGER_FUNCTION "pg_repack_safe_records_protected"
+#define WRITER_ONLY_TRIGGER_FUNCTION "pg_repack_safe_records_writer_only"
 
 /*
  * Custom WAL resource manager. The ID is the one reserved for pg_repack_safe
@@ -298,7 +302,7 @@ isRecordTable(Oid relid)
  * @brief Tell whether a function is one of the record table's trigger
  *        functions
  * @param funcOid Function OID
- * @param name The trigger function's name, or NULL for either of them
+ * @param name The trigger function's name, or NULL for any of them
  * @return True if it has that name and lives in the extension's schema
  */
 static bool
@@ -312,7 +316,8 @@ isRecordTriggerFunction(Oid funcOid, const char *name)
     if (name != NULL
         ? strcmp(funcName, name) != 0
         : (strcmp(funcName, CHANGED_TRIGGER_FUNCTION) != 0 &&
-           strcmp(funcName, PROTECTED_TRIGGER_FUNCTION) != 0))
+           strcmp(funcName, PROTECTED_TRIGGER_FUNCTION) != 0 &&
+           strcmp(funcName, WRITER_ONLY_TRIGGER_FUNCTION) != 0))
         return false;
     schemaOid = extensionSchema();
     return OidIsValid(schemaOid) && get_func_namespace(funcOid) == schemaOid;
@@ -441,18 +446,19 @@ lookupRecordTable(RecordTableUse use)
  * @brief Tell whether the record table has one of its triggers, firing ALWAYS
  * @param rel The record table
  * @param functionName The trigger function the trigger must call
+ * @param level TRIGGER_TYPE_ROW or TRIGGER_TYPE_STATEMENT
  * @param timing TRIGGER_TYPE_BEFORE or TRIGGER_TYPE_AFTER
  * @param events TRIGGER_TYPE_* event bits, all of which the trigger must
  *        fire on
- * @return True if a statement-level trigger with those properties exists
+ * @return True if a trigger with those properties exists
  *
  * TRIGGER_TYPE_MATCHES compares the level, the timing and the given event
  * bits exactly (pg_trigger.h), so a trigger firing on only some of the
  * events does not match; one firing on more does.
  */
 static bool
-hasRecordTrigger(Relation rel, const char *functionName, int16 timing,
-                 int16 events)
+hasRecordTrigger(Relation rel, const char *functionName, int16 level,
+                 int16 timing, int16 events)
 {
     TriggerDesc *trigdesc = rel->trigdesc;
 
@@ -463,8 +469,7 @@ hasRecordTrigger(Relation rel, const char *functionName, int16 timing,
         Trigger    *trigger = &trigdesc->triggers[i];
 
         if (trigger->tgenabled == TRIGGER_FIRES_ALWAYS &&
-            TRIGGER_TYPE_MATCHES(trigger->tgtype, TRIGGER_TYPE_STATEMENT,
-                                 timing, events) &&
+            TRIGGER_TYPE_MATCHES(trigger->tgtype, level, timing, events) &&
             isRecordTriggerFunction(trigger->tgfoid, functionName))
             return true;
     }
@@ -496,16 +501,20 @@ checkRecordTableDefinition(Relation rel, RecordTableUse use)
      * the table but not yet its triggers.
      */
     if (!exemptInBinaryUpgrade(use) &&
-        (!hasRecordTrigger(rel, CHANGED_TRIGGER_FUNCTION, TRIGGER_TYPE_AFTER,
+        (!hasRecordTrigger(rel, CHANGED_TRIGGER_FUNCTION,
+                           TRIGGER_TYPE_STATEMENT, TRIGGER_TYPE_AFTER,
                            TRIGGER_TYPE_INSERT | TRIGGER_TYPE_UPDATE |
                            TRIGGER_TYPE_DELETE | TRIGGER_TYPE_TRUNCATE) ||
          !hasRecordTrigger(rel, PROTECTED_TRIGGER_FUNCTION,
-                           TRIGGER_TYPE_BEFORE,
-                           TRIGGER_TYPE_UPDATE | TRIGGER_TYPE_DELETE)))
+                           TRIGGER_TYPE_STATEMENT, TRIGGER_TYPE_BEFORE,
+                           TRIGGER_TYPE_UPDATE | TRIGGER_TYPE_DELETE) ||
+         !hasRecordTrigger(rel, WRITER_ONLY_TRIGGER_FUNCTION,
+                           TRIGGER_TYPE_ROW, TRIGGER_TYPE_BEFORE,
+                           TRIGGER_TYPE_INSERT)))
         ereport(ERROR,
                 (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                  errmsg("pg_repack_safe cannot use its record table"),
-                 errdetail("The table \"%s\" does not have both of its triggers, enabled ALWAYS.",
+                 errdetail("The table \"%s\" does not have all three of its triggers, enabled ALWAYS.",
                            RECORD_TABLE_NAME),
                  errhint("Drop and re-create the extension.")));
 
@@ -1410,7 +1419,8 @@ noteRelationAltered(Oid relid)
  *
  * Refusals of the statements that would remove records or the triggers
  * that guard them, give the table an index its writer does not maintain, or
- * change its columns.
+ * change its columns. The refusals of UPDATE, DELETE and INSERT are the
+ * table's trigger functions, further down.
  * ----------------------------------------------------------------
  */
 
@@ -1475,7 +1485,7 @@ refuseUnprotectedRemoval(RemovalKind kind, const char *objectDescription)
  * @param tgrelid The trigger's table
  * @param tgfoid The trigger's function
  * @return True if the table is the record table and the function is one of
- *         its two trigger functions
+ *         its trigger functions
  *
  * The trigger's name is not part of its identity, so renaming one changes
  * nothing.
@@ -1634,7 +1644,7 @@ protectRecordTrigger(Oid triggerOid)
             (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
              errmsg("cannot change when %s fires",
                     getObjectDescription(&address, false)),
-             errdetail("The record table's triggers keep readers' caches current and its records unchanged, and must fire ALWAYS.")));
+             errdetail("The record table's triggers keep readers' caches current and refuse every change to the records but the extension's own, and must fire ALWAYS.")));
 }
 
 /**
@@ -1808,12 +1818,76 @@ pg_repack_safe_records_protected(PG_FUNCTION_ARGS)
 }
 
 /**
+ * @brief Trigger function: refuse every INSERT into the record table
+ * @return Does not return
+ *
+ * Invariant: while the record table has this trigger, firing ALWAYS, no
+ * row enters it through the executor, COPY or logical replication, which
+ * leaves insertRecord, in this database, for the REPACK (CONCURRENTLY) the
+ * record describes. Without the trigger every read and REPACK
+ * (CONCURRENTLY) is refused (checkRecordTableDefinition). A record names a
+ * table by OID and a transaction by ID, which mean something only in the
+ * cluster that wrote them. A row from anywhere else names whichever table
+ * has that OID here, and the reader check then refuses reads of it, or
+ * every statement on it while the transaction ID is not yet assigned
+ * (rewriteHiddenFromSnapshot); nobody could delete the row either
+ * (pg_repack_safe_records_protected).
+ *
+ * BEFORE INSERT, row level, enabled ALWAYS. Every row passes
+ * ExecBRInsertTriggers first: INSERT and MERGE (nodeModifyTable.c:918-924,
+ * ExecInsert, which MERGE's insert action calls at :3929), COPY FROM
+ * (copyfrom.c:1331-1335), and logical replication,
+ * both the apply worker (execReplication.c:901-906,
+ * ExecSimpleRelationInsert) and the initial table synchronization, which
+ * is a CopyFrom (tablesync.c:1214-1217). Row level, because the apply
+ * worker fires no statement-level insert trigger (neither worker.c nor
+ * execReplication.c calls ExecBSInsertTriggers). ALWAYS, because the apply
+ * worker runs with session_replication_role = replica (worker.c:5860),
+ * under which a trigger enabled any other way does not fire
+ * (trigger.c:3504-3508, TriggerEnabled).
+ *
+ * insertRecord is not refused: simple_heap_insert fires no trigger. Nor are
+ * the rewrites that copy the table's rows as they are (VACUUM FULL, CLUSTER,
+ * REPACK), pg_upgrade, which copies files, or a standby's replay.
+ *
+ * The apply worker treats the error like any other: it reports it, exits,
+ * and applies the same transaction again when it restarts, so the
+ * subscription applies nothing more, for any table, until an operator
+ * excludes the record table from the publication and refreshes the
+ * subscription, after which the worker passes over the table's changes
+ * (worker.c:2683-2691; t/016_publication.pl, doc/installation.md "Logical
+ * Replication"). Raising is the developer's decision: returning NULL here
+ * would skip the row and keep the subscription running, but would discard
+ * rows without telling anyone.
+ */
+Datum
+pg_repack_safe_records_writer_only(PG_FUNCTION_ARGS)
+{
+    if (!CALLED_AS_TRIGGER(fcinfo))
+        ereport(ERROR,
+                (errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+                 errmsg("pg_repack_safe_records_writer_only() must be called as a trigger")));
+
+    ereport(ERROR,
+            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+             errmsg("cannot insert into the pg_repack_safe record table"),
+             errdetail("Only REPACK (CONCURRENTLY) writes records. A record names a table by OID and a transaction by ID, which mean something only in the database cluster that wrote it."),
+             errhint("If logical replication delivered this row: on the publisher, exclude the record table from the publication (ALTER PUBLICATION ... SET ALL TABLES EXCEPT (TABLE %s)); then, on the subscriber, run ALTER SUBSCRIPTION ... REFRESH PUBLICATION. See \"Logical Replication\" in doc/installation.md.",
+                     RECORD_TABLE_NAME)));
+
+    PG_RETURN_NULL();
+}
+
+/**
  * @brief Trigger function: invalidate readers' record caches
  * @return NULL (statement-level AFTER trigger)
  *
- * Fires after any INSERT, UPDATE, DELETE or TRUNCATE of the record table
- * (the trigger is ENABLE ALWAYS, so session_replication_role does not skip
- * it), so changes made by hand reach readers' caches like the writer's own.
+ * Fires after any INSERT, UPDATE, DELETE or TRUNCATE statement on the
+ * record table (the trigger is ENABLE ALWAYS, so session_replication_role
+ * does not skip it), so that a change made by hand reaches readers' caches
+ * like the writer's own. The other two trigger functions refuse every such
+ * statement that would change a row, which leaves TRUNCATE, allowed under
+ * pg_repack_safe.allow_unprotected_drop or while the table is empty.
  */
 Datum
 pg_repack_safe_records_changed(PG_FUNCTION_ARGS)

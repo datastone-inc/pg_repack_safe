@@ -10,6 +10,10 @@
 # not refuse it, although a 32-bit XID would name X. A record with X's full
 # XID must refuse it. A record with a transaction ID not yet assigned cannot
 # come from the writer and refuses every read of its table.
+#
+# No REPACK (CONCURRENTLY) writes such records, and nothing else may insert
+# into the record table, so the test writes them with test_insert_record
+# (test/modules/test_record), which inserts as the writer does.
 
 use strict;
 use warnings FATAL => 'all';
@@ -31,6 +35,11 @@ $node->safe_psql('postgres', q{
     CREATE TABLE t (id int PRIMARY KEY);
     INSERT INTO t SELECT generate_series(1, 5);
     CREATE TABLE other (id int);
+    CREATE FUNCTION test_insert_record(record_table regclass, relid oid,
+                                       rewrite_xid xid8)
+    RETURNS void
+    AS 'test_record'
+    LANGUAGE C STRICT;
 });
 
 # X is running when the reader takes its snapshot, and commits afterwards.
@@ -44,15 +53,15 @@ $holder->query_safe('COMMIT');
 $holder->quit;
 
 $node->safe_psql('postgres', qq{
-    INSERT INTO pg_repack_safe_rewrites
-        VALUES ('t'::regclass, '@{[ $x - 4294967296 ]}');
+    SELECT test_insert_record('pg_repack_safe_rewrites', 't'::regclass,
+                              '@{[ $x - 4294967296 ]}');
 });
 my ($out, $err) = runIn($reader, 'SELECT count(*) FROM t');
 is($err, '', "epoch-0 record with X's low 32 bits: no error");
 is($out, '5', "epoch-0 record with X's low 32 bits: every row");
 
 $node->safe_psql('postgres', qq{
-    INSERT INTO pg_repack_safe_rewrites VALUES ('t'::regclass, '$x');
+    SELECT test_insert_record('pg_repack_safe_rewrites', 't'::regclass, '$x');
 });
 ($out, $err) = runIn($reader, 'SELECT count(*) FROM t');
 like($err, qr/cannot read table "t" with this snapshot/,
@@ -65,8 +74,8 @@ $reader->quit;
 $node->safe_psql('postgres', q{
     SET pg_repack_safe.allow_unprotected_drop = on;
     TRUNCATE pg_repack_safe_rewrites;
-    INSERT INTO pg_repack_safe_rewrites
-        SELECT 't'::regclass, (pg_current_xact_id()::text::bigint + 1000000)::text::xid8;
+    SELECT test_insert_record('pg_repack_safe_rewrites', 't'::regclass,
+        (pg_current_xact_id()::text::bigint + 1000000)::text::xid8);
 });
 my ($ret, $stdout, $stderr) = $node->psql('postgres', 'SELECT count(*) FROM t');
 isnt($ret, 0, 'record with an unassigned XID refuses the read');

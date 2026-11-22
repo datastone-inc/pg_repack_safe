@@ -15,7 +15,20 @@
  * session: the isolation specs and t/005_reader_guard.pl cover that. A
  * query is also refused when the extension exists but its record table
  * cannot be found; in that state REPACK (CONCURRENTLY) is refused as well.
+ *
+ * Only REPACK (CONCURRENTLY) can insert into the record table
+ * (protection.sql), and it records its own transaction. The records with
+ * other transaction IDs that this test needs are written by
+ * test_insert_record, from the test-only module test/modules/test_record,
+ * the way the writer does: no trigger fires, and the record table's relcache
+ * entry is invalidated.
  */
+
+CREATE FUNCTION test_insert_record(record_table regclass, relid oid,
+                                   rewrite_xid xid8)
+RETURNS void
+AS 'test_record'
+LANGUAGE C STRICT;
 
 -- This test truncates, renames, moves and drops the record table to reach
 -- the reader's lookup failures. protection.sql tests the refusals of those
@@ -34,27 +47,30 @@ CREATE TABLE rc_t (id int PRIMARY KEY);
 
 -- Records this session's snapshots all see: queries pass.
 -- The bootstrap XID precedes every snapshot.
-INSERT INTO pg_repack_safe_rewrites VALUES ('pg_class'::regclass, '1');
+SELECT test_insert_record('pg_repack_safe_rewrites', 'pg_class'::regclass, '1');
 SELECT count(*) > 0 AS passes FROM pg_class;
 -- A transaction that committed before the snapshot was taken.
 BEGIN;
 SELECT pg_current_xact_id() AS committed_xid \gset
 COMMIT;
-INSERT INTO pg_repack_safe_rewrites VALUES ('rc_t'::regclass, :'committed_xid');
+SELECT test_insert_record('pg_repack_safe_rewrites', 'rc_t'::regclass,
+                          :'committed_xid');
 SELECT count(*) AS passes FROM rc_t;
 -- An aborted transaction.
 BEGIN;
 SELECT pg_current_xact_id() AS aborted_xid \gset
 ROLLBACK;
-INSERT INTO pg_repack_safe_rewrites VALUES ('rc_t'::regclass, :'aborted_xid');
+SELECT test_insert_record('pg_repack_safe_rewrites', 'rc_t'::regclass,
+                          :'aborted_xid');
 SELECT count(*) AS passes FROM rc_t;
 -- The query's own transaction, whose XID was assigned after its snapshot.
 BEGIN ISOLATION LEVEL REPEATABLE READ;
 SELECT count(*) AS passes FROM rc_t;
-INSERT INTO pg_repack_safe_rewrites
-    VALUES ('rc_t'::regclass, pg_current_xact_id());
+SELECT test_insert_record('pg_repack_safe_rewrites', 'rc_t'::regclass,
+                          pg_current_xact_id());
 SELECT count(*) AS passes FROM rc_t;
 COMMIT;
+SELECT count(*) AS records FROM pg_repack_safe_rewrites;
 
 -- TRUNCATE is a utility statement and gives the table zero blocks again.
 TRUNCATE pg_repack_safe_rewrites;
@@ -93,7 +109,8 @@ SELECT 1 AS passes;
 -- Record table detached, then the extension dropped: the table survives
 -- and is no longer a record table, so a row in it refuses nothing. Its
 -- triggers depend on the extension's trigger functions, so the drop needs
--- CASCADE and removes them.
+-- CASCADE and removes them, and an INSERT into the table is then an INSERT
+-- into any table.
 CREATE EXTENSION pg_repack_safe;
 SELECT 1 AS passes;
 ALTER EXTENSION pg_repack_safe DROP TABLE pg_repack_safe_rewrites;
@@ -104,5 +121,6 @@ DROP TABLE pg_repack_safe_rewrites;
 
 DROP SCHEMA rc_other;
 DROP TABLE rc_t;
+DROP FUNCTION test_insert_record(regclass, oid, xid8);
 
 RESET pg_repack_safe.allow_unprotected_drop;

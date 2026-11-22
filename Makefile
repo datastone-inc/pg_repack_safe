@@ -38,9 +38,15 @@ PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
-# The TAP tests load a test-only module (test/modules/oat_observer) next to
-# this one; install it for them. make install does not install it.
+# The tests use test-only modules; install them for the tests. make install
+# does not install them.
+# - test/modules/oat_observer: a second object_access_hook, loaded next to
+#   this library by t/015_oat_hook_chain.pl.
+# - test/modules/test_record: writes a record with a chosen table and
+#   transaction ID, for the regress, isolation and TAP cases that need a
+#   record no REPACK (CONCURRENTLY) produces.
 installcheck: install-test-modules
 install-test-modules:
 	$(MAKE) -C test/modules/oat_observer PG_CONFIG=$(PG_CONFIG) install
+	$(MAKE) -C test/modules/test_record PG_CONFIG=$(PG_CONFIG) install
 .PHONY: install-test-modules

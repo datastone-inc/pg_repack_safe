@@ -15,12 +15,18 @@
  *   without CONCURRENTLY, which keep every record unchanged, are refused:
  *   REPACK (CONCURRENTLY) and rewriting ALTER TABLE;
  * - UPDATE and DELETE of records are refused, by any route (MERGE, a
- *   writable CTE); INSERT is allowed.
+ *   writable CTE).
  * Changing when the record table's triggers fire is refused always, and
  * dropping them follows the DROP rule: they carry the cache invalidation and
- * the UPDATE/DELETE refusal. A record table without both triggers, firing
- * ALWAYS, refuses every read and REPACK (CONCURRENTLY).
+ * the UPDATE/DELETE and INSERT refusals. A record table without all three
+ * triggers, firing ALWAYS, refuses every read and REPACK (CONCURRENTLY).
  * Refused always, with or without records and whatever the override says:
+ * - INSERT into the record table, by any route (INSERT ... SELECT, COPY
+ *   FROM, MERGE, a writable CTE) and whatever session_replication_role is:
+ *   only REPACK (CONCURRENTLY) writes records. A row from anywhere else,
+ *   such as another cluster's record arriving by logical replication
+ *   (t/016_publication.pl), would refuse reads of whichever table has its
+ *   OID here;
  * - creating an index on the record table, in any spelling (CREATE INDEX,
  *   a PRIMARY KEY or UNIQUE constraint): the writer inserts records without
  *   maintaining indexes, so an index would miss every later record;
@@ -57,25 +63,26 @@ DETAIL:  The statement would truncate table pg_repack_safe_rewrites. A snapshot 
 HINT:  First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, "Removing the extension"); then a superuser can set pg_repack_safe.allow_unprotected_drop.
 DROP EXTENSION pg_repack_safe;
 ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
-DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
 HINT:  First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, "Removing the extension"); then a superuser can set pg_repack_safe.allow_unprotected_drop.
 DROP EXTENSION pg_repack_safe CASCADE;
 ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
-DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
 HINT:  First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, "Removing the extension"); then a superuser can set pg_repack_safe.allow_unprotected_drop.
 -- Detached from the extension, then dropped, or the extension dropped:
 -- refused.
 ALTER EXTENSION pg_repack_safe DROP TABLE pg_repack_safe_rewrites;
 DROP TABLE pg_repack_safe_rewrites;
 ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
-DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
 HINT:  First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, "Removing the extension"); then a superuser can set pg_repack_safe.allow_unprotected_drop.
 DROP EXTENSION pg_repack_safe CASCADE;
-NOTICE:  drop cascades to 2 other objects
+NOTICE:  drop cascades to 3 other objects
 DETAIL:  drop cascades to trigger pg_repack_safe_rewrites_changed on table pg_repack_safe_rewrites
 drop cascades to trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites
+drop cascades to trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites
 ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
-DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
 HINT:  First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, "Removing the extension"); then a superuser can set pg_repack_safe.allow_unprotected_drop.
 ALTER EXTENSION pg_repack_safe ADD TABLE pg_repack_safe_rewrites;
 -- MVCC-safe rewrites, also database-wide, are allowed and keep every
@@ -112,7 +119,7 @@ DETAIL:  The extension reads and writes records as the two columns it created. W
 REPACK (CONCURRENTLY) pg_repack_safe_rewrites;
 ERROR:  cannot execute REPACK (CONCURRENTLY) on relation "pg_repack_safe_rewrites"
 DETAIL:  Relation "pg_repack_safe_rewrites" has no identity index.
--- UPDATE and DELETE: refused by any route. INSERT is allowed.
+-- UPDATE and DELETE: refused by any route.
 UPDATE pg_repack_safe_rewrites SET relid = 0;
 ERROR:  cannot update or delete pg_repack_safe records
 DETAIL:  A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on a standby, relies on the record.
@@ -128,11 +135,76 @@ USING (VALUES (1)) v(x) ON true
 WHEN MATCHED THEN DELETE;
 ERROR:  cannot update or delete pg_repack_safe records
 DETAIL:  A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on a standby, relies on the record.
-INSERT INTO pg_repack_safe_rewrites VALUES (0, '1');
 SELECT count(*) AS records FROM pg_repack_safe_rewrites;
  records 
 ---------
-       2
+       1
+(1 row)
+
+-- INSERT: refused by any route, and whatever session_replication_role is
+-- (a logical replication apply worker runs with replica).
+INSERT INTO pg_repack_safe_rewrites VALUES (0, '1');
+ERROR:  cannot insert into the pg_repack_safe record table
+DETAIL:  Only REPACK (CONCURRENTLY) writes records. A record names a table by OID and a transaction by ID, which mean something only in the database cluster that wrote it.
+HINT:  If logical replication delivered this row: on the publisher, exclude the record table from the publication (ALTER PUBLICATION ... SET ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites)); then, on the subscriber, run ALTER SUBSCRIPTION ... REFRESH PUBLICATION. See "Logical Replication" in doc/installation.md.
+INSERT INTO pg_repack_safe_rewrites SELECT 0, '1'::xid8;
+ERROR:  cannot insert into the pg_repack_safe record table
+DETAIL:  Only REPACK (CONCURRENTLY) writes records. A record names a table by OID and a transaction by ID, which mean something only in the database cluster that wrote it.
+HINT:  If logical replication delivered this row: on the publisher, exclude the record table from the publication (ALTER PUBLICATION ... SET ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites)); then, on the subscriber, run ALTER SUBSCRIPTION ... REFRESH PUBLICATION. See "Logical Replication" in doc/installation.md.
+COPY pg_repack_safe_rewrites FROM STDIN;
+ERROR:  cannot insert into the pg_repack_safe record table
+DETAIL:  Only REPACK (CONCURRENTLY) writes records. A record names a table by OID and a transaction by ID, which mean something only in the database cluster that wrote it.
+HINT:  If logical replication delivered this row: on the publisher, exclude the record table from the publication (ALTER PUBLICATION ... SET ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites)); then, on the subscriber, run ALTER SUBSCRIPTION ... REFRESH PUBLICATION. See "Logical Replication" in doc/installation.md.
+CONTEXT:  COPY pg_repack_safe_rewrites, line 1: "0	1"
+MERGE INTO pg_repack_safe_rewrites r
+USING (VALUES (1)) v(x) ON false
+WHEN NOT MATCHED THEN INSERT VALUES (0, '1');
+ERROR:  cannot insert into the pg_repack_safe record table
+DETAIL:  Only REPACK (CONCURRENTLY) writes records. A record names a table by OID and a transaction by ID, which mean something only in the database cluster that wrote it.
+HINT:  If logical replication delivered this row: on the publisher, exclude the record table from the publication (ALTER PUBLICATION ... SET ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites)); then, on the subscriber, run ALTER SUBSCRIPTION ... REFRESH PUBLICATION. See "Logical Replication" in doc/installation.md.
+INSERT INTO pg_repack_safe_rewrites VALUES (0, '1') ON CONFLICT DO NOTHING;
+ERROR:  cannot insert into the pg_repack_safe record table
+DETAIL:  Only REPACK (CONCURRENTLY) writes records. A record names a table by OID and a transaction by ID, which mean something only in the database cluster that wrote it.
+HINT:  If logical replication delivered this row: on the publisher, exclude the record table from the publication (ALTER PUBLICATION ... SET ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites)); then, on the subscriber, run ALTER SUBSCRIPTION ... REFRESH PUBLICATION. See "Logical Replication" in doc/installation.md.
+WITH i AS (INSERT INTO pg_repack_safe_rewrites VALUES (0, '1') RETURNING 1)
+SELECT count(*) FROM i;
+ERROR:  cannot insert into the pg_repack_safe record table
+DETAIL:  Only REPACK (CONCURRENTLY) writes records. A record names a table by OID and a transaction by ID, which mean something only in the database cluster that wrote it.
+HINT:  If logical replication delivered this row: on the publisher, exclude the record table from the publication (ALTER PUBLICATION ... SET ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites)); then, on the subscriber, run ALTER SUBSCRIPTION ... REFRESH PUBLICATION. See "Logical Replication" in doc/installation.md.
+SET session_replication_role = replica;
+INSERT INTO pg_repack_safe_rewrites VALUES (0, '1');
+ERROR:  cannot insert into the pg_repack_safe record table
+DETAIL:  Only REPACK (CONCURRENTLY) writes records. A record names a table by OID and a transaction by ID, which mean something only in the database cluster that wrote it.
+HINT:  If logical replication delivered this row: on the publisher, exclude the record table from the publication (ALTER PUBLICATION ... SET ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites)); then, on the subscriber, run ALTER SUBSCRIPTION ... REFRESH PUBLICATION. See "Logical Replication" in doc/installation.md.
+INSERT INTO pg_repack_safe_rewrites SELECT 0, '1'::xid8;
+ERROR:  cannot insert into the pg_repack_safe record table
+DETAIL:  Only REPACK (CONCURRENTLY) writes records. A record names a table by OID and a transaction by ID, which mean something only in the database cluster that wrote it.
+HINT:  If logical replication delivered this row: on the publisher, exclude the record table from the publication (ALTER PUBLICATION ... SET ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites)); then, on the subscriber, run ALTER SUBSCRIPTION ... REFRESH PUBLICATION. See "Logical Replication" in doc/installation.md.
+COPY pg_repack_safe_rewrites FROM STDIN;
+ERROR:  cannot insert into the pg_repack_safe record table
+DETAIL:  Only REPACK (CONCURRENTLY) writes records. A record names a table by OID and a transaction by ID, which mean something only in the database cluster that wrote it.
+HINT:  If logical replication delivered this row: on the publisher, exclude the record table from the publication (ALTER PUBLICATION ... SET ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites)); then, on the subscriber, run ALTER SUBSCRIPTION ... REFRESH PUBLICATION. See "Logical Replication" in doc/installation.md.
+CONTEXT:  COPY pg_repack_safe_rewrites, line 1: "0	1"
+MERGE INTO pg_repack_safe_rewrites r
+USING (VALUES (1)) v(x) ON false
+WHEN NOT MATCHED THEN INSERT VALUES (0, '1');
+ERROR:  cannot insert into the pg_repack_safe record table
+DETAIL:  Only REPACK (CONCURRENTLY) writes records. A record names a table by OID and a transaction by ID, which mean something only in the database cluster that wrote it.
+HINT:  If logical replication delivered this row: on the publisher, exclude the record table from the publication (ALTER PUBLICATION ... SET ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites)); then, on the subscriber, run ALTER SUBSCRIPTION ... REFRESH PUBLICATION. See "Logical Replication" in doc/installation.md.
+RESET session_replication_role;
+SELECT count(*) AS records FROM pg_repack_safe_rewrites;
+ records 
+---------
+       1
+(1 row)
+
+-- REPACK (CONCURRENTLY) still records.
+REPACK (CONCURRENTLY) pr_t;
+SELECT count(*) AS records, count(DISTINCT relid) AS tables
+FROM pg_repack_safe_rewrites;
+ records | tables 
+---------+--------
+       2 |      1
 (1 row)
 
 -- The triggers: disabling, changing when they fire, or dropping them is
@@ -140,21 +212,33 @@ SELECT count(*) AS records FROM pg_repack_safe_rewrites;
 ALTER TABLE pg_repack_safe_rewrites
     DISABLE TRIGGER pg_repack_safe_rewrites_changed;
 ERROR:  cannot change when trigger pg_repack_safe_rewrites_changed on table pg_repack_safe_rewrites fires
-DETAIL:  The record table's triggers keep readers' caches current and its records unchanged, and must fire ALWAYS.
+DETAIL:  The record table's triggers keep readers' caches current and refuse every change to the records but the extension's own, and must fire ALWAYS.
 ALTER TABLE pg_repack_safe_rewrites DISABLE TRIGGER ALL;
 ERROR:  cannot change when trigger pg_repack_safe_rewrites_changed on table pg_repack_safe_rewrites fires
-DETAIL:  The record table's triggers keep readers' caches current and its records unchanged, and must fire ALWAYS.
+DETAIL:  The record table's triggers keep readers' caches current and refuse every change to the records but the extension's own, and must fire ALWAYS.
 ALTER TABLE pg_repack_safe_rewrites DISABLE TRIGGER USER;
 ERROR:  cannot change when trigger pg_repack_safe_rewrites_changed on table pg_repack_safe_rewrites fires
-DETAIL:  The record table's triggers keep readers' caches current and its records unchanged, and must fire ALWAYS.
+DETAIL:  The record table's triggers keep readers' caches current and refuse every change to the records but the extension's own, and must fire ALWAYS.
 ALTER TABLE pg_repack_safe_rewrites
     ENABLE TRIGGER pg_repack_safe_rewrites_protected;
 ERROR:  cannot change when trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites fires
-DETAIL:  The record table's triggers keep readers' caches current and its records unchanged, and must fire ALWAYS.
+DETAIL:  The record table's triggers keep readers' caches current and refuse every change to the records but the extension's own, and must fire ALWAYS.
 ALTER TABLE pg_repack_safe_rewrites
     ENABLE REPLICA TRIGGER pg_repack_safe_rewrites_changed;
 ERROR:  cannot change when trigger pg_repack_safe_rewrites_changed on table pg_repack_safe_rewrites fires
-DETAIL:  The record table's triggers keep readers' caches current and its records unchanged, and must fire ALWAYS.
+DETAIL:  The record table's triggers keep readers' caches current and refuse every change to the records but the extension's own, and must fire ALWAYS.
+ALTER TABLE pg_repack_safe_rewrites
+    DISABLE TRIGGER pg_repack_safe_rewrites_writer_only;
+ERROR:  cannot change when trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites fires
+DETAIL:  The record table's triggers keep readers' caches current and refuse every change to the records but the extension's own, and must fire ALWAYS.
+ALTER TABLE pg_repack_safe_rewrites
+    ENABLE TRIGGER pg_repack_safe_rewrites_writer_only;
+ERROR:  cannot change when trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites fires
+DETAIL:  The record table's triggers keep readers' caches current and refuse every change to the records but the extension's own, and must fire ALWAYS.
+ALTER TABLE pg_repack_safe_rewrites
+    ENABLE REPLICA TRIGGER pg_repack_safe_rewrites_writer_only;
+ERROR:  cannot change when trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites fires
+DETAIL:  The record table's triggers keep readers' caches current and refuse every change to the records but the extension's own, and must fire ALWAYS.
 DROP TRIGGER pg_repack_safe_rewrites_changed ON pg_repack_safe_rewrites;
 ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
 DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_changed on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
@@ -162,6 +246,10 @@ HINT:  First make sure no snapshot older than the newest record remains on this 
 DROP TRIGGER pg_repack_safe_rewrites_protected ON pg_repack_safe_rewrites;
 ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
 DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+HINT:  First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, "Removing the extension"); then a superuser can set pg_repack_safe.allow_unprotected_drop.
+DROP TRIGGER pg_repack_safe_rewrites_writer_only ON pg_repack_safe_rewrites;
+ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
+DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
 HINT:  First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, "Removing the extension"); then a superuser can set pg_repack_safe.allow_unprotected_drop.
 -- Dropping a trigger function with CASCADE would drop its trigger: refused.
 -- (PostgreSQL itself refuses to drop a member of the extension, so the
@@ -177,6 +265,13 @@ ERROR:  cannot drop the pg_repack_safe extension, its record table or its trigge
 DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
 HINT:  First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, "Removing the extension"); then a superuser can set pg_repack_safe.allow_unprotected_drop.
 ALTER EXTENSION pg_repack_safe ADD FUNCTION pg_repack_safe_records_protected();
+ALTER EXTENSION pg_repack_safe DROP FUNCTION pg_repack_safe_records_writer_only();
+DROP FUNCTION pg_repack_safe_records_writer_only() CASCADE;
+NOTICE:  drop cascades to trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites
+ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
+DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+HINT:  First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, "Removing the extension"); then a superuser can set pg_repack_safe.allow_unprotected_drop.
+ALTER EXTENSION pg_repack_safe ADD FUNCTION pg_repack_safe_records_writer_only();
 -- Dropping the extension's schema with CASCADE would drop the extension:
 -- refused.
 DROP SCHEMA public CASCADE;
@@ -184,13 +279,13 @@ NOTICE:  drop cascades to 2 other objects
 DETAIL:  drop cascades to extension pg_repack_safe
 drop cascades to table pr_t
 ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
-DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
 HINT:  First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, "Removing the extension"); then a superuser can set pg_repack_safe.allow_unprotected_drop.
 SELECT count(*) AS triggers FROM pg_trigger
 WHERE tgrelid = 'pg_repack_safe_rewrites'::regclass;
  triggers 
 ----------
-        2
+        3
 (1 row)
 
 -- Renaming a trigger changes nothing it does: allowed.
@@ -309,7 +404,7 @@ DETAIL:  A snapshot taken before a recorded REPACK (CONCURRENTLY), on this serve
 DROP SCHEMA pr_s CASCADE;
 NOTICE:  drop cascades to extension pg_repack_safe
 ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
-DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_protected on table pr_s.pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_writer_only on table pr_s.pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
 HINT:  First make sure no snapshot older than the newest record remains on this server or on any standby (see the README, "Removing the extension"); then a superuser can set pg_repack_safe.allow_unprotected_drop.
 SELECT count(*) AS passes FROM pr_t;
  passes 
@@ -333,7 +428,8 @@ ERROR:  permission denied to set parameter "pg_repack_safe.allow_unprotected_dro
 RESET ROLE;
 DROP ROLE pr_user;
 -- With the override, DROP and TRUNCATE are allowed; ALTER TABLE rewrites,
--- UPDATE, DELETE, the triggers, indexes and column changes stay refused.
+-- UPDATE, DELETE, INSERT, the triggers, indexes and column changes stay
+-- refused.
 SET pg_repack_safe.allow_unprotected_drop = on;
 ALTER TABLE pg_repack_safe_rewrites SET UNLOGGED;
 ERROR:  cannot rewrite the pg_repack_safe record table with this command
@@ -380,11 +476,37 @@ SELECT count(*) AS passes FROM pr_t;
 DELETE FROM pg_repack_safe_rewrites;
 ERROR:  cannot update or delete pg_repack_safe records
 DETAIL:  A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on a standby, relies on the record.
+INSERT INTO pg_repack_safe_rewrites VALUES (0, '1');
+ERROR:  cannot insert into the pg_repack_safe record table
+DETAIL:  Only REPACK (CONCURRENTLY) writes records. A record names a table by OID and a transaction by ID, which mean something only in the database cluster that wrote it.
+HINT:  If logical replication delivered this row: on the publisher, exclude the record table from the publication (ALTER PUBLICATION ... SET ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites)); then, on the subscriber, run ALTER SUBSCRIPTION ... REFRESH PUBLICATION. See "Logical Replication" in doc/installation.md.
+COPY pg_repack_safe_rewrites FROM STDIN;
+ERROR:  cannot insert into the pg_repack_safe record table
+DETAIL:  Only REPACK (CONCURRENTLY) writes records. A record names a table by OID and a transaction by ID, which mean something only in the database cluster that wrote it.
+HINT:  If logical replication delivered this row: on the publisher, exclude the record table from the publication (ALTER PUBLICATION ... SET ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites)); then, on the subscriber, run ALTER SUBSCRIPTION ... REFRESH PUBLICATION. See "Logical Replication" in doc/installation.md.
+CONTEXT:  COPY pg_repack_safe_rewrites, line 1: "0	1"
 ALTER TABLE pg_repack_safe_rewrites DISABLE TRIGGER ALL;
 ERROR:  cannot change when trigger pg_repack_safe_rewrites_changed on table pg_repack_safe_rewrites fires
-DETAIL:  The record table's triggers keep readers' caches current and its records unchanged, and must fire ALWAYS.
+DETAIL:  The record table's triggers keep readers' caches current and refuse every change to the records but the extension's own, and must fire ALWAYS.
 TRUNCATE pg_repack_safe_rewrites;
 INSERT INTO pg_repack_safe_rewrites VALUES (0, '1');
+ERROR:  cannot insert into the pg_repack_safe record table
+DETAIL:  Only REPACK (CONCURRENTLY) writes records. A record names a table by OID and a transaction by ID, which mean something only in the database cluster that wrote it.
+HINT:  If logical replication delivered this row: on the publisher, exclude the record table from the publication (ALTER PUBLICATION ... SET ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites)); then, on the subscriber, run ALTER SUBSCRIPTION ... REFRESH PUBLICATION. See "Logical Replication" in doc/installation.md.
+SELECT count(*) AS records FROM pg_repack_safe_rewrites;
+ records 
+---------
+       0
+(1 row)
+
+-- The extension is dropped while its table holds a record again.
+REPACK (CONCURRENTLY) pr_t;
+SELECT count(*) AS records FROM pg_repack_safe_rewrites;
+ records 
+---------
+       1
+(1 row)
+
 DROP EXTENSION pg_repack_safe;
 RESET pg_repack_safe.allow_unprotected_drop;
 -- Without records, dropping a trigger is allowed, and then every read and
@@ -394,11 +516,29 @@ CREATE EXTENSION pg_repack_safe;
 DROP TRIGGER pg_repack_safe_rewrites_protected ON pg_repack_safe_rewrites;
 SELECT count(*) AS refused FROM pr_t;
 ERROR:  pg_repack_safe cannot use its record table
-DETAIL:  The table "pg_repack_safe_rewrites" does not have both of its triggers, enabled ALWAYS.
+DETAIL:  The table "pg_repack_safe_rewrites" does not have all three of its triggers, enabled ALWAYS.
 HINT:  Drop and re-create the extension.
 REPACK (CONCURRENTLY) pr_t;
 ERROR:  pg_repack_safe cannot use its record table
-DETAIL:  The table "pg_repack_safe_rewrites" does not have both of its triggers, enabled ALWAYS.
+DETAIL:  The table "pg_repack_safe_rewrites" does not have all three of its triggers, enabled ALWAYS.
+HINT:  Drop and re-create the extension.
+DROP EXTENSION pg_repack_safe;
+SELECT count(*) AS passes FROM pr_t;
+ passes 
+--------
+      5
+(1 row)
+
+-- The same without the trigger that refuses INSERT.
+CREATE EXTENSION pg_repack_safe;
+DROP TRIGGER pg_repack_safe_rewrites_writer_only ON pg_repack_safe_rewrites;
+SELECT count(*) AS refused FROM pr_t;
+ERROR:  pg_repack_safe cannot use its record table
+DETAIL:  The table "pg_repack_safe_rewrites" does not have all three of its triggers, enabled ALWAYS.
+HINT:  Drop and re-create the extension.
+REPACK (CONCURRENTLY) pr_t;
+ERROR:  pg_repack_safe cannot use its record table
+DETAIL:  The table "pg_repack_safe_rewrites" does not have all three of its triggers, enabled ALWAYS.
 HINT:  Drop and re-create the extension.
 DROP EXTENSION pg_repack_safe;
 SELECT count(*) AS passes FROM pr_t;

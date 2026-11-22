@@ -41,9 +41,11 @@ like($stderr,
     'library loaded with LOAD: the error names the setting');
 
 # Firing a trigger of the record table loads the library for its C function.
+# TRUNCATE fires the AFTER statement trigger and raises no error: this
+# backend has no hook yet that could refuse it, and the table is empty.
 ($ret, $stdout, $stderr) = $node->psql('postgres', q{
     BEGIN;
-    INSERT INTO pg_repack_safe_rewrites VALUES (0, '1');
+    TRUNCATE pg_repack_safe_rewrites;
     ROLLBACK;
     REPACK (CONCURRENTLY) t;
 });

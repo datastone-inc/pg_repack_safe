@@ -100,9 +100,71 @@ would refuse reads of whichever table now has its OID. Nothing is lost by
 leaving the records behind, because no snapshot survives a dump and
 restore.
 
-For the same reason, do not copy rows of `pg_repack_safe_rewrites` from one
-database to another by hand, even within one cluster: relation OIDs differ
-between databases.
+For the same reason, rows of `pg_repack_safe_rewrites` cannot be copied
+from one database to another, even within one cluster, where relation OIDs
+differ between databases: every `INSERT` and `COPY ... FROM` into the table
+is refused, and only `REPACK (CONCURRENTLY)` writes records.
+
+## Logical Replication
+
+Keep `pg_repack_safe_rewrites` out of every publication. As with a dump, a
+record's relation OID and transaction ID mean something only in the cluster
+that wrote them. On a subscriber the OID belongs to some other table, or to
+none, and the transaction ID may not have been assigned there yet.
+
+`CREATE PUBLICATION ... FOR ALL TABLES` includes the record table like any
+other table. Exclude it when creating the publication:
+
+```sql
+CREATE PUBLICATION my_publication
+    FOR ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites);
+```
+
+or afterwards (the list replaces any earlier `EXCEPT` list):
+
+```sql
+ALTER PUBLICATION my_publication
+    SET ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites);
+```
+
+`FOR TABLES IN SCHEMA` has no `EXCEPT`: do not publish the schema the
+extension is installed in, or move the extension to another schema with
+`ALTER EXTENSION pg_repack_safe SET SCHEMA`.
+
+If the table is published all the same, a subscriber that has the extension
+does not store the publisher's records: every insert into its record table
+is refused, in the apply worker too, so none of its tables is affected. The
+refusal is an error, not a silent skip, and it stops the subscription
+(`t/016_publication.pl`):
+
+- Once the publisher runs `REPACK (CONCURRENTLY)`, the apply worker logs
+  `ERROR: cannot insert into the pg_repack_safe record table` and retries
+  the same transaction for as long as it is refused. Meanwhile the
+  subscription applies nothing, for any table.
+- If the publisher's record table already holds records when the
+  subscription is created, the initial copy of that one table fails in the
+  same way and is retried; the other tables are copied and replicate.
+
+To recover, in this order:
+
+1. On the publisher, exclude the table with the `ALTER PUBLICATION`
+   statement above. This alone does not release a transaction that was
+   already refused: the apply worker keeps failing on it.
+2. On the subscriber, refresh the subscription, which drops the record
+   table from it:
+
+   ```sql
+   ALTER SUBSCRIPTION my_subscription REFRESH PUBLICATION;
+   ```
+
+   The apply worker then passes over the record table's changes, the
+   refused ones included, and continues with the other tables. Nothing is
+   skipped but the records. A failing initial copy ends as well.
+
+A subscriber without the extension has no such table. Its apply worker
+stops with PostgreSQL's own error, `logical replication target relation
+"public.pg_repack_safe_rewrites" does not exist`, so the exclusion is
+needed there too.
 
 ## Other Extensions
 
@@ -128,9 +190,11 @@ make installcheck
 
 This does not use the server that `PGHOST`/`PGPORT` point at: the test
 suites start their own temporary servers from the installed binaries (see
-[development.md](development.md)). It also installs a test-only module,
-`oat_observer`, into the PostgreSQL library directory; `make install`
-does not.
+[development.md](development.md)). It also installs two test-only modules,
+`oat_observer` and `test_record`, into the PostgreSQL library directory;
+`make install` does not. `test_record` can write arbitrary rows into a
+record table, which the extension otherwise refuses, so do not run
+`make installcheck` against the installation of a production server.
 
 ## Removing the Extension
 

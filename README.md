@@ -107,6 +107,12 @@ Logical replication's initial copy of a table published through its
 partitioned root is such a statement; `pg_dump` copies each partition by
 itself and is not affected.
 
+A publication `FOR ALL TABLES` includes `pg_repack_safe_rewrites`. Exclude
+it: a subscriber that has the extension refuses the publisher's records,
+and its subscription then applies nothing more until the table is excluded
+and the subscription refreshed (`t/016_publication.pl`; see "Logical
+Replication" in [doc/installation.md](doc/installation.md)).
+
 The record table is protected:
 
 - Records are never deleted. Each `REPACK (CONCURRENTLY)` adds one or two
@@ -119,6 +125,12 @@ The record table is protected:
   `ALTER TABLE`, `REPACK (CONCURRENTLY)`), and changes to when its triggers
   fire are always refused. `VACUUM`, `VACUUM FULL`, `CLUSTER` and `REPACK`
   of it, also database-wide, are allowed.
+- `INSERT` into it is always refused, by any route (`COPY ... FROM`,
+  `MERGE`, logical replication) and whatever `session_replication_role` is.
+  Only `REPACK (CONCURRENTLY)` writes records. A record names a table by
+  OID and a transaction by ID, which mean something only in the cluster
+  that wrote it; a row from anywhere else would refuse reads of whichever
+  table has that OID.
 - Creating an index on it, by `CREATE INDEX` or a `PRIMARY KEY` or `UNIQUE`
   constraint, is always refused. Records are inserted without maintaining
   indexes, so an index would miss every later record and a query using it
@@ -126,8 +138,8 @@ The record table is protected:
 - Adding, dropping or altering a column of it (the type, default, name or
   any other property) is always refused. With any other column list, every
   query in that database would be refused.
-- If the record table loses its definition or either trigger by a route no
-  hook could stop, every query and `REPACK (CONCURRENTLY)` in that database
+- If the record table loses its definition or any of its three triggers by
+  a route no hook could stop, every query and `REPACK (CONCURRENTLY)` in that database
   is refused until the extension is re-created.
 
 ## Installation

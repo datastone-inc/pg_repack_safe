@@ -45,7 +45,12 @@ count
 (1 row)
 
 step o_begin: BEGIN;
-step o_record: INSERT INTO pg_repack_safe_rewrites VALUES ('t'::regclass, pg_current_xact_id());
+step o_record: SELECT test_insert_record('pg_repack_safe_rewrites', 't'::regclass, pg_current_xact_id());
+test_insert_record
+------------------
+                  
+(1 row)
+
 step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
 count
 -----
@@ -65,7 +70,12 @@ count
 (1 row)
 
 step o_replica: SET session_replication_role = replica; BEGIN;
-step o_record: INSERT INTO pg_repack_safe_rewrites VALUES ('t'::regclass, pg_current_xact_id());
+step o_record: SELECT test_insert_record('pg_repack_safe_rewrites', 't'::regclass, pg_current_xact_id());
+test_insert_record
+------------------
+                  
+(1 row)
+
 step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
 count
 -----

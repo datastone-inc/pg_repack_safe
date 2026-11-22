@@ -37,12 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the record table cannot be found or does not have the definition the
   extension created.
 - A query is refused when the extension exists but its record table cannot
-  be found (renamed, moved to another schema, or dropped) or lacks either of
-  its triggers firing ALWAYS. Both refusals are skipped in binary-upgrade
+  be found (renamed, moved to another schema, or dropped) or lacks any of
+  its three triggers firing ALWAYS. Both refusals are skipped in binary-upgrade
   mode so that `pg_upgrade` works; `REPACK (CONCURRENTLY)` stays refused
   there. `pg_upgrade` carries the records over unchanged; `pg_dump` leaves
   them behind.
-- The record table is protected. `UPDATE` and `DELETE` of records,
+- The record table is protected. `INSERT` (by any route: `COPY ... FROM`,
+  `MERGE`, logical replication), `UPDATE` and `DELETE` of records,
   `REPACK (CONCURRENTLY)` and rewriting `ALTER TABLE` of the table, and
   changes to when its triggers fire are refused (`VACUUM FULL`, `CLUSTER`
   and `REPACK` are allowed). Creating an index on it, which the writer
@@ -52,6 +53,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TRUNCATE`, are refused unless a superuser sets
   `pg_repack_safe.allow_unprotected_drop`. The README
   describes how to remove the extension safely.
+- Only `REPACK (CONCURRENTLY)` writes records. A row-level
+  `BEFORE INSERT` trigger on the record table, enabled ALWAYS, refuses every
+  other insert with "cannot insert into the pg_repack_safe record table".
+  A publication `FOR ALL TABLES` includes the record table, and without the
+  refusal a subscriber with the extension stored the publisher's records,
+  which took the subscriber's table with the same OID offline. The refusal
+  stops the subscription instead, until the table is excluded from the
+  publication and the subscription is refreshed; `doc/installation.md`,
+  "Logical Replication", gives the steps.
 - Custom WAL resource manager (ID 149, reserved on the PostgreSQL wiki): each
   `REPACK (CONCURRENTLY)` logs a record before its commit, so a standby
   without the library stops replay instead of serving the repacked table to
@@ -75,8 +85,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `known_gaps`, which pins what the extension does not cover (TRUNCATE,
     rewriting ALTER TABLE, REFRESH MATERIALIZED VIEW, the foreign-key
     check);
-  - TAP (`t/001` to `t/015`): `pg_dump`, `pg_upgrade`, hot standbys, hook
+  - TAP (`t/001` to `t/016`): `pg_dump`, `pg_upgrade`, hot standbys, hook
     chaining with `pg_stat_statements` and with the test-only module
-    `test/modules/oat_observer` (installed by `make installcheck`, not by
-    `make install`), COPY, the pre-check, logical replication's initial
-    copy, and PL/pgSQL procedures that commit in a loop.
+    `test/modules/oat_observer`, COPY, the pre-check, logical replication's
+    initial copy, PL/pgSQL procedures that commit in a loop, and a
+    publication that includes the record table.
+  - Test-only modules `test/modules/oat_observer` and
+    `test/modules/test_record` (writes a record with a chosen table and
+    transaction ID), installed by `make installcheck`, not by
+    `make install`.
