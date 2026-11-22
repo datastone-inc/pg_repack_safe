@@ -38,11 +38,11 @@
  *
  * - a custom WAL resource manager, whose record at the swap of an unsafe
  *   rewrite stops replay on a standby that does not have this library;
- * - the record table's three trigger functions:
- *   pg_repack_safe_records_changed invalidates readers' record caches,
- *   pg_repack_safe_records_protected refuses UPDATE and DELETE of records,
- *   and pg_repack_safe_records_writer_only refuses every INSERT, so that
- *   only the writer in this file, which fires no trigger, adds records.
+ * - the record table's two trigger functions:
+ *   pg_repack_safe_records_protected refuses UPDATE and DELETE of records
+ *   and TRUNCATE of a record table that holds any, and
+ *   pg_repack_safe_records_writer_only refuses every INSERT, so that only
+ *   the writer in this file, which fires no trigger, adds records.
  */
 
 #include "postgres.h"
@@ -99,14 +99,12 @@
 
 PG_MODULE_MAGIC;
 
-PG_FUNCTION_INFO_V1(pg_repack_safe_records_changed);
 PG_FUNCTION_INFO_V1(pg_repack_safe_records_protected);
 PG_FUNCTION_INFO_V1(pg_repack_safe_records_writer_only);
 PG_FUNCTION_INFO_V1(pg_repack_safe_prune_records);
 
 #define EXTENSION_NAME "pg_repack_safe"
 #define RECORD_TABLE_NAME "pg_repack_safe_rewrites"
-#define CHANGED_TRIGGER_FUNCTION "pg_repack_safe_records_changed"
 #define PROTECTED_TRIGGER_FUNCTION "pg_repack_safe_records_protected"
 #define WRITER_ONLY_TRIGGER_FUNCTION "pg_repack_safe_records_writer_only"
 
@@ -202,7 +200,7 @@ static uint32 recordTableNameHash = 0;
  * Backend-local copy of the record table: every (relid, rewrite_xid) pair,
  * deleted row versions included, keyed by relid. recordCacheState is set to
  * RECORD_CACHE_INVALID by any relcache invalidation of the record table (sent
- * by the writer and by the table's statement trigger) and by the syscache
+ * by the writer; no SQL statement changes a record) and by the syscache
  * callback that forgets the cached record table OID
  * (recordTableCacheCallback); the next reader check then reloads it. Only
  * RECORD_CACHE_CURRENT allows the cache to be used.
@@ -318,8 +316,7 @@ isRecordTriggerFunction(Oid funcOid, const char *name)
         return false;
     if (name != NULL
         ? strcmp(funcName, name) != 0
-        : (strcmp(funcName, CHANGED_TRIGGER_FUNCTION) != 0 &&
-           strcmp(funcName, PROTECTED_TRIGGER_FUNCTION) != 0 &&
+        : (strcmp(funcName, PROTECTED_TRIGGER_FUNCTION) != 0 &&
            strcmp(funcName, WRITER_ONLY_TRIGGER_FUNCTION) != 0))
         return false;
     schemaOid = extensionSchema();
@@ -504,11 +501,7 @@ checkRecordTableDefinition(Relation rel, RecordTableUse use)
      * the table but not yet its triggers.
      */
     if (!exemptInBinaryUpgrade(use) &&
-        (!hasRecordTrigger(rel, CHANGED_TRIGGER_FUNCTION,
-                           TRIGGER_TYPE_STATEMENT, TRIGGER_TYPE_AFTER,
-                           TRIGGER_TYPE_INSERT | TRIGGER_TYPE_UPDATE |
-                           TRIGGER_TYPE_DELETE | TRIGGER_TYPE_TRUNCATE) ||
-         !hasRecordTrigger(rel, PROTECTED_TRIGGER_FUNCTION,
+        (!hasRecordTrigger(rel, PROTECTED_TRIGGER_FUNCTION,
                            TRIGGER_TYPE_STATEMENT, TRIGGER_TYPE_BEFORE,
                            TRIGGER_TYPE_UPDATE | TRIGGER_TYPE_DELETE |
                            TRIGGER_TYPE_TRUNCATE) ||
@@ -518,7 +511,7 @@ checkRecordTableDefinition(Relation rel, RecordTableUse use)
         ereport(ERROR,
                 (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                  errmsg("pg_repack_safe cannot use its record table"),
-                 errdetail("The table \"%s\" does not have all three of its triggers, enabled ALWAYS.",
+                 errdetail("The table \"%s\" does not have both of its triggers, enabled ALWAYS.",
                            RECORD_TABLE_NAME),
                  errhint("Drop and re-create the extension.")));
 
@@ -1825,7 +1818,7 @@ protectRecordTrigger(Oid triggerOid)
             (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
              errmsg("cannot change when %s fires",
                     getObjectDescription(&address, false)),
-             errdetail("The record table's triggers keep readers' caches current and refuse every change to the records but the extension's own, and must fire ALWAYS.")));
+             errdetail("The record table's triggers refuse every change to the records but the extension's own, and must fire ALWAYS.")));
 }
 
 /**
@@ -2125,32 +2118,6 @@ pg_repack_safe_prune_records(PG_FUNCTION_ARGS)
     table_close(rel, NoLock);
 
     PG_RETURN_INT64((int64) deleted);
-}
-
-/**
- * @brief Trigger function: invalidate readers' record caches
- * @return NULL (statement-level AFTER trigger)
- *
- * Fires after any INSERT, UPDATE, DELETE or TRUNCATE statement on the
- * record table (the trigger is ENABLE ALWAYS, so session_replication_role
- * does not skip it), so that a change made by hand reaches readers' caches
- * like the writer's own. The other two trigger functions refuse every such
- * statement that would change a row, which leaves TRUNCATE, allowed under
- * pg_repack_safe.allow_unprotected_drop or while the table is empty.
- */
-Datum
-pg_repack_safe_records_changed(PG_FUNCTION_ARGS)
-{
-    TriggerData *trigdata = (TriggerData *) fcinfo->context;
-
-    if (!CALLED_AS_TRIGGER(fcinfo))
-        ereport(ERROR,
-                (errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
-                 errmsg("pg_repack_safe_records_changed() must be called as a trigger")));
-
-    CacheInvalidateRelcache(trigdata->tg_relation);
-
-    return PointerGetDatum(NULL);
 }
 
 /* ----------------------------------------------------------------

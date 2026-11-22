@@ -25,8 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as empty. Checked in the executor and for `COPY relation TO` (including
   partitioned tables), so `pg_dump` fails instead of dumping no rows. Each
   backend keeps a copy of the records, so a query does not read the record
-  table; the writer, and a statement trigger on the record table for changes
-  made by hand, invalidate it.
+  table; the writer invalidates it.
 - `COPY partitioned_table TO` is run as `COPY (SELECT columns FROM
   partitioned_table) TO`, so that a partition attached during the COPY
   cannot be scanned unchecked and no lock beyond COPY's own is taken. The
@@ -38,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extension created.
 - A query is refused when the extension exists but its record table cannot
   be found (renamed, moved to another schema, or dropped) or lacks any of
-  its three triggers firing ALWAYS. Both refusals are skipped in binary-upgrade
+  its two triggers firing ALWAYS. Both refusals are skipped in binary-upgrade
   mode so that `pg_upgrade` works; `REPACK (CONCURRENTLY)` stays refused
   there. `pg_upgrade` carries the records over unchanged; `pg_dump` leaves
   them behind.

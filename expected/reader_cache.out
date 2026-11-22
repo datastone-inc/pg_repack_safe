@@ -86,3 +86,23 @@ step o_commit: COMMIT; RESET session_replication_role;
 step r_t: SELECT count(*) FROM t;
 ERROR:  cannot read table "t" with this snapshot
 step r_commit: COMMIT;
+
+starting permutation: r_begin_sp p_repack r_t r_back o_truncate r_t r_commit
+step r_begin_sp: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other; SAVEPOINT s;
+count
+-----
+    0
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) t;
+step r_t: SELECT count(*) FROM t;
+ERROR:  cannot read table "t" with this snapshot
+step r_back: ROLLBACK TO s;
+step o_truncate: SET pg_repack_safe.allow_unprotected_drop = on; TRUNCATE pg_repack_safe_rewrites; RESET pg_repack_safe.allow_unprotected_drop;
+step r_t: SELECT count(*) FROM t;
+count
+-----
+    0
+(1 row)
+
+step r_commit: COMMIT;

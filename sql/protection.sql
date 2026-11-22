@@ -22,9 +22,9 @@
  * - UPDATE and DELETE of records are refused, by any route (MERGE, a
  *   writable CTE).
  * Changing when the record table's triggers fire is refused always, and
- * dropping them follows the DROP rule: they carry the cache invalidation and
- * the UPDATE/DELETE and INSERT refusals. A record table without all three
- * triggers, firing ALWAYS, refuses every read and REPACK (CONCURRENTLY).
+ * dropping them follows the DROP rule: they carry the UPDATE/DELETE,
+ * TRUNCATE and INSERT refusals. A record table without both triggers,
+ * firing ALWAYS, refuses every read and REPACK (CONCURRENTLY).
  * Refused always, with or without records and whatever the override says:
  * - INSERT into the record table, by any route (INSERT ... SELECT, COPY
  *   FROM, MERGE, a writable CTE) and whatever session_replication_role is:
@@ -155,20 +155,19 @@ FROM pg_repack_safe_rewrites;
 -- The triggers: disabling, changing when they fire, or dropping them is
 -- refused, whatever the spelling.
 ALTER TABLE pg_repack_safe_rewrites
-    DISABLE TRIGGER pg_repack_safe_rewrites_changed;
+    DISABLE TRIGGER pg_repack_safe_rewrites_protected;
 ALTER TABLE pg_repack_safe_rewrites DISABLE TRIGGER ALL;
 ALTER TABLE pg_repack_safe_rewrites DISABLE TRIGGER USER;
 ALTER TABLE pg_repack_safe_rewrites
     ENABLE TRIGGER pg_repack_safe_rewrites_protected;
 ALTER TABLE pg_repack_safe_rewrites
-    ENABLE REPLICA TRIGGER pg_repack_safe_rewrites_changed;
+    ENABLE REPLICA TRIGGER pg_repack_safe_rewrites_protected;
 ALTER TABLE pg_repack_safe_rewrites
     DISABLE TRIGGER pg_repack_safe_rewrites_writer_only;
 ALTER TABLE pg_repack_safe_rewrites
     ENABLE TRIGGER pg_repack_safe_rewrites_writer_only;
 ALTER TABLE pg_repack_safe_rewrites
     ENABLE REPLICA TRIGGER pg_repack_safe_rewrites_writer_only;
-DROP TRIGGER pg_repack_safe_rewrites_changed ON pg_repack_safe_rewrites;
 DROP TRIGGER pg_repack_safe_rewrites_protected ON pg_repack_safe_rewrites;
 DROP TRIGGER pg_repack_safe_rewrites_writer_only ON pg_repack_safe_rewrites;
 -- Dropping a trigger function with CASCADE would drop its trigger: refused.
@@ -187,13 +186,13 @@ DROP SCHEMA public CASCADE;
 SELECT count(*) AS triggers FROM pg_trigger
 WHERE tgrelid = 'pg_repack_safe_rewrites'::regclass;
 -- Renaming a trigger changes nothing it does: allowed.
-ALTER TRIGGER pg_repack_safe_rewrites_changed ON pg_repack_safe_rewrites
+ALTER TRIGGER pg_repack_safe_rewrites_protected ON pg_repack_safe_rewrites
     RENAME TO pr_renamed;
 ALTER TRIGGER pr_renamed ON pg_repack_safe_rewrites
-    RENAME TO pg_repack_safe_rewrites_changed;
+    RENAME TO pg_repack_safe_rewrites_protected;
 -- Re-enabling as ALWAYS is a no-op: allowed.
 ALTER TABLE pg_repack_safe_rewrites
-    ENABLE ALWAYS TRIGGER pg_repack_safe_rewrites_changed;
+    ENABLE ALWAYS TRIGGER pg_repack_safe_rewrites_protected;
 
 -- Indexes: refused in every spelling, and none is left behind. The writer
 -- inserts records without maintaining indexes.

@@ -200,9 +200,8 @@ SELECT 1 AS passes;
 
 ALTER EXTENSION pg_repack_safe DROP TABLE pg_repack_safe_rewrites;
 DROP EXTENSION pg_repack_safe CASCADE;
-NOTICE:  drop cascades to 3 other objects
-DETAIL:  drop cascades to trigger pg_repack_safe_rewrites_changed on table pg_repack_safe_rewrites
-drop cascades to trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites
 drop cascades to trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites
 INSERT INTO pg_repack_safe_rewrites VALUES ('pg_class'::regclass, '1');
 SELECT 1 AS passes;
