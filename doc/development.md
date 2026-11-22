@@ -24,6 +24,10 @@ cd pg_repack_safe
 make
 ```
 
+The build enables `-Wall -Wextra`. `make WERROR=1` also turns warnings into
+errors, in the library and in the test modules; use it before sending a
+change.
+
 ## Testing
 
 Regression tests use `pg_regress` through PGXS. `sql/` holds the test
