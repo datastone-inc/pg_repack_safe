@@ -281,8 +281,14 @@ trade, offered to those who prefer an error to a wrong result.
 A patch that makes `REPACK (CONCURRENTLY)` MVCC-safe, so that nobody gets an
 error or a wrong result, is under review for PostgreSQL 20. It is not
 committed, and patches under review are sometimes postponed or dropped, so
-do not plan on it. PostgreSQL 19 will not get it either way. The history,
-with its sources, is in [doc/research/history.md](doc/research/history.md).
+do not plan on it. PostgreSQL 19 will not get it either way.
+
+That fix cannot be delivered as an extension. It changes how the heap, the
+WAL and logical decoding handle transaction IDs, and PostgreSQL 19 has no
+extension point for any of them, which is why `pg_repack_safe` raises an
+error instead of returning the right rows. The comparison is in §7 of
+[doc/research/history.md](doc/research/history.md), which also gives the
+history with its sources.
 
 ## Known gaps
 

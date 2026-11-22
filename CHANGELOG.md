@@ -108,6 +108,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   what the extension guarantees and what it does not; `doc/installation.md`
   covers server and standby configuration, settings, `pg_upgrade` and other
   extensions.
+- Documentation: the README's "Outlook" says why the MVCC-safe fix under
+  review for PostgreSQL 20 cannot be delivered as an extension;
+  `doc/research/history.md` §7 compares that patch with this extension.
 - Tests, run by `make installcheck` on temporary instances:
   - regression: `doc_examples`, `storage_change`, `reader_check`, `writer`,
     `protection`, `copy_partitioned`;

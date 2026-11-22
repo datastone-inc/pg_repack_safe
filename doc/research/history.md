@@ -65,7 +65,8 @@ links AI-generated patches or reviews to the REPACK review or the MVCC decision.
 | 2026-04-06 | 28d534e2ae0 "Add CONCURRENTLY option to REPACK" (Herrera; author Houska, co-authors Nikalayeu, Herrera). Adds the "not MVCC-safe" text to repack.sgml and the mvcc.sgml caveat | git [V] |
 | 2026-04 to 2026-11 | ~60 follow-up commits; e.g. 04bb1500253 blocks user catalog tables as "not an MVCC-safe operation" | git [V] |
 | 2026-06-16 | Houska: "REPACK enhancements" for PG20; patch 0008 "Make REPACK CONCURRENTLY MVCC safe"; CF 6957 | 109367.1781614382@localhost [V] |
-| 2026-11-14 | MVCC-safety patch not on master | git log --all [V] |
+| 2026-11-10 | Houska: v05 of the series; the MVCC-safety patch is 0009 (see §7) | 88740.1794308080@chrudos [V] |
+| 2026-11-21 | MVCC-safety patch not on master | git log --all [V] |
 
 ## 3. How the non-MVCC-safety was justified
 
@@ -212,8 +213,84 @@ schedule, contested at the time; the record does not show it was decisive.
   commit carries an AI disclosure. **The README must not suggest a
   connection.**
 
+## 7. The PG20 patch compared with this extension
+
+Added 2026-11-22. Patch read: v05-0009 "Make REPACK CONCURRENTLY MVCC safe"
+(88740.1794308080@chrudos, 2026-11-10; numbered 0008 in v01 to v04). Roughly
+the first third of the patch text was read verbatim and the rest through a
+summary, so patch details are **[V]** only where they come from the commit
+message or that first third, and **[I]** otherwise. PG19 facts were checked
+in the REL_19_0 tree.
+
+**Different kinds of fix.** The patch removes the cause; the extension detects
+the wrong read and raises an error. The patch is candidate F in
+[fix-design.md](fix-design.md); the extension is candidate G.
+
+| | pg_repack_safe | PG20 patch |
+|---|---|---|
+| Mechanism | The writer records each unsafe rewrite; a reader errors (40001) if its snapshot does not see the rewriter's XID as committed | The new heap keeps each row's original xmin/xmax instead of the REPACK XID |
+| Old-snapshot reader | Error | Correct rows |
+| Standbys | Need the library; a custom WAL record stops replay without it | Nothing special: the WAL carries the original XIDs |
+| Known gaps | Readers that bypass the guarded paths (direct-scan extensions, output plugins) | None by design |
+| Option or default | Loaded per cluster, created per database | Changes the command itself; no SAFE option seen [I] |
+
+**What the patch changes.**
+- [V] Commit message: "This patch teaches REPACK (CONCURRENTLY) to transfer
+  the visibility information from the old table to the new one."
+- [V] `heap_insert` and `heap_update` take a new flag `TABLE_REUSE_XID` and
+  then use the tuple's own xmin instead of `GetCurrentTransactionId()`.
+  `heap_delete`, `simple_heap_delete`, the table AM `tuple_delete` callback
+  and the TOAST delete functions gain a `TransactionId xid` argument.
+- [V] The copy goes through rewriteheap.c: `heap_insert_for_repack` calls a
+  new `rewrite_heap_tuple_no_chains`, and `begin_heap_rewrite` gains a
+  `no_chains` argument. TOAST tuples are inserted with `raw_heap_insert`.
+- [V] WAL: a record flag `XLR_XID_REPLAYED`, a call to set the record's XID,
+  and a bumped `XLOG_PAGE_MAGIC`. `decode.c` returns early for flagged
+  records.
+- [V] A new snapshot type `SNAPSHOT_NEW_HEAP` with
+  `HeapTupleSatisfiesNewHeap` finds existing tuples in the new heap when
+  concurrent changes are applied.
+- [V] The command commits before copying, "so that there is no XID assigned
+  while we copy the data" (cover letter, 109367.1781614382@localhost), and
+  copies in block ranges.
+- [I] An auxiliary table with an identity index replaces the tuplestore.
+  Diffstat: 33 files, 1223 insertions, 336 deletions.
+- [V] Stated limitation: "we only freeze tuples during the initial copying,
+  while the data changes decoded from WAL are replayed without freezing."
+
+**Not implementable as an extension [V, PG19 source].**
+- `heapam.c (heap_insert)`, `(heap_update)` and `(heap_delete)` take the XID
+  from `GetCurrentTransactionId()`, with no argument or hook to override it.
+- `heapam_handler.c (heap_insert_for_repack)` and
+  `rewriteheap.c (raw_heap_insert)` are `static`.
+- `repack.c` and `repack_worker.c` contain no hooks.
+- The WAL record flag, the page magic, the decode.c skip and the new snapshot
+  type are core changes with no extension point.
+- [I] The remaining extension route is a replacement command with private
+  copies of the heap insert, update and delete code, as pg_squeeze is built.
+  That does not make stock `REPACK (CONCURRENTLY)` safe, and pg_squeeze
+  itself never preserved visibility (§4).
+
+**State of the patch.**
+- [V] Not on origin/master as of 2026-11-21 (`git log --all --grep`).
+- [I] Commitfest 6957, from a possibly stale page: "Needs review", needing a
+  rebase, author Houska, reviewer Reyes Bravo, no committer.
+- [V] Open at v05: an assertion in `compute_new_xmax_infomask` is commented
+  out; Houska: "I couldn't reproduce this problem yet."
+- [I] Open at v05: a failed run leaves a `pg_temp_<oid>` table that breaks
+  later rewrites and `pg_upgrade` (Reyes Bravo, 2026-09-22); no fix seen.
+- [I] Reported fixed in v04: rows lost when the table grows during the run,
+  and a wraparound bug with synchronized seqscans (shihao zhong, 2026-09).
+  A "could not find target tuple" error after a concurrent DELETE or UPDATE
+  has a fix in v05 that was not seen confirmed.
+- [I] No back-patch to 19 has been proposed, and the WAL format change rules
+  one out.
+
 ## Source caveats
 
+- The v05-0009 patch (§7) was read verbatim only for about its first third;
+  the 2026-09-24 and 2026-11-11 to 2026-11-14 thread messages were read only
+  through a summary.
 - PGConf.EU 2025 slides are image-only; nothing in them is verified.
 - PG19 GA date (Nov 19, per press) not checked against a primary source.
 - The Phoronix write-up returned 403 and was not read.
