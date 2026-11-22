@@ -942,32 +942,22 @@ checkCopyTo(PlannedStmt *pstmt, bool readOnlyTree)
  */
 
 /**
- * @brief Find and lock the record table for an unsafe rewriter
+ * @brief Find the record table and lock it for a change to its records
  * @return OID of the record table, on which this transaction then holds
- *         RowExclusiveLock until it ends
+ *         RowExclusiveLock until it ends, or InvalidOid when the extension
+ *         is not created in this database
  *
- * Refuses the rewrite when the library was not loaded through
- * shared_preload_libraries, and when there is nowhere to record it: the
- * extension is not created in this database, or its record table cannot be
- * found or has another definition. The lock keeps the table from being
- * dropped, renamed or moved to another schema (each needs
- * AccessExclusiveLock) before the swap writes the record. Taking it processes pending invalidation messages, so
- * the OID is accepted only if the cache still holds it once the lock is held.
+ * The lock keeps the table from being dropped, renamed or moved to another
+ * schema (each needs AccessExclusiveLock) while the caller writes or deletes
+ * records. Taking it processes pending invalidation messages, so the OID is
+ * accepted only if the cache still holds it once the lock is held; the
+ * table's definition is checked under the lock. A record table that cannot
+ * be found, or has another definition, raises an error (lookupRecordTable,
+ * checkRecordTableDefinition).
  */
 static Oid
-lockRecordTableForWriter(void)
+lockRecordTableForChange(void)
 {
-    /*
-     * A record protects readers only in backends that have the reader
-     * check, and only shared_preload_libraries puts it in every backend.
-     */
-    if (!loadedAtServerStart)
-        ereport(ERROR,
-                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                 errmsg("REPACK (CONCURRENTLY) requires pg_repack_safe in shared_preload_libraries"),
-                 errdetail("The library was loaded in this session only, so other sessions may not check their reads against the rewrite."),
-                 errhint("Add pg_repack_safe to shared_preload_libraries and restart the server.")));
-
     for (;;)
     {
         Oid         tableOid;
@@ -976,14 +966,8 @@ lockRecordTableForWriter(void)
         CHECK_FOR_INTERRUPTS();
 
         tableOid = lookupRecordTable(RECORD_TABLE_FOR_WRITER);
-
         if (!OidIsValid(tableOid))
-            ereport(ERROR,
-                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                     errmsg("REPACK (CONCURRENTLY) requires the extension \"%s\" in this database",
-                            EXTENSION_NAME),
-                     errdetail("The extension records each REPACK (CONCURRENTLY) so that readers with older snapshots get an error instead of wrong results."),
-                     errhint("Run CREATE EXTENSION %s.", EXTENSION_NAME)));
+            return InvalidOid;
 
         LockRelationOid(tableOid, RowExclusiveLock);
         if (recordTableOidKnown && recordTableOid == tableOid)
@@ -999,6 +983,45 @@ lockRecordTableForWriter(void)
         UnlockRelationOid(tableOid, RowExclusiveLock);
         recordTableOidKnown = false;
     }
+}
+
+/**
+ * @brief Find and lock the record table for an unsafe rewriter
+ * @return OID of the record table, locked as by lockRecordTableForChange
+ *
+ * Refuses the rewrite when the library was not loaded through
+ * shared_preload_libraries, and when there is nowhere to record it: the
+ * extension is not created in this database, or its record table cannot be
+ * found or has another definition. The lock is held from here to the end of
+ * the transaction, so the table is still there when the swap writes the
+ * record.
+ */
+static Oid
+lockRecordTableForWriter(void)
+{
+    Oid         tableOid;
+
+    /*
+     * A record protects readers only in backends that have the reader
+     * check, and only shared_preload_libraries puts it in every backend.
+     */
+    if (!loadedAtServerStart)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("REPACK (CONCURRENTLY) requires pg_repack_safe in shared_preload_libraries"),
+                 errdetail("The library was loaded in this session only, so other sessions may not check their reads against the rewrite."),
+                 errhint("Add pg_repack_safe to shared_preload_libraries and restart the server.")));
+
+    tableOid = lockRecordTableForChange();
+    if (!OidIsValid(tableOid))
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("REPACK (CONCURRENTLY) requires the extension \"%s\" in this database",
+                        EXTENSION_NAME),
+                 errdetail("The extension records each REPACK (CONCURRENTLY) so that readers with older snapshots get an error instead of wrong results."),
+                 errhint("Run CREATE EXTENSION %s.", EXTENSION_NAME)));
+
+    return tableOid;
 }
 
 /**
@@ -2088,30 +2111,16 @@ pg_repack_safe_records_writer_only(PG_FUNCTION_ARGS)
 Datum
 pg_repack_safe_prune_records(PG_FUNCTION_ARGS)
 {
-    Oid         tableOid;
+    Oid         tableOid = lockRecordTableForChange();
     Relation    rel;
     uint64      deleted;
 
-    for (;;)
-    {
-        CHECK_FOR_INTERRUPTS();
+    if (!OidIsValid(tableOid))
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_repack_safe cannot find its record table")));
 
-        tableOid = lookupRecordTable(RECORD_TABLE_FOR_WRITER);
-        if (!OidIsValid(tableOid))
-            ereport(ERROR,
-                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                     errmsg("pg_repack_safe cannot find its record table")));
-
-        /* As lockRecordTableForWriter: accept the OID only once locked. */
-        LockRelationOid(tableOid, RowExclusiveLock);
-        if (recordTableOidKnown && recordTableOid == tableOid &&
-            (rel = try_table_open(tableOid, NoLock)) != NULL)
-            break;
-        UnlockRelationOid(tableOid, RowExclusiveLock);
-        recordTableOidKnown = false;
-    }
-
-    checkRecordTableDefinition(rel, RECORD_TABLE_FOR_WRITER);
+    rel = table_open(tableOid, NoLock);
     deleted = deleteOlderRecords(rel);
     table_close(rel, NoLock);
 
