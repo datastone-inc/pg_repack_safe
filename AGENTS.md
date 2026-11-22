@@ -121,7 +121,7 @@ or a PG source citation settles it.
 
 ## Target versions
 
-- PostgreSQL 19 (local build `/opt/pg19`, currently 19rc2, source at
+- PostgreSQL 19 (local build `/opt/pg19`, currently 19.0, source at
   `/opt/pg19/src`). `REPACK` does not exist before 19. Don't add
   compatibility shims for older majors.
 - Release state: prerelease. Edit `pg_repack_safe--1.0.0.sql` in place. No
