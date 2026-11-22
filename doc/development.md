@@ -40,6 +40,15 @@ make installcheck
 
 A failing run leaves `regression.diffs` in the repository root.
 
+## Demo
+
+`demo/demo.sh` creates a throwaway server in a temporary directory and runs
+the scenarios `demo/[0-9]_*.sql` against it, first without the library and
+then with the extension. Each scenario is one psql script that runs the
+other session's statements with `\!`, so the interleaving is fixed.
+`t/018_demo.pl` runs the demo and checks both halves of its output, which
+also makes it the one test of what stock PostgreSQL 19 does in these cases.
+
 ## Continuous Integration
 
 `.github/workflows/ci.yml` runs on every push and pull request:

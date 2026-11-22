@@ -85,6 +85,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   standby: delete the records with `pg_repack_safe_prune_records()`, vacuum
   the record table until it is empty, and `DROP EXTENSION` (README,
   "Removing the extension").
+- `demo/demo.sh`: four scenarios (a report, an `UPDATE`, a `DELETE`, a
+  `pg_dump`) run
+  on a throwaway server without and then with the extension, showing the
+  wrong result on stock PostgreSQL 19 and the error that replaces it.
+  `t/018_demo.pl` checks its output.
 - Custom WAL resource manager (ID 149, reserved on the PostgreSQL wiki): each
   `REPACK (CONCURRENTLY)` logs a record before its commit, so a standby
   without the library stops replay instead of serving the repacked table to

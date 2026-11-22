@@ -29,12 +29,62 @@ happens to `pg_dump` (a dump with the table's rows missing), to cursors, and
 to logical replication's initial table copy (a subscriber that never gets
 the table's existing rows).
 
+## See it happen
+
+`demo/demo.sh` runs four small scenarios on a throwaway PostgreSQL 19
+server, first without the extension and then with it. It needs only the
+PostgreSQL 19 binaries and this extension installed, and it touches no
+existing server.
+
+```bash
+make install
+demo/demo.sh
+```
+
+The first scenario is a report that reads `customers`, then `orders`, in one
+transaction, while another session repacks `orders` in between. On stock
+PostgreSQL 19 the report is told there are no orders:
+
+```text
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) AS customers FROM customers;
+ customers
+-----------
+       100
+
+-- Meanwhile another session repacks orders.
+\! psql -X -q -c "REPACK (CONCURRENTLY) orders"
+
+SELECT count(*) AS orders, sum(amount) AS revenue FROM orders;
+ orders | revenue
+--------+---------
+      0 |
+```
+
+With pg_repack_safe, the same statement fails and the transaction can be
+retried:
+
+```text
+SELECT count(*) AS orders, sum(amount) AS revenue FROM orders;
+ERROR:  cannot read table "orders" with this snapshot
+DETAIL:  REPACK (CONCURRENTLY) rewrote the table after the snapshot was taken, and row visibility for older snapshots was not preserved.
+HINT:  Retry the transaction.
+```
+
+The other three scenarios show an `UPDATE` that reports `UPDATE 0` for ten
+matching rows, a `DELETE` of a customer's orders that removes none of them
+before the customer itself is deleted, and a `pg_dump` that exits with
+status 0 and a dump holding none of the table's 1000 rows. With the
+extension all three get the same error.
+`t/018_demo.pl` runs the demo and checks every one of these outputs.
+
 ## What pg_repack_safe guarantees
 
 With the library in `shared_preload_libraries` on the primary and on every
 standby, and the extension created in the database:
 
-- A read of a table, whose snapshot does not see a committed
+- A read of a table, including the read an `UPDATE` or `DELETE` does to
+  find its rows, whose snapshot does not see a committed
   `REPACK (CONCURRENTLY)` of that table, fails with
   `ERROR: cannot read table "..." with this snapshot`, SQLSTATE 40001 (a
   serialization failure: retry the transaction), instead of returning wrong
@@ -51,7 +101,8 @@ standby, and the extension created in the database:
   snapshot and that is then repacked gives a spurious error.
 
 The reproducers that fail on stock PostgreSQL 19 and pass with the
-extension are `specs/repack_concurrently_*.spec`, `t/001_repack_pg_dump.pl`,
+extension are `demo/demo.sh` (which shows both), and
+`specs/repack_concurrently_*.spec`, `t/001_repack_pg_dump.pl`,
 `t/008_copy_guard.pl` and `t/013_tablesync.pl`.
 
 ## What it does not guarantee
@@ -78,6 +129,30 @@ problem), and a few configurations the extension cannot see.
 
 Details, including `pg_upgrade` and other extensions, are in
 [doc/installation.md](doc/installation.md).
+
+### Without the extension
+
+pg_repack_safe needs its library installed and preloaded on every server
+that replays the WAL: the primary, its standbys, and any server that
+restores a base backup with WAL (point-in-time recovery, clones), for as
+long as that WAL holds a `REPACK (CONCURRENTLY)`. That is possible wherever
+you manage PostgreSQL yourself. On a managed service it depends on the
+provider offering the extension.
+
+Where it cannot be installed, `REPACK (CONCURRENTLY)` has no guard, and any
+role with the `MAINTAIN` privilege on a table can run it. To switch it off
+for the whole server, set
+
+```
+max_repack_replication_slots = 0
+```
+
+and restart. PostgreSQL then refuses every `REPACK (CONCURRENTLY)` with
+`REPACK can only be used if "max_repack_replication_slots" > 0`, while
+`REPACK` without `CONCURRENTLY`, which is MVCC-safe on the primary, still
+runs
+(`t/009_not_preloaded.pl`). The setting can only be changed at server
+start, so on a managed service it also depends on the provider exposing it.
 
 ## How it works
 

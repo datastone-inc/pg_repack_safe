@@ -76,5 +76,23 @@ is($node->safe_psql('postgres',
         'SELECT count(*) FROM pg_repack_safe_rewrites'),
     '0', 'KNOWN GAP: library never loaded, no record is written');
 
+# Where the library cannot be installed, PostgreSQL itself can switch
+# REPACK (CONCURRENTLY) off for the whole server (README, "Without the
+# extension"): it needs a replication slot from a pool of its own, and
+# refuses when that pool is empty. REPACK without CONCURRENTLY, which is
+# MVCC-safe, does not use it.
+$node->append_conf('postgresql.conf', "max_repack_replication_slots = 0\n");
+$node->restart;
+($ret, $stdout, $stderr) =
+  $node->psql('postgres', 'REPACK (CONCURRENTLY) t');
+isnt($ret, 0,
+    'max_repack_replication_slots = 0: REPACK (CONCURRENTLY) is refused');
+like($stderr,
+    qr/REPACK can only be used if "max_repack_replication_slots" > 0/,
+    'max_repack_replication_slots = 0: PostgreSQL names the setting');
+($ret, $stdout, $stderr) = $node->psql('postgres', 'REPACK t');
+is($ret, 0, 'max_repack_replication_slots = 0: plain REPACK still runs')
+  or diag($stderr);
+
 $node->stop;
 done_testing();
