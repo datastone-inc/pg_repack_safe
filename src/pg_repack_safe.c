@@ -513,7 +513,7 @@ checkRecordTableDefinition(Relation rel, RecordTableUse use)
                  errmsg("pg_repack_safe cannot use its record table"),
                  errdetail("The table \"%s\" does not have both of its triggers, enabled ALWAYS.",
                            RECORD_TABLE_NAME),
-                 errhint("Drop and re-create the extension.")));
+                 errhint("Drop and re-create the extension. That discards its records, so do it when no transaction older than the last REPACK (CONCURRENTLY) remains; while the record table holds records the drop needs pg_repack_safe.allow_unprotected_drop.")));
 
     if (rel->rd_rel->relkind != RELKIND_RELATION ||
         rel->rd_tableam != GetHeapamTableAmRoutine() ||
@@ -528,7 +528,7 @@ checkRecordTableDefinition(Relation rel, RecordTableUse use)
                  errmsg("pg_repack_safe cannot use its record table"),
                  errdetail("The table \"%s\" does not have the definition the extension created.",
                            RECORD_TABLE_NAME),
-                 errhint("Drop and re-create the extension.")));
+                 errhint("Drop and re-create the extension. That discards its records, so do it when no transaction older than the last REPACK (CONCURRENTLY) remains; while the record table holds records the drop needs pg_repack_safe.allow_unprotected_drop.")));
 }
 
 /* ----------------------------------------------------------------
@@ -1070,6 +1070,11 @@ pidsLockingRelation(Oid relid)
  *   ago. A snapshot is never older than its transaction.
  * Not seen: sessions on standbys, background workers, and snapshots taken
  * after the check.
+ *
+ * The error does not identify the session: pg_stat_activity hides another
+ * role's process ID and transaction start from users without
+ * pg_read_all_stats, and any table owner can set
+ * pg_repack_safe.precheck_snapshot_age.
  */
 static void
 precheckOldSnapshots(Oid relid, bool atSwap)
@@ -1116,13 +1121,9 @@ precheckOldSnapshots(Oid relid, bool atSwap)
                  errmsg("REPACK (CONCURRENTLY) refused: another session holds a snapshot that has not read table \"%s\"",
                         OidIsValid(relid) ? get_rel_name(relid) : "?"),
                  atSwap
-                 ? errdetail("Process %d, whose transaction started at %s, would get a serialization failure if it read the table after the REPACK. Checked at the swap.",
-                             status->st_procpid,
-                             timestamptz_to_str(status->st_xact_start_timestamp))
-                 : errdetail("Process %d, whose transaction started at %s, would get a serialization failure if it read the table after the REPACK. Checked before the REPACK started.",
-                             status->st_procpid,
-                             timestamptz_to_str(status->st_xact_start_timestamp)),
-                 errhint("Wait for that transaction to end, or set pg_repack_safe.precheck_snapshot_age to -1 to skip this check.")));
+                 ? errdetail("A session in this database would get a serialization failure if it read the table after the REPACK. Checked at the swap.")
+                 : errdetail("A session in this database would get a serialization failure if it read the table after the REPACK. Checked before the REPACK started."),
+                 errhint("Wait for that session's transaction to end (pg_stat_activity shows the sessions with a backend_xmin and their xact_start), or set pg_repack_safe.precheck_snapshot_age to -1 to skip this check.")));
     }
     list_free(lockingPids);
 }
@@ -1867,14 +1868,14 @@ selfVisibleIndexTable(Oid relid)
  * Caught by meaning, at the creation of the index, whatever statement
  * creates it: CREATE INDEX with or without CONCURRENTLY, a PRIMARY KEY,
  * UNIQUE or EXCLUDE constraint, REINDEX CONCURRENTLY. Only index_create
- * inserts pg_index rows (index.c:1056, through UpdateIndexRelation, whose
- * insertion at index.c:669 is the only one into that catalog), and it fires
- * this hook for the new relation with subId 0 (index.c:1233-1234). It does so
- * before advancing the command counter (index.c:1240), so the catalog cache
- * does not yet hold the pg_index row and the row is read with SnapshotSelf.
+ * (index.c) inserts pg_index rows, through UpdateIndexRelation, whose
+ * insertion is the only one into that catalog, and it fires this hook for
+ * the new relation with subId 0. It does so before advancing the command
+ * counter, so the catalog cache does not yet hold the pg_index row and the
+ * row is read with SnapshotSelf.
  *
  * The hook also fires for every new table, view and sequence
- * (heap.c:1832); those have no pg_index row and pass. The transient heap of
+ * (heap.c, heap_create_with_catalog); those have no pg_index row and pass. The transient heap of
  * a VACUUM FULL, CLUSTER or REPACK of the record table is such a table, and
  * since the record table has no index and no TOAST table, those commands
  * create no index for it.
@@ -1911,29 +1912,30 @@ protectRecordTableFromIndex(Oid relid)
  *
  * Caught by meaning: PostgreSQL reports a column as (pg_class, the table's
  * OID, the column number). In tablecmds.c:
- * - ADD COLUMN: OAT_POST_CREATE (ATExecAddColumn, :8030);
+ * - ADD COLUMN: OAT_POST_CREATE (ATExecAddColumn);
  * - DROP COLUMN: OAT_DROP. ATExecDropColumn hands the column's address to
- *   performMultipleDeletions (:10116-10125), and every deleted object is
- *   reported with its sub-ID (dependency.c:1270-1271);
- * - OAT_POST_ALTER: RENAME COLUMN (renameatt_internal, :4020), ALTER COLUMN
- *   TYPE (ATExecAlterColumnType, :16101, in every case, also when the new
- *   type is binary coercible and nothing is rewritten), DROP NOT NULL
- *   (:8448), a SET NOT NULL that adds a constraint (:8679; the record
+ *   performMultipleDeletions, and every deleted object is reported with its
+ *   sub-ID (dependency.c, deleteOneObject);
+ * - OAT_POST_ALTER: RENAME COLUMN (renameatt_internal), ALTER COLUMN TYPE
+ *   (ATExecAlterColumnType, in every case, also when the new type is binary
+ *   coercible and nothing is rewritten), DROP NOT NULL (ATExecDropNotNull),
+ *   a SET NOT NULL that adds a constraint (ATExecSetNotNull; the record
  *   table's columns have one, so it changes nothing and is not reported),
- *   ADD, SET and DROP IDENTITY (:8962, :9076, :9180),
- *   SET and DROP EXPRESSION (:9368, :9485), SET STATISTICS (:9651), SET and
- *   RESET of attribute options (:9764), SET STORAGE (:9879) and SET
- *   COMPRESSION (:20110).
+ *   ADD, SET and DROP IDENTITY (ATExecAddIdentity, ATExecSetIdentity,
+ *   ATExecDropIdentity), SET and DROP EXPRESSION (ATExecSetExpression,
+ *   ATExecDropExpression), SET STATISTICS (ATExecSetStatistics), SET and
+ *   RESET of attribute options (ATExecSetOptions), SET STORAGE
+ *   (ATExecSetStorage) and SET COMPRESSION (ATExecSetCompression).
  * A new column default is reported differently, as OAT_POST_CREATE of
  * (pg_attrdef, the table's OID, the column number), by StoreAttrDefault
- * (pg_attrdef.c:143-144), which every route to a default goes through; that
- * is refused as well. DROP DEFAULT then never finds a default to drop.
+ * (pg_attrdef.c), which every route to a default goes through; that is
+ * refused as well. DROP DEFAULT then never finds a default to drop.
  *
  * Dropping the whole table, or the extension, reports the table with sub-ID
  * 0 and no column: a column is deleted as an object of its own only when it
  * is the original target or depends on another object being dropped
- * (dependency.c:836-846 skips a table's own columns when collecting what
- * depends on the table). The record table's columns depend on nothing: their
+ * (dependency.c, findDependentObjects, skips a table's own columns when
+ * collecting what depends on the table). The record table's columns depend on nothing: their
  * types are pinned, they have no collation, and this function refuses
  * whatever could add a dependency (protection.sql checks pg_depend).
  *
@@ -1978,12 +1980,12 @@ protectRecordTableColumns(ObjectAccessType access, Oid classId, Oid objectId,
  * any block, unless pg_repack_safe.allow_unprotected_drop is set. Any block
  * counts, as for DROP (refuseUnprotectedDrop). ExecuteTruncateGuts fires
  * the BEFORE TRUNCATE triggers of every table it is to truncate, those
- * reached by CASCADE included, before it truncates any
- * (tablecmds.c:2163-2181), and it has two callers: the TRUNCATE command
- * (tablecmds.c:2003) and the logical replication apply worker
- * (worker.c:3803). The apply worker does not pass truncate_check_rel, the
- * one place that reports OAT_TRUNCATE (tablecmds.c:2460), which is why this
- * is a trigger and not a case of the object access hook.
+ * reached by CASCADE included, before it truncates any, and it has two
+ * callers: the TRUNCATE command (tablecmds.c, ExecuteTruncate) and the
+ * logical replication apply worker (worker.c, apply_handle_truncate). The
+ * apply worker does not pass truncate_check_rel, the one place that reports
+ * OAT_TRUNCATE, which is why this is a trigger and not a case of the object
+ * access hook.
  *
  * In an apply worker the refusal stops the subscription as a refused record
  * does (pg_repack_safe_records_writer_only), and the hint gives the same
@@ -2043,17 +2045,16 @@ pg_repack_safe_records_protected(PG_FUNCTION_ARGS)
  * (pg_repack_safe_records_protected).
  *
  * BEFORE INSERT, row level, enabled ALWAYS. Every row passes
- * ExecBRInsertTriggers first: INSERT and MERGE (nodeModifyTable.c:918-924,
- * ExecInsert, which MERGE's insert action calls at :3929), COPY FROM
- * (copyfrom.c:1331-1335), and logical replication,
- * both the apply worker (execReplication.c:901-906,
- * ExecSimpleRelationInsert) and the initial table synchronization, which
- * is a CopyFrom (tablesync.c:1214-1217). Row level, because the apply
- * worker fires no statement-level insert trigger (neither worker.c nor
- * execReplication.c calls ExecBSInsertTriggers). ALWAYS, because the apply
- * worker runs with session_replication_role = replica (worker.c:5860),
- * under which a trigger enabled any other way does not fire
- * (trigger.c:3504-3508, TriggerEnabled).
+ * ExecBRInsertTriggers first: INSERT and MERGE (nodeModifyTable.c,
+ * ExecInsert, which MERGE's insert action calls from ExecMergeNotMatched),
+ * COPY FROM (copyfrom.c, CopyFrom), and logical replication, both the apply
+ * worker (execReplication.c, ExecSimpleRelationInsert) and the initial
+ * table synchronization, which is a CopyFrom (tablesync.c, copy_table). Row
+ * level, because the apply worker fires no statement-level insert trigger
+ * (neither worker.c nor execReplication.c calls ExecBSInsertTriggers).
+ * ALWAYS, because the apply worker runs with session_replication_role =
+ * replica (worker.c, InitializeLogRepWorker), under which a trigger enabled
+ * any other way does not fire (trigger.c, TriggerEnabled).
  *
  * insertRecord is not refused: heap_insert fires no trigger, and its record
  * is not sent to subscribers either, so what reaches this trigger through
@@ -2067,7 +2068,8 @@ pg_repack_safe_records_protected(PG_FUNCTION_ARGS)
  * subscription applies nothing more, for any table, until an operator
  * excludes the record table from the publication and refreshes the
  * subscription, after which the worker passes over the table's changes
- * (worker.c:2683-2691; t/016_publication.pl, doc/installation.md "Logical
+ * (worker.c, should_apply_changes_for_rel in apply_handle_insert;
+ * t/016_publication.pl, doc/installation.md "Logical
  * Replication"). Raising is the developer's decision: returning NULL here
  * would skip the row and keep the subscription running, but would discard
  * rows without telling anyone.

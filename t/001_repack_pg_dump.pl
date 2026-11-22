@@ -10,8 +10,8 @@
 #
 # With pg_repack_safe preloaded and created, the cases marked "GUARDED"
 # expect pg_dump to fail with the reader guard's error instead. pg_dump reads
-# the table with COPY ... TO stdout (pg_dump.c:2429), which scans the table
-# without the executor (copyto.c:1362, copyto.c:1396), so these cases are
+# the table with COPY ... TO stdout (pg_dump.c, dumpTableData_copy), which scans the table
+# without the executor (copyto.c, DoCopyTo and CopyRelationTo), so these cases are
 # caught by the COPY check in the ProcessUtility hook. pg_dump prints only
 # the primary message, so the SQLSTATE is not pinned here.
 

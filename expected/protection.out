@@ -570,11 +570,11 @@ DROP TRIGGER pg_repack_safe_rewrites_protected ON pg_repack_safe_rewrites;
 SELECT count(*) AS refused FROM pr_t;
 ERROR:  pg_repack_safe cannot use its record table
 DETAIL:  The table "pg_repack_safe_rewrites" does not have both of its triggers, enabled ALWAYS.
-HINT:  Drop and re-create the extension.
+HINT:  Drop and re-create the extension. That discards its records, so do it when no transaction older than the last REPACK (CONCURRENTLY) remains; while the record table holds records the drop needs pg_repack_safe.allow_unprotected_drop.
 REPACK (CONCURRENTLY) pr_t;
 ERROR:  pg_repack_safe cannot use its record table
 DETAIL:  The table "pg_repack_safe_rewrites" does not have both of its triggers, enabled ALWAYS.
-HINT:  Drop and re-create the extension.
+HINT:  Drop and re-create the extension. That discards its records, so do it when no transaction older than the last REPACK (CONCURRENTLY) remains; while the record table holds records the drop needs pg_repack_safe.allow_unprotected_drop.
 DROP EXTENSION pg_repack_safe;
 SELECT count(*) AS passes FROM pr_t;
  passes 
@@ -588,11 +588,11 @@ DROP TRIGGER pg_repack_safe_rewrites_writer_only ON pg_repack_safe_rewrites;
 SELECT count(*) AS refused FROM pr_t;
 ERROR:  pg_repack_safe cannot use its record table
 DETAIL:  The table "pg_repack_safe_rewrites" does not have both of its triggers, enabled ALWAYS.
-HINT:  Drop and re-create the extension.
+HINT:  Drop and re-create the extension. That discards its records, so do it when no transaction older than the last REPACK (CONCURRENTLY) remains; while the record table holds records the drop needs pg_repack_safe.allow_unprotected_drop.
 REPACK (CONCURRENTLY) pr_t;
 ERROR:  pg_repack_safe cannot use its record table
 DETAIL:  The table "pg_repack_safe_rewrites" does not have both of its triggers, enabled ALWAYS.
-HINT:  Drop and re-create the extension.
+HINT:  Drop and re-create the extension. That discards its records, so do it when no transaction older than the last REPACK (CONCURRENTLY) remains; while the record table holds records the drop needs pg_repack_safe.allow_unprotected_drop.
 DROP EXTENSION pg_repack_safe;
 SELECT count(*) AS passes FROM pr_t;
  passes 

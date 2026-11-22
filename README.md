@@ -13,6 +13,9 @@
 Makes PostgreSQL 19's `REPACK (CONCURRENTLY)` safe: a query whose snapshot
 predates the repack gets a retryable error instead of wrong rows.
 
+`REPACK` is a command built into PostgreSQL 19, and this extension guards
+that command. It is not related to the `pg_repack` extension.
+
 </div>
 <!-- markdownlint-enable MD033 MD041 -->
 
@@ -24,7 +27,9 @@ PostgreSQL 19's `REPACK (CONCURRENTLY)` rewrites a table without blocking
 reads or writes, but it is not MVCC-safe (documented in the `REPACK`
 reference page and in "MVCC caveats"). After it commits, a transaction whose
 snapshot was taken before it committed, and which had not yet touched the
-table, reads the table as **empty**. Nothing raises an error. The same
+table, reads the table as **empty**. (The reference page speaks of
+transactions that started before the repack; a snapshot taken while it runs
+is affected in the same way, and the extension covers both.) Nothing raises an error. The same
 happens to `pg_dump` (a dump with the table's rows missing), to cursors, and
 to logical replication's initial table copy (a subscriber that never gets
 the table's existing rows).
@@ -97,8 +102,11 @@ standby, and the extension created in the database:
 - Reads that do not need an error get none: snapshots taken after the
   repack committed, snapshots that had already read the table (the repack
   waits for them), empty tables, `VACUUM FULL`, `CLUSTER`, plain `REPACK`.
-  One accepted exception: a table whose only rows were inserted after the
-  snapshot and that is then repacked gives a spurious error.
+  Two accepted exceptions, each an error where stock PostgreSQL would have
+  been right: a table whose only rows were inserted after the snapshot and
+  that is then repacked; and a plain `INSERT ... VALUES` into a repacked
+  table from an older snapshot, which reads no rows but is checked like any
+  statement that names the table.
 
 The reproducers that fail on stock PostgreSQL 19 and pass with the
 extension are `demo/demo.sh` (which shows both), and
@@ -165,6 +173,23 @@ records, refreshed by cache invalidation, so the check costs about as much
 as a hash lookup. The design and its evidence are in
 [doc/research/fix-design.md](doc/research/fix-design.md).
 
+Measured on PostgreSQL 19.0 built with optimisation and without assertions,
+with select-only `pgbench` (prepared statements, scale 10, three 10-second
+runs each, 14-core arm64 machine):
+
+| | 1 client | 8 clients |
+|---|---|---|
+| without the library | 17,610 tps | 61,200 tps |
+| library and extension, no records | 17,470 tps | 61,330 tps |
+| a record for the table being read | 17,100 tps | 61,000 tps |
+
+That is at most about 3%, or under 2 microseconds a query, with one client,
+where the baseline's own runs differed by 7%; with eight clients the
+difference is within run-to-run noise. It is one machine and the workload
+where a fixed per-query cost shows most. Each `REPACK (CONCURRENTLY)` also
+makes every backend reload its copy of the records once, which is a scan of
+a table that holds a handful of rows.
+
 `COPY partitioned_table TO` is run as `COPY (SELECT columns FROM
 partitioned_table) TO`, in every database of a server with the library
 loaded, so that the check covers exactly the partitions that are read. The
@@ -191,7 +216,9 @@ until the table is excluded and the subscription refreshed
 (`t/016_publication.pl`; see "Logical Replication" in
 [doc/installation.md](doc/installation.md)).
 
-The record table is protected:
+The record table is protected against accidents. Its owner and superusers
+can still defeat the protection deliberately, for example by replacing one
+of its trigger functions:
 
 - Each `REPACK (CONCURRENTLY)` adds one or two records and deletes every
   older one, so the table stays small. A deleted record still protects: it
@@ -243,6 +270,19 @@ CREATE EXTENSION pg_repack_safe;
 ```
 
 See [doc/installation.md](doc/installation.md).
+
+## Outlook
+
+Raising an error for older snapshots was proposed on pgsql-hackers while
+`REPACK (CONCURRENTLY)` was being developed, and was not adopted: one
+session's `REPACK` would make other sessions fail. This extension is that
+trade, offered to those who prefer an error to a wrong result.
+
+A patch that makes `REPACK (CONCURRENTLY)` MVCC-safe, so that nobody gets an
+error or a wrong result, is under review for PostgreSQL 20. It is not
+committed, and patches under review are sometimes postponed or dropped, so
+do not plan on it. PostgreSQL 19 will not get it either way. The history,
+with its sources, is in [doc/research/history.md](doc/research/history.md).
 
 ## Known gaps
 

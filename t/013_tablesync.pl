@@ -7,8 +7,8 @@
 #
 # The table sync worker runs, on a replication connection to the publisher,
 # BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ, then creates its slot with
-# SNAPSHOT 'use' (tablesync.c:1414-1431), then copies the table with
-# COPY ... TO (tablesync.c:1113). If REPACK (CONCURRENTLY) commits after the
+# SNAPSHOT 'use' (tablesync.c, LogicalRepSyncTableStart), then copies the table with
+# COPY ... TO (tablesync.c, copy_table). If REPACK (CONCURRENTLY) commits after the
 # slot's snapshot and before the COPY takes its lock, stock PostgreSQL copies
 # no rows and the subscriber's table stays without its initial rows.
 #

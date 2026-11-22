@@ -20,7 +20,7 @@
 # - reads through a view, an inlined set-returning SQL function, a parallel
 #   plan, and the parent of a repacked partition (open question 7): each
 #   puts the repacked relation in the range table the check reads. Parallel
-#   workers are launched on the first ExecGather call (nodeGather.c:152-182),
+#   workers are launched on the first ExecGather call (nodeGather.c, ExecGather),
 #   after the leader's ExecutorStart has run the check.
 # Accepted spurious errors (fix-design.md section 6b), pinned:
 # - rows inserted into an empty table after the snapshot, then REPACK (16):

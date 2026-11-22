@@ -75,8 +75,10 @@ $h = sleeper('BEGIN', 'SELECT 1', 'SELECT count(*) FROM other, pg_sleep(30)',
 ($ret, $stdout, $stderr) = repack(0);
 isnt($ret, 0, 'later statement of a transaction: counted, REPACK refused');
 like($stderr, $refusal, 'later statement of a transaction: the refusal');
-like($stderr, qr/Process \d+, whose transaction started at/,
-    'the refusal names the process');
+like($stderr, qr/DETAIL:  A session in this database would get a serialization failure/,
+    'the refusal says why');
+unlike($stderr, qr/Process \d+|started at/,
+    'the refusal does not identify the session, which pg_stat_activity may hide from this user');
 
 # The threshold: the same transaction counts once it is old enough.
 ($ret, $stdout, $stderr) = repack("'1h'");

@@ -1,5 +1,5 @@
 # pg_repack_safe extension
-comment = 'Makes REPACK (CONCURRENTLY) safe: old snapshots get an error instead of wrong rows'
+comment = 'Makes the built-in REPACK (CONCURRENTLY) safe: old snapshots get an error instead of wrong rows'
 default_version = '1.0.0'
 module_pathname = '$libdir/pg_repack_safe'
 relocatable = true

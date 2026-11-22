@@ -1,8 +1,8 @@
 # REPACK (CONCURRENTLY): history and how the wrong results were accepted
 
 Research notes, 2026-11-15. Tags: **[V]** verified against a quoted primary
-source, **[I]** inferred, **[NF]** not found. Git evidence is from the PG19
-tree at /opt/pg19/src (REL_19_STABLE db9095b9026, origin/master to
+source, **[I]** inferred, **[NF]** not found. Git evidence is from the
+PostgreSQL repository (REL_19_STABLE db9095b9026, origin/master to
 2026-11-14). Mail evidence is from the postgresql.org archive; every
 message-id below was read there.
 

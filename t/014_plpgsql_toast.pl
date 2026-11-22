@@ -8,9 +8,9 @@
 #
 # Answered: the values stay correct. In a procedure that may commit,
 # PL/pgSQL detoasts a value before storing it in a variable, since a TOAST
-# pointer can go stale after a commit (pl_exec.c:9009-9020), and the FOR
+# pointer can go stale after a commit (pl_exec.c, assign_simple_var), and the FOR
 # loop's cursor, made holdable at COMMIT, detoasts everything it keeps
-# (portalcmds.c:417-421). Nothing reads the old TOAST relation after the
+# (portalcmds.c, PersistHoldablePortal). Nothing reads the old TOAST relation after the
 # commit, so no reader check is involved.
 
 use strict;

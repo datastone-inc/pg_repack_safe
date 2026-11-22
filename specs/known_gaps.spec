@@ -16,11 +16,11 @@
 # - REFRESH MATERIALIZED VIEW without CONCURRENTLY (open questions 4, 16):
 #   the old snapshot reads the view's new contents, 4 rows instead of the
 #   3 it had when the snapshot was taken. The refresh writes its rows frozen
-#   (matview.c:494, TABLE_INSERT_FROZEN), so every snapshot sees them; the
+#   (matview.c, transientrel_startup, TABLE_INSERT_FROZEN), so every snapshot sees them; the
 #   reference page does not say the command is not MVCC-safe.
 # - The foreign-key check of an INSERT into a table that references a
 #   repacked table: PostgreSQL 19 checks the referenced table's index with
-#   the transaction snapshot outside the executor (ri_triggers.c:2883-2901),
+#   the transaction snapshot outside the executor (ri_triggers.c, ri_FastPathCheck),
 #   so the reader guard does not see the read. The referenced row is
 #   invisible to the old snapshot, and the INSERT fails with a foreign-key
 #   violation (SQLSTATE 23503) instead of a serialization failure. No wrong

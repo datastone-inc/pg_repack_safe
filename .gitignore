@@ -21,6 +21,9 @@
 /expected/regression.out
 
 # Editor and IDE
+# The workspace file and CLAUDE.local.md hold one machine's paths.
+/pg_repack_safe.code-workspace
+/CLAUDE.local.md
 .vscode/
 .idea/
 *.swp

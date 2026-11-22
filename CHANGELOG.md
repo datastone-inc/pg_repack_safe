@@ -85,6 +85,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   standby: delete the records with `pg_repack_safe_prune_records()`, vacuum
   the record table until it is empty, and `DROP EXTENSION` (README,
   "Removing the extension").
+- The optional pre-check's refusal no longer names the other session's
+  process ID and transaction start time, which `pg_stat_activity` hides
+  from users without `pg_read_all_stats`; its hint points there instead.
 - `demo/demo.sh`: four scenarios (a report, an `UPDATE`, a `DELETE`, a
   `pg_dump`) run
   on a throwaway server without and then with the extension, showing the

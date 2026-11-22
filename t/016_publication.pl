@@ -199,7 +199,7 @@ is($subscriber->safe_psql('postgres', 'SELECT count(*) FROM other'),
 
 # Step 2, on the subscriber: refresh the subscription, which drops the
 # record table from it. The apply worker then passes over that table's
-# changes (worker.c:2683-2691, should_apply_changes_for_rel) and goes on.
+# changes (worker.c, should_apply_changes_for_rel) and goes on.
 $subscriber->safe_psql('postgres',
     'ALTER SUBSCRIPTION sub REFRESH PUBLICATION');
 $publisher->wait_for_catchup('sub');
@@ -233,7 +233,7 @@ is($subscriber->safe_psql('postgres', 'SELECT count(*) FROM victim'),
 # The initial table synchronization. The publisher's record table now holds
 # records, and a second publication includes it. A subscription to that one,
 # from another database of the subscriber, copies the record table with
-# COPY ... FROM (tablesync.c:1214-1217), which the trigger refuses as well.
+# COPY ... FROM (tablesync.c, copy_table), which the trigger refuses as well.
 $publisher->safe_psql('postgres',
     'CREATE PUBLICATION pub_sync FOR ALL TABLES');
 $subscriber->safe_psql('postgres', 'CREATE DATABASE sync');
@@ -292,7 +292,7 @@ is($subscriber->safe_psql('sync', q{
     '0', 'after the refresh, the record table is not in the subscription');
 
 # A replicated TRUNCATE. The apply worker truncates without the TRUNCATE
-# command's checks (worker.c:3803 calls ExecuteTruncateGuts directly), so
+# command's checks (worker.c, apply_handle_truncate, calls ExecuteTruncateGuts directly), so
 # only the record table's BEFORE TRUNCATE trigger stands between a
 # publisher's TRUNCATE of its record table and a subscriber's records.
 # A third subscription, in another database of the subscriber, takes the

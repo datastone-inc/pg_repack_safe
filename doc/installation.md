@@ -185,6 +185,14 @@ to the hooks of libraries loaded before it: it must not run at all.
 Libraries loaded before it also see `COPY partitioned_table TO` in the form
 it is run in, `COPY (SELECT ...) TO` (README, "How it works").
 
+A library listed after `pg_repack_safe` in `shared_preload_libraries` sees
+every statement first, the refused ones included. So list `pg_repack_safe`
+before an audit or statistics library that should record refused attempts:
+
+```
+shared_preload_libraries = 'pg_repack_safe, pg_stat_statements'
+```
+
 It registers a custom WAL resource manager with ID 149, reserved for
 `pg_repack_safe` on the PostgreSQL wiki
 ([CustomWALResourceManagers](https://wiki.postgresql.org/wiki/CustomWALResourceManagers)).

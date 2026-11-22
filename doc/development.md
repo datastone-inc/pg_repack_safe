@@ -109,4 +109,4 @@ make PG_CONFIG=/path/to/pg19/bin/pg_config install installcheck
 ```
 
 Every SQL example in the documentation has a matching test in
-`sql/doc_examples.sql` (see `project_template.md`).
+`sql/doc_examples.sql`, headed by the document and section it comes from.
