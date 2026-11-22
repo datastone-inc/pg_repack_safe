@@ -40,6 +40,18 @@ make installcheck
 
 A failing run leaves `regression.diffs` in the repository root.
 
+## Continuous Integration
+
+`.github/workflows/ci.yml` runs on every push and pull request:
+
+- PostgreSQL 19 from the apt.postgresql.org packages, built with gcc on
+  x86_64 and arm64, with `make WERROR=1`, then `make installcheck`.
+
+Weekly, and on request, it also builds the tip of PostgreSQL's
+`REL_19_STABLE` branch from source with clang, assertions and injection
+points, and runs the suites against it. The extension relies on server
+internals, and this is where a change in them shows up first.
+
 `make installcheck` runs three suites. None of them uses the server that
 `PGHOST`/`PGPORT` point at; each starts its own instances from the installed
 binaries.

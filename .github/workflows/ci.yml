@@ -1,0 +1,130 @@
+# Copyright (c) 2026 dataStone Inc.
+# SPDX-License-Identifier: MIT
+#
+# Build the extension and run its three test suites (pg_regress, isolation,
+# TAP) against PostgreSQL 19.
+#
+# - packages: PostgreSQL 19 from apt.postgresql.org, built with gcc, on
+#   x86_64 and arm64, with warnings as errors (make WERROR=1).
+# - upstream: the tip of REL_19_STABLE built from source with clang,
+#   assertions and injection points, weekly and on request, to learn of
+#   server changes before a minor release ships them. PGXS hands an
+#   extension the compiler flags its server was built with, so clang is
+#   tested against a server built with clang.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  packages:
+    if: github.event_name != 'schedule'
+    name: PG 19 packages, ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL 19
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-19 postgresql-server-dev-19 \
+              libipc-run-perl
+          echo /usr/lib/postgresql/19/bin >> "$GITHUB_PATH"
+
+      # make install and make installcheck (which installs two test-only
+      # modules) write into the server's directories.
+      - name: Let the runner install into the PostgreSQL directories
+        run: |
+          sudo chown -R "$USER" "$(pg_config --pkglibdir)" \
+              "$(pg_config --sharedir)/extension"
+
+      - name: Build
+        run: |
+          pg_config --version
+          make WERROR=1
+          make WERROR=1 install
+
+      - name: Test
+        run: make WERROR=1 installcheck
+
+      - name: Keep the test output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-${{ matrix.runner }}
+          if-no-files-found: ignore
+          path: |
+            regression.diffs
+            regression.out
+            results/
+            output_iso/
+            tmp_check/log/
+
+  upstream:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    name: REL_19_STABLE from source, clang, assertions
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang bison flex \
+              pkg-config libreadline-dev zlib1g-dev libicu-dev \
+              libipc-run-perl
+
+      - name: Build PostgreSQL
+        run: |
+          git clone --depth 1 --branch REL_19_STABLE \
+              https://github.com/postgres/postgres.git "$RUNNER_TEMP/postgres"
+          cd "$RUNNER_TEMP/postgres"
+          git log -1 --format='%H %cd %s'
+          ./configure CC=clang --prefix="$HOME/pg19" --enable-cassert \
+              --enable-debug \
+              --enable-tap-tests --enable-injection-points
+          make -j"$(nproc)" -s
+          make -s install
+          make -s -C contrib/pageinspect install
+          make -s -C contrib/pg_stat_statements install
+          echo "$HOME/pg19/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: |
+          pg_config --version
+          make
+          make install
+
+      - name: Test
+        run: make installcheck
+
+      - name: Keep the test output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-upstream
+          if-no-files-found: ignore
+          path: |
+            regression.diffs
+            regression.out
+            results/
+            output_iso/
+            tmp_check/log/
