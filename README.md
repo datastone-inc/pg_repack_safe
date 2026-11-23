@@ -501,11 +501,11 @@ in a new transaction gets past, and each says why the guard cannot tell.
 ### Contrib functions the guard does not see
 
 The guard checks the tables a query's plan reads and the table
-`COPY ... TO` names. Two contrib functions read a table that is neither:
-they take it as an argument and scan it themselves with the transaction's
-snapshot. Called with a snapshot that does not see a committed
-`REPACK (CONCURRENTLY)` of that table, they see no rows in it and return a
-wrong answer with no error:
+`COPY ... TO` names. Functions of two contrib modules read a table that is
+neither: they take the table, or one of its indexes, as an argument and
+read the table themselves with the transaction's snapshot. Called with a
+snapshot that does not see a committed `REPACK (CONCURRENTLY)` of that
+table, they see no rows in it and return a wrong answer with no error:
 
 - **`pgrowlocks('t')`** reports no row locks, whatever rows are locked
   (`contrib/pgrowlocks/pgrowlocks.c`, `pgrowlocks`).
@@ -514,12 +514,18 @@ wrong answer with no error:
   heap row to look up in the index, so they report success without having
   verified that any row is indexed (`contrib/amcheck/verify_nbtree.c`,
   `bt_check_every_level`).
+- **`bt_index_check(index, false, true)`**, that is with `checkunique`, and
+  `bt_index_parent_check` with the same option compare only the index
+  entries of rows the snapshot sees. They see none, compare nothing, and
+  report success for a unique index that holds duplicates
+  (`contrib/amcheck/verify_nbtree.c`, `heap_entry_is_visible`).
 
-Neither returns the table's rows, and a call in a new transaction is not
+None of them returns the table's rows, and a call in a new transaction is not
 affected. A query of the same table in the same transaction gets the
 guard's error. PostgreSQL has no hook on a table scan, so the guard cannot
 see these reads; no other function in PostgreSQL 19 or its contrib modules
-scans a table this way (`t/019_contrib_readers.pl`).
+reads a table this way (`t/019_contrib_readers.pl`; the census is in
+`doc/research/fix-design.md`, step 12).
 
 ### Standby errors caused by pg_repack_safe (without `hot_standby_feedback`)
 

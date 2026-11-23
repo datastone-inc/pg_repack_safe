@@ -934,6 +934,64 @@ order unless noted.
   foreign-key violation (23503) instead of 40001. Not wrong rows; pinned as
   a known gap. Q1, Q2, Q3 and Q6: see the questions. README "Known gaps"
   lists each with its test.
+  Census repeated on 2026-11-23 over `src/backend`, `src/pl` and `contrib`
+  of PostgreSQL 19.0, by every caller of the table and index scan and fetch
+  functions (`table_beginscan*`, `index_beginscan*`,
+  `table_index_fetch_begin`, `table_tuple_fetch_row_version`,
+  `table_tuple_satisfies_snapshot`, `table_index_build_scan`,
+  `table_index_build_range_scan`, `table_index_validate_scan`,
+  `table_tuple_get_latest_tid`, `HeapTupleSatisfies*`) outside the executor's
+  plan nodes, and every use of `GetTransactionSnapshot()` and
+  `GetActiveSnapshot()` outside the executor, SPI and the portal code. A
+  user table is read with a snapshot that can predate a committed
+  `REPACK (CONCURRENTLY)` in four places:
+  - `ri_triggers.c (ri_FastPathCheck)`, the foreign-key fast path above;
+  - `contrib/pgrowlocks/pgrowlocks.c (pgrowlocks)`, with the active snapshot;
+  - `contrib/amcheck/verify_nbtree.c (bt_check_every_level)` with
+    `heapallindexed`, which registers the transaction snapshot and passes it
+    to `table_index_build_scan`;
+  - `contrib/amcheck/verify_nbtree.c (heap_entry_is_visible)` with
+    `checkunique`, which fetches the heap tuple of each index entry with the
+    transaction snapshot. Found by this census; reproduced by marking a
+    non-unique index unique in pg_index after the REPACK: a new snapshot
+    gets "index uniqueness is violated", the old snapshot gets success.
+
+  The last three are the README's "Contrib functions the guard does not
+  see", pinned by `t/019_contrib_readers.pl`. The other callers, by the
+  snapshot they use:
+  - a snapshot taken after the caller's lock: `tablecmds.c (ATRewriteTable,
+    validateForeignKeyConstraint)`, `typecmds.c
+    (validateDomainNotNullConstraint, validateDomainCheckConstraint)`,
+    `partbounds.c (check_default_partition_contents)`, `index.c
+    (IndexCheckExclusion)`,
+    `tid.c (currtid_internal)`, all with `GetLatestSnapshot()`;
+  - index builds: `heapam_handler.c (heapam_index_build_range_scan)` and the
+    parallel builds in `nbtsort.c`, `gininsert.c` and `brin.c` use
+    `SnapshotAny` unless `ii_Concurrent` is set, and the transaction
+    snapshot when it is. `ii_Concurrent` is set by `index.c
+    (index_concurrently_build, validate_index)`, which run under
+    CREATE INDEX CONCURRENTLY and REINDEX CONCURRENTLY, neither allowed in a
+    transaction block, and by amcheck (above). `brin.c (summarize_range)`
+    does not set it;
+  - `SnapshotAny`, `SnapshotSelf` or a dirty snapshot: `trigger.c`,
+    `constraint.c (unique_key_recheck)`, `nbtinsert.c (_bt_check_unique)`,
+    `execIndexing.c`, `execReplication.c`, `execMain.c
+    (EvalPlanQualFetchRowMark)`, `contrib/pgstattuple`;
+  - `HeapTupleSatisfiesVacuum`, no snapshot: `contrib/pgstattuple
+    (pgstatapprox.c)`, `contrib/pg_visibility`; `contrib/amcheck
+    (verify_heapam.c)` takes only the snapshot's xmin;
+  - statistics: `analyze.c`, `selfuncs.c (get_actual_variable_endpoint)`
+    with `SnapshotNonVacuumable`;
+  - catalogs only, which `REPACK (CONCURRENTLY)` refuses (`repack.c
+    (check_concurrent_repack_requirements)`): `inv_api.c` (large objects,
+    with the active snapshot), `acl.c`, `pg_inherits.c`, `partdesc.c`,
+    `ruleutils.c`;
+  - `copyto.c (CopyRelationTo)` with the active snapshot, which the COPY check
+    covers.
+
+  Not covered by the census: code outside the PostgreSQL tree (other
+  extensions' direct `table_beginscan`), and the contrib modules that read
+  pages without a snapshot (`pageinspect`, `pg_surgery`, `pg_prewarm`).
 - [x] **13. Productize.** README guarantees and non-guarantees, installation
   and standby requirements, `doc_examples`, hook audit, an optimised-build
   benchmark, the resource manager ID claim.
