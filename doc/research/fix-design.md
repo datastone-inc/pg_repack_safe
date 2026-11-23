@@ -4,10 +4,8 @@ Research notes, 2026-11-15, against PostgreSQL REL_19_STABLE at db9095b9026
 (19rc2 plus 42 commits; five commits short of 19.0, none in the code cited).
 Tags: **[V]** read in the code, **[I]** inferred and needs a reproducer,
 **[R]** confirmed by this repo's tests. Source references name the file and,
-in parentheses, the function. **Status: direction chosen 2026-11-15 (record-based reader guard,
-see "Design direction"); step 0 of the implementation plan (skeleton and
-probes) is built, the guard itself is not; several points still await the
-developer's confirmation.**
+in parentheses, the function. **Status: direction chosen 2026-11-15
+(record-based reader guard, see "Design direction").
 
 ## Bottom line
 
@@ -28,12 +26,18 @@ developer's confirmation.**
    see as committed. This is the `relcheckxmin` idea rejected for core in
    2026-02 (see [history.md](history.md) §3), with an extension-owned record
    in place of a catalog column.
-5. **Refusing REPACK alone is rejected.** Its misses are silent wrong rows, and
-   by §2 it would refuse almost always on a busy database.
+5. **Refusing REPACK as the only defence, with no reader-side guard, is
+   rejected.** A refusal has to be decided before commit, and no check before
+   commit can be race-free ([§3](#3-timing)): a snapshot taken after the check
+   still sees an empty table, and nothing else catches it. And because any
+   snapshot at all counts as old ([§2](#2-writer-side-detecting-an-older-snapshot-exists)),
+   a check strict enough to be correct would refuse almost every time on a
+   busy database.
 
 ## 1. Mechanism
 
 **REPACK CONCURRENTLY** [V]
+
 - Takes ShareUpdateExclusiveLock (`repack.c (RepackLockLevel)`), starts the decoding
   worker, copies with the worker's exported historic snapshot
   (`repack.c (rebuild_relation)`, `get_initial_snapshot`;
@@ -52,9 +56,10 @@ developer's confirmation.**
   t's pg_class xmin becomes the REPACK XID.
 - The backend gets its XID after the initial snapshot (comment
   `repack.c (ExecRepack)`).
-- A reader acquiring its lock runs `AcceptInvalidationMessages` (`lmgr.c:~133`)
+- A reader acquiring its lock runs `AcceptInvalidationMessages` (`lmgr.c (LockRelationOid)`)
   and moves to the new relfilenode; old files are unlinked after locks are
-  released (`xact.c` CommitTransaction ~2447 / ~2490).
+  released (`xact.c (CommitTransaction)`: `smgrDoPendingDeletes` follows
+  the lock release).
 
 **TRUNCATE** [V]: AccessExclusiveLock up front (`tablecmds.c (ExecuteTruncate)`), then
 `RelationSetNewRelfilenumber` (`tablecmds.c (ExecuteTruncateGuts)`; `relcache.c (RelationSetNewRelfilenumber)`). The
@@ -79,15 +84,20 @@ freezing only below FreezeLimit ≤ OldestXmin (`vacuum.c (vacuum_get_cutoffs)`;
 need rows VACUUM FULL dropped as DEAD, with no conflict to cancel its query.
 
 **Other wrong-results modes in REPACK CONCURRENTLY**
+
 - Logical replication initial sync: tablesync uses a USE_SNAPSHOT slot snapshot
   (`walsender.c (CreateReplicationSlot)`) then COPYs; if REPACK commits in between, the
-  subscriber's initial copy is empty and the rows are lost for good. [I]
+  subscriber's initial copy is empty and the rows are lost for good. [R]
+  `t/013_tablesync.pl`, which runs the sync worker's commands on a replication
+  connection rather than through a subscription; it fails on stock PG19.
 - Hot standby: standby snapshots taken before commit replay see the table
-  empty; the primary cannot see them. [I]
-- Swap-time lock upgrade (`repack.c (rebuild_relation_finish_concurrent)`): readers queue behind it and are
-  victims if their snapshot predates the commit. [R]
-- Serializable: predicate locks promoted at swap (`repack.c (rebuild_relation_finish_concurrent)`); no
-  extra hazard seen. [V]
+  empty; the primary cannot see them. [R] with the guard bypassed (step 5's
+  reverted cleanup design; the `t/017` mutation run); no stock-only test.
+  Guarded: `t/007_standby_reader.pl`, `t/017_standby_record_cleanup.pl`.
+- Swap-time lock upgrade (`repack.c (rebuild_relation_finish_concurrent)`): readers
+  queue behind it and are victims if their snapshot predates the commit. [R]
+- Serializable: predicate locks promoted at swap (`repack.c
+  (rebuild_relation_finish_concurrent)`); no extra hazard seen. [V]
 - TOAST re-toasted with new value OIDs (`repack.c (copy_table_data)`); open risk is a
   detoast-later pointer held across a procedure COMMIT. [I, low]
 - Rejected targets: catalogs, user_catalog_table, TOAST, unlogged/temp,
@@ -109,7 +119,7 @@ need rows VACUUM FULL dropped as DEAD, with no conflict to cancel its query.
 - hot_standby_feedback gives only an aggregate xmin; standbys without it are
   invisible. **The writer side cannot cover standbys.**
 - Prepared transactions hold no snapshot (`twophase.c (MarkAsPreparingGuts)`); not victims.
-- WITH HOLD cursors are materialized in `PreCommit_Portals` (`xact.c:~2327`)
+- WITH HOLD cursors are materialized in `PreCommit_Portals` (`xact.c (CommitTransaction)`)
   while locks are held: safe. Plain cursors calling functions that open other
   relations later are victims. [R] `specs/repack_concurrently_cursor.spec`.
 - Nothing records whether a snapshot will touch t; PGPROC does not even record
@@ -118,21 +128,23 @@ need rows VACUUM FULL dropped as DEAD, with no conflict to cancel its query.
 ## 3. Timing
 
 - Dangerous set: snapshots taken before the rewriter's `ProcArrayEndTransaction`
-  (`xact.c:~2447`) that later read t under a lock acquired after the rewriter
+  (`xact.c (CommitTransaction)`) that later read t under a lock acquired after the rewriter
   released AccessExclusiveLock. [V, R]
 - A check at ProcessUtility start misses snapshots taken during the copy and
   at the swap. [R]
 - No pre-commit check is race-free: snapshots taken between the check and
   commit are dangerous, and an extension cannot hold ProcArrayLock across
-  commit. Latest usable points: `XACT_EVENT_PRE_COMMIT` (`xact.c (CommitTransaction)`) and
-  `OAT_POST_ALTER` in `swap_relation_files` (`repack.c (swap_relation_files)`), both with a
-  window, the latter after all the work.
-- `XACT_EVENT_COMMIT` (`xact.c:~2467`) is after commit visibility but before
-  lock release; waiting there and cancelling queued victims would close the
-  window on the primary, but it runs under `HOLD_INTERRUPTS`, cannot ERROR,
-  and cannot use the deadlock detector. Not recommended.
+  commit. Latest usable points: `XACT_EVENT_PRE_COMMIT` (`xact.c
+  (CommitTransaction)`) and `OAT_POST_ALTER` in `swap_relation_files` (`repack.c
+  (swap_relation_files)`), both with a window, the latter after all the work.
+- `XACT_EVENT_COMMIT` (`xact.c (CommitTransaction)`) is after commit visibility
+  but before lock release; waiting there and cancelling queued victims would
+  close the window on the primary, but it runs under `HOLD_INTERRUPTS`, cannot
+  ERROR, and cannot use the deadlock detector. Not recommended.
 - A CIC-style wait before commit is correct when it ends in a deadlock error
-  but can livelock as new snapshots keep appearing. [I]
+  but can livelock as new snapshots keep appearing. [I] (CIC is `CREATE INDEX
+  CONCURRENTLY`, which before finishing waits for every transaction whose
+  snapshot predates its own: `WaitForOlderSnapshots`, §2.)
 
 ## 4. Hook points
 
@@ -161,6 +173,7 @@ Same dangerous set. Taking AccessExclusiveLock immediately only protects
 readers that already touched t. The record-based guard (§6b) covers them only
 if their writers also write a record. Proposed decision 4 leaves them
 unrecorded for now. What recording them would take:
+
 - Heap storage is replaced in exactly five places [V]: the two `cluster_rel`
   swaps (`repack.c (rebuild_relation)` non-concurrent, `repack.c (rebuild_relation_finish_concurrent)` concurrent), ALTER
   rewrite (`tablecmds.c (ATRewriteTables)`), REFRESH MATERIALIZED VIEW (`matview.c (refresh_by_heap_swap)`),
@@ -217,12 +230,13 @@ Rejected 2026-11-15 for two reasons:
 
 ### 6b. Chosen variant: unsafe-rewrite record (candidate G)
 
-Nothing here is prototyped; every step is [I] unless tagged.
+Nothing here is prototyped at the time of design; every step is [I] unless tagged.
 
 **Writer.** When REPACK (CONCURRENTLY) swaps a table, insert a row
 (table OID, rewriter XID) into an extension-owned table, in the rewriter's own
 transaction. The row aborts with the rewrite, survives a crash, and reaches
 standbys through WAL.
+
 - Detection: `ProcessUtility_hook` sees `T_RepackStmt` with the concurrently
   option and sets a backend-local flag; `OAT_POST_ALTER` in
   `swap_relation_files` (`repack.c (swap_relation_files)`) supplies the table OID at the swap.
@@ -240,6 +254,7 @@ standbys through WAL.
 **Reader.** Same interception points as above (ExecutorStart after calling
 through, ProcessUtility for COPY TO). Per RTE_RELATION with storage, after the
 lock is held, snapshot S:
+
 1. Fast path: if the record table has zero blocks, pass.
 2. Scan the record table with `SnapshotAny` (deleted rows included) for the
    table OID.
@@ -277,12 +292,14 @@ any storage change it did not recognise. This variant is silent on any rewrite
 the writer side did not record, so safety rests on the writer census above.
 Reason: the developer ruled spurious errors on MVCC-safe rewrites and new
 tables unacceptable (2026-11-15). Remaining fail-open cases:
+
 - library never loaded in the primary backend that runs REPACK: it runs
   unrecorded, and an unloaded library cannot check for itself (a backend
   that loaded it other than through `shared_preload_libraries` refuses,
   step 9; `t/009_not_preloaded.pl` pins the rest);
-- library not loaded on a standby: closed by the WAL record (step 10), which
-  stops its replay, except for open question 17;
+- library not loaded on a standby: a misconfiguration, which can give wrong
+  results; the WAL record (step 10) stops its replay as a best-effort
+  safeguard, missing the case of research question 17;
 - readers that bypass the executor and COPY;
 - binary-upgrade mode (below).
 
@@ -300,12 +317,13 @@ survives the upgrade. The refusal for a non-empty record table is not
 exempted.
 
 The mode is a postmaster option, not a pg_upgrade private: `-b` sets
-`IsBinaryUpgrade` (`postmaster.c (PostmasterMain)`), so an operator can start any cluster
-with `pg_ctl start -o "-b"`, and then the exemption lasts as long as that
+`IsBinaryUpgrade` (`postmaster.c (PostmasterMain)`), so an operator can start
+any cluster with `pg_ctl start -o "-b"`, and then the exemption lasts as long as that
 server runs and applies to TCP connections too, if the configuration allows
 them.
 
 The exemption cannot hide an unsafe rewrite, for two reasons:
+
 - The ProcessUtility hook refuses REPACK (CONCURRENTLY) when the extension
   exists and its record table cannot be found, with no binary-upgrade
   exemption (`reader_check` regression test; `t/003_pg_upgrade.pl` on a
@@ -313,8 +331,8 @@ The exemption cannot hide an unsafe rewrite, for two reasons:
   locks the record table, so it is still in place at the swap.
 - Stock PostgreSQL refuses to create the new heap in binary-upgrade mode
   unless its OID was preset: "pg_class heap OID value not set when in binary
-  upgrade mode" (`heap.c (heap_create_with_catalog)`), seen in `t/003_pg_upgrade.pl` when
-  REPACK (CONCURRENTLY) ran under `-b` with the record table present. A
+  upgrade mode" (`heap.c (heap_create_with_catalog)`), seen in `t/003_pg_upgrade.pl`
+  when REPACK (CONCURRENTLY) ran under `-b` with the record table present. A
   superuser can preset the OIDs with the `binary_upgrade_set_next_*`
   functions, so this alone is not a guarantee.
 
@@ -324,6 +342,7 @@ Answers from source reading; [R] marks those since confirmed by a probe in
 this repo, the rest are [I].
 
 Probe results, 2026-11-15, skeleton library `src/pg_repack_safe.c`:
+
 - **Q13, Q9 [R]** `sql/storage_change.sql`: the hook reports exactly one
   storage replacement for VACUUM FULL, CLUSTER, REPACK, REPACK
   (CONCURRENTLY) in three option spellings, rewriting ALTER TABLE and
@@ -353,12 +372,12 @@ Probe results, 2026-11-15, skeleton library `src/pg_repack_safe.c`:
   sends a relcache invalidation for the record table when it inserts a
   record; a reader processes it when it acquires its lock on the rewritten
   table, which is the same path by which it learns the new relfilenode
-  (`lmgr.c:~133`). The flag starts unset in every new backend and is cleared
+  (`lmgr.c (LockRelationOid)`). The flag starts unset in every new backend and is cleared
   on any invalidation reset. Needs the writer, then an isolation test and a
   standby test that a stale flag cannot pass a reader.
 
 - **Recognising the swap (Q13).** `swap_relation_files` updates pg_class
-  (`repack.c:~1855`) and fires the hook (`repack.c (swap_relation_files)`) with no
+  (`CatalogTupleUpdateWithInfo`) and fires the hook (`repack.c (swap_relation_files)`) with no
   `CommandCounterIncrement` between. In the hook the syscache still returns
   the pre-swap row, and a `SnapshotSelf` scan of pg_class returns the new one.
   "The two relfilenodes differ" identifies a storage change by meaning, at
@@ -373,7 +392,7 @@ Probe results, 2026-11-15, skeleton library `src/pg_repack_safe.c`:
   follows the rewriter's XID R. The reader scans with `SnapshotAny`, so it
   needs the row physically present, not live. On the primary, VACUUM keeps a
   deleted row while its deleter does not precede OldestXmin
-  (`heapam_visibility.c (HeapTupleSatisfiesVacuum)`, `1329`), and a snapshot that does not see R
+  (`heapam_visibility.c (HeapTupleSatisfiesVacuum)`), and a snapshot that does not see R
   has xmin <= R. On a standby, the removal replays with a recovery conflict
   only up to the logged horizon, and that horizon ignores a row deleted by
   its inserting transaction (`heapam.c (HeapTupleHeaderAdvanceConflictHorizon)`): such a removal cancels
@@ -407,7 +426,7 @@ Probe results, 2026-11-15, skeleton library `src/pg_repack_safe.c`:
   designed: DELETE is harmless (see record
   lifetime). Refuse DROP (`OAT_DROP`), TRUNCATE (`OAT_TRUNCATE`) and any
   rewrite (REPACK, CLUSTER, VACUUM FULL) of the record table; a rewrite drops
-  dead rows a standby may still need (open question 1). A superuser UPDATE of
+  dead rows a standby may still need (research question 1). A superuser UPDATE of
   a record is not defended against.
 - **Cost (Q8).** *Superseded by step 7: each backend keeps a copy of the
   records, and a query does not open the record table.* As first designed:
@@ -418,7 +437,7 @@ Probe results, 2026-11-15, skeleton library `src/pg_repack_safe.c`:
 ## Candidate approaches
 
 | # | Where | Catches | Misses | False positives | Race-free |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | A | ProcessUtility at start: refuse if any other backend in the database has an xmin | snapshots existing at start | snapshots taken during the run; standbys; CASCADE / logrep TRUNCATE | refuses nearly always on a busy database | No |
 | B | `OAT_POST_ALTER` / `OAT_TRUNCATE` / `XACT_EVENT_PRE_COMMIT`: refuse if any other snapshot exists | everything up to the check, all spellings | snapshots between check and commit; standbys | as A, after all the work | No (small window) |
 | C | CIC-style wait before commit under AccessExclusiveLock | victims queued on our lock die by deadlock error | new snapshots during the wait; standbys | waits on unrelated long transactions | No (livelock) |
@@ -430,8 +449,8 @@ Probe results, 2026-11-15, skeleton library `src/pg_repack_safe.c`:
 | I | Custom WAL resource manager record at the swap | standbys without the library (replay stops) | — | halts an unprepared standby | n/a |
 
 Notes on H [I]: REPACK (CONCURRENTLY) cannot run in a transaction block
-(`repack.c (ExecRepack)`), the hook fires under the lock taken at `repack.c (rebuild_relation_finish_concurrent)`, the
-wait list is fetched once and only shrinks (`indexcmds.c:~445`), so the
+(`repack.c (ExecRepack)`), the hook fires under the lock taken at `repack.c (rebuild_relation_finish_concurrent)
+`, the wait list is fetched once and only shrinks (`indexcmds.c (WaitForOlderSnapshots)`), so the
 post-commit set of old snapshots is finite and there is no livelock. Session
 locks are released on abort (`proc.c (ProcReleaseLocks)`). Cost: t is fully locked until the
 oldest pre-commit snapshot ends. H saves no reader that G would error: an
@@ -446,17 +465,20 @@ could raise a recovery conflict (`standby.c (ResolveRecoveryConflictWithSnapshot
 ## Design direction
 
 **Decided by the developer, 2026-11-15**
+
 1. The guarantee is a reader-side error, not a refusal of REPACK.
 2. No spurious errors for MVCC-safe rewrites or for tables created after the
    snapshot. This selects the record-based check (G, §6b) over the pg_class
    check (E), and accepts the principle 1 divergence recorded in §6b.
 3. Take the zero-blocks empty-table exemption and accept the remaining
    spurious error (§6b) as a documented limitation.
-
 4. Record only REPACK (CONCURRENTLY) for now, but build the writer side as
    the general storage-change detector (§5) so TRUNCATE, rewriting ALTER TABLE
    and REFRESH MATERIALIZED VIEW can be switched on later. Until then they
-   keep stock documented behaviour and are listed as known gaps.
+   keep stock documented behaviour and are listed as known gaps. Before any
+   of them is switched on, the writer must handle or refuse PREPARE
+   TRANSACTION: unlike REPACK (CONCURRENTLY), they run in a transaction
+   block (research question 18).
 5. Do not build the commit-then-wait mode (H): it saves no reader that G
    would error and locks the table until old snapshots end. Readers that
    bypass the guarded paths are a known gap with a reproducer. Keep a
@@ -522,7 +544,7 @@ order unless noted.
   commit, `storage.c (RelationDropStorage)`), read through `smgrGetPendingDeletes`. The
   relation's own "created here" flag cannot serve: `swap_relation_files`
   copies the target's `rd_createSubid` onto the transient heap
-  (`repack.c:~1789`), and a probe showed the transient heap recorded under
+  (`repack.c (swap_relation_files)`), and a probe showed the transient heap recorded under
   that rule. The trace NOTICE uses the same rule (developer decision,
   2026-11-16), so it no longer reports CREATE MATERIALIZED VIEW. The old
   storage's blocks are counted through the relation cache, which still
@@ -783,7 +805,7 @@ order unless noted.
 - [x] **10. Standby enforcement.** Custom WAL record at the swap
   (resource manager ID 149). Check: a TAP test in which a standby
   without the library stops replay, and one with it errors the old-snapshot
-  reader. Open question 17 is settled or written up as a known gap.
+  reader. Research question 17 is settled or written up as a known gap.
   Done. The library registers a resource manager (ID 149,
   name `pg_repack_safe`, a no-op redo) when preloaded; registering is only
   possible then (`rmgr.c (RegisterCustomRmgr)`). The writer logs one record per unsafe swap,
@@ -794,8 +816,9 @@ order unless noted.
   the record in the REPACK's transaction, before its commit; a standby with
   the library errors its old snapshot; the primary's crash recovery replays
   the record. Before the record existed, the standby without the library
-  never stopped. Open question 17 is a known gap (developer decision,
-  2026-11-16), see the question.
+  never stopped. Research question 17 was first recorded as a known gap
+  (developer decision, 2026-11-16), and reclassified on 2026-11-23 as wrong
+  results under misconfiguration; see the question.
 - [x] **11. Advisory pre-check.** Refuse REPACK (CONCURRENTLY), under a
   setting, when a snapshot older than a threshold exists. Check: regression
   and isolation tests; documented as best-effort.
@@ -810,7 +833,7 @@ order unless noted.
   for those; at the swap none can), and its transaction is at least that
   old. Single statements are not counted: they lock their plan's relations
   when they start. pg_dump locks every dumped table right after its
-  snapshot (`pg_dump.c:~7725-7745`), so it is waited for, not counted.
+  snapshot (`pg_dump.c (getTables)`), so it is waited for, not counted.
   Over-refusal, documented: later statements of a READ COMMITTED
   transaction count, since the isolation level is not visible. Not seen:
   standbys, background workers, snapshots after the check.
@@ -820,15 +843,16 @@ order unless noted.
   makes `t/011` fail.
 - [x] **12. Known gaps and Group B.** A reproducer and a README entry for
   each: TRUNCATE, rewriting ALTER TABLE, readers that bypass the executor
-  and COPY, and open questions 1-4, 6 and 16.
-  Done. `specs/known_gaps.spec` pins TRUNCATE and a rewriting ALTER TABLE
-  (old snapshot reads 0 rows), REFRESH MATERIALIZED VIEW (Q4, Q16: reads
+  and COPY, and research questions 1-4, 6 and 16.
+  Done. `specs/stock_rewrites.spec` pins TRUNCATE and a rewriting ALTER TABLE
+  (old snapshot reads 0 rows) and REFRESH MATERIALIZED VIEW (Q4, Q16: reads
   the new contents; the refresh inserts frozen rows, `matview.c (transientrel_startup)`;
-  REFRESH CONCURRENTLY is the control), and the foreign-key fast path.
+  REFRESH CONCURRENTLY is the control). `specs/reader_guard_edges.spec`
+  pins the foreign-key fast path, a limit of the guard itself.
   Census of readers outside the executor and COPY: every user-table scan in
   `src/backend` outside the executor either takes a fresh snapshot after
-  its lock (`tablecmds.c (ATRewriteTable)`, `14805`; `tid.c (currtid_internal)`; `partbounds.c (check_default_partition_contents)`;
-  `index.c (IndexCheckExclusion)`), uses a dirty snapshot (`execReplication.c (RelationFindReplTupleByIndex)`, `443`),
+  its lock (`tablecmds.c (ATRewriteTable)`; `tid.c (currtid_internal)`; `partbounds.c (check_default_partition_contents)`;
+  `index.c (IndexCheckExclusion)`), uses a dirty snapshot (`execReplication.c (RelationFindReplTupleByIndex)`),
   or feeds statistics (`selfuncs.c`, `analyze.c`), except the PostgreSQL 19
   foreign-key fast path (`ri_triggers.c (ri_FastPathCheck)`), which scans the
   referenced table's index with the transaction snapshot: after a REPACK
@@ -874,7 +898,6 @@ order unless noted.
     `-Wno-unused-parameter`; and `processUtilityHook` modified `pstmt` and
     `readOnlyTree` before its `PG_TRY` (`-Wclobbered`), so the `PG_TRY`
     moved into `runUtilityAs`, which modifies nothing before its setjmp.
-
   - Measured again on 2026-11-22, on PostgreSQL 19.0 (meson release,
     `-O3`, no assertions) with the code as of the bounded-records change,
     same pgbench settings, over TCP on localhost, means of three runs. 1
@@ -886,7 +909,102 @@ order unless noted.
     Three REPACK (CONCURRENTLY) of a 1000-row table, each deleting the
     previous one's record at its swap, took 5.4, 3.4 and 3.0 ms in all.
 
-## Open questions needing reproducers
+## Review of 2026-11-21
+
+A code walkthrough of the whole repository on 2026-11-21, with publishing to
+the PostgreSQL community as its lens, raised 40 items. Each was fixed or
+accepted, and the README, `doc/installation.md` and the code comments now
+hold their outcomes. This section keeps what the review decided or measured that is
+not written down anywhere else.
+
+**Record table protection.** The README section "How it works" lists the
+refusals, and the functions that enforce them state their invariants.
+
+- No index (`protectRecordTableFromIndex`). The motivating probe: with an
+  index on the record table, after two more REPACK (CONCURRENTLY) a heap
+  scan saw 8 records and an index scan 4, and `max(rewrite_xid)` through the
+  index returned an older XID than the newest record. The removal
+  procedure's check would have under-reported. [R] Rejected alternative:
+  `checkRecordTableDefinition` does not also refuse when the table has an
+  index. The reader guard scans the heap, so a stale index cannot make it
+  wrong, and refusing every query in the database would be out of
+  proportion. A backend that never loaded the library can still create the
+  index; that is the never-loaded-session gap the README already lists.
+- No column changes (`protectRecordTableColumns`). RENAME COLUMN would be
+  harmless on its own. It is refused anyway so that the rule stays one
+  sentence: every column change is refused.
+- Table constraints are allowed (developer decision). `ADD CHECK` and
+  `ADD FOREIGN KEY` are accepted, and the writer's direct `heap_insert`
+  does not enforce them. They cannot change a query result. A foreign
+  key's `ON DELETE CASCADE` cannot delete records (`sql/protection.sql`).
+- Only the writer inserts records (BEFORE INSERT trigger,
+  `pg_repack_safe_records_protected`). Before that trigger existed, a probe
+  with two clusters and `CREATE PUBLICATION ... FOR ALL TABLES` put a
+  publisher's record on a subscriber. There its OID named an unrelated
+  table, which refused every SELECT and INSERT ("transaction ID that has
+  not been assigned") until the subscriber's XID counter passed the
+  record's. Nobody could delete the record.
+
+**COPY of a partitioned table (step 8).** The throughput figure for the
+query form (about 4-7% slower) was measured on a debug (`-O0`) build: 4
+million rows in 8 partitions to `/dev/null`, three runs. Text took
+2357-2403 ms in the relation form and 2468-2488 ms in the query form;
+binary took 1567-1568 ms and 1668-1683 ms. It has not been measured on an
+optimised build. Logical replication's initial sync of a partitioned root
+is the main real user of this path.
+
+**Accepted as they are (developer decisions).**
+
+- A damaged record table (renamed, moved, or missing a trigger) refuses
+  even `SELECT 1` in that database. Only its owner or a superuser can damage
+  it this way. Utility statements still run, so renaming it back or
+  `DROP EXTENSION` recovers (`sql/reader_check.sql`; README "How it works").
+- `isConcurrentRepack` is true for any `RepackStmt` with CONCURRENTLY,
+  including `CLUSTER (CONCURRENTLY)` and VACUUM FULL forms that
+  `repack.c (ExecRepack)` rejects. Such a statement then gets the
+  extension's refusal (not preloaded, no extension, pre-check) in place of
+  upstream's "option not supported". It fails either way. [V]
+- The library is one C file with six concerns (cache, reader, writer, WAL,
+  protection, hooks). Whether outside contributors find it readable has not
+  been judged.
+- `make installcheck` installs the test module `test_record` into the
+  server's library directory, and a superuser could use it to write
+  arbitrary records. The warning in `doc/installation.md` against running
+  installcheck on a production installation is enough.
+- On a standby without `hot_standby_feedback`, replaying a VACUUM of the
+  record table ends every snapshot in that database older than the latest
+  REPACK (CONCURRENTLY) (step 6). The README's figure of "about 50 deleted
+  records" before autovacuum runs comes from the default thresholds, not
+  from a run.
+- No test reaches the branch of `deleteOlderRecords` where `heap_delete`
+  does not return TM_Ok. That happens when another cleaner (a second
+  REPACK (CONCURRENTLY) or `pg_repack_safe_prune_records()`) deletes the
+  same record after this one's scan snapshot was taken. Hitting that window
+  needs an injection point, and the local build has none. The branch is
+  safe without a test. With `wait = false`, `heap_delete` writes nothing
+  for any result but TM_Ok: it returns TM_BeingModified, TM_Updated,
+  TM_Deleted or TM_SelfModified before touching the tuple
+  (`heapam.c (heap_delete)`). The function then moves on, so the record
+  stays exactly as the other transaction leaves it. A record that is not
+  deleted protects as before, which is how every record behaved before
+  records were deleted at all. So the branch can keep a record longer than
+  needed, never remove one early. The other transaction is itself a
+  cleaner, since the BEFORE trigger refuses every other DELETE
+  (`pg_repack_safe_records_protected`), so its own deletion meets the
+  invariant stated in `deleteOlderRecords`' header. If it aborts, the record
+  stays until the next cleaner runs. [V]
+- The replica-role permutation of `specs/reader_cache.spec` stays,
+  although no trigger is involved in it any more: readers learn of a record
+  from the writer's own relcache invalidation, which
+  `session_replication_role` cannot disable. The permutation fails if
+  someone moves that invalidation back into a trigger.
+
+## Research questions
+
+The questions the research raised, all now answered, each with the test that
+settles it or the developer's decision. Numbered once and never renumbered:
+the README, the specs, the TAP tests and the source cite them as "research
+question N".
 
 1. VACUUM FULL / plain REPACK on a standby without hot_standby_feedback: wrong
    results or a conflict cancel?
@@ -899,137 +1017,169 @@ order unless noted.
    `max_standby_streaming_delay = -1` does not help; `hot_standby_feedback`
    does, and one feedback standby protects every standby of that primary.
    Reported on pgsql-hackers by Noah Misch in 2012-01 with this reproducer;
-   no fix found. `t/012_standby_safe_rewrite.pl`. Option kept: record these
-   rewrites as standby-only records, if users ask.
+   no fix found. `t/012_standby_safe_rewrite.pl`. Closed as a known gap
+   outside the extension's scope (developer decision, 2026-11-23), like 4.
+   Option kept, if users ask: record these rewrites too and check the
+   records only during recovery. The existing rule is enough there: a
+   standby snapshot that sees the rewriter's XID R as committed misses no
+   row, since every row the rewrite dropped had a deleter that finished
+   before the rewrite's cutoff, so its commit precedes R's in the WAL and
+   has been replayed. Costs that kept it unbuilt: spurious errors on
+   standbys with `hot_standby_feedback = on`, for which the rewrite is safe
+   (decision 2; the cutoff the rewrite used is computed inside
+   `repack.c (copy_table_data)` and not passed to the hook, and recomputing
+   it at the swap is unsafe because the horizon can move backwards); mapped
+   catalogs, whose relfilenode stays 0, would stay uncovered; and one record
+   per table for a database-wide VACUUM FULL.
 2. Logical-replication tablesync racing REPACK CONCURRENTLY: rows permanently
-   missing on the subscriber?
-   **Yes in stock PostgreSQL 19, closed by the COPY check.** The sync
-   worker's COPY with a snapshot from before the REPACK returns no rows and
-   no error without the check, and is refused with it
-   (`t/013_tablesync.pl`, which runs the sync worker's commands,
-   `tablesync.c (copy_table)`, `1414-1431`). A real subscription rarely reaches it:
-   CREATE SUBSCRIPTION reads the table on the publisher and waits behind the
-   REPACK, and a slot created while the REPACK holds an XID waits for it.
+   missing on the subscriber? **Yes in stock PostgreSQL 19, closed by the
+   COPY check.** The sync worker's COPY (`tablesync.c (copy_table)`) with a
+   snapshot from before the REPACK returns no rows and no error without the
+   check, and is refused with it (`t/013_tablesync.pl`). A real subscription
+   rarely reaches it: CREATE SUBSCRIPTION reads the table on the publisher
+   and waits behind the REPACK, and a slot created while the REPACK holds an
+   XID waits for it.
 3. Hot-standby RR query spanning commit replay of REPACK CONCURRENTLY: empty?
-   Answered: with the library on the standby it gets 40001
-   (`t/007_standby_reader.pl`); without it, replay stops (`t/010`).
+   With the library on the standby it gets 40001 (`t/007_standby_reader.pl`,
+   `t/017`); without it, replay stops (`t/010`), except in the window of 17.
 4. REFRESH MATERIALIZED VIEW: does an old snapshot see the new contents?
    **Yes**: without CONCURRENTLY the refresh inserts its rows frozen
-   (`matview.c (transientrel_startup)`, `TABLE_INSERT_FROZEN`), visible to every snapshot.
-   Known gap (decision 4), pinned in `specs/known_gaps.spec`.
-5. Record cleanup: a record may be deleted once its XID is visible to every
-   snapshot, but the primary cannot see standby snapshots without
-   hot_standby_feedback. What is the safe deletion rule?
-   Partly answered (step 6): the deleter must be a later transaction whose
-   XID follows the record's; deleting in the rewriter's own transaction
-   gives wrong results on standbys. Who deletes, and when, is deferred.
-6. PL/pgSQL procedure COMMIT loops holding TOAST pointers across a swap.
-   Answered: values stay correct. PL/pgSQL detoasts before storing a value
-   in non-atomic contexts (`pl_exec.c (assign_simple_var)`) and holdable cursors
+   (`matview.c (transientrel_startup)`, `TABLE_INSERT_FROZEN`). Known gap
+   (decision 4), pinned in `specs/stock_rewrites.spec`.
+5. Record cleanup: what is the safe deletion rule, when the primary cannot
+   see standby snapshots? The deleter must be a later transaction whose XID
+   follows the record's; deleting in the rewriter's own transaction gives
+   wrong results on standbys (step 6). Each REPACK (CONCURRENTLY) deletes
+   the older committed records at its swap, and
+   `pg_repack_safe_prune_records()` does the same on request; VACUUM decides
+   when they go, by its horizon on the primary and by the recovery conflict
+   on a standby (step 6 rulings, 2026-11-22). `t/002`, `t/017`,
+   `specs/record_prune.spec`.
+6. PL/pgSQL procedure COMMIT loops holding TOAST pointers across a swap:
+   values stay correct. PL/pgSQL detoasts before storing a value in
+   non-atomic contexts (`pl_exec.c (assign_simple_var)`) and holdable cursors
    detoast what they keep (`portalcmds.c (PersistHoldablePortal)`).
    `t/014_plpgsql_toast.pl`.
-7. Are reads through parallel workers and inlined SQL functions checked?
-   [R] Yes for views, inlined set-returning SQL functions, parallel plans
-   and partitioned parents (`specs/reader_guard_edges.spec`). Workers start
-   at the first `ExecGather` call (`nodeGather.c (ExecGather)`), after the
-   leader's check; non-inlined functions run their own `ExecutorStart`
-   (`repack_concurrently_cursor`).
-8. Overhead of the ExecutorStart check (pgbench): one record lookup per
-   relation per ExecutorStart, and whether it needs a cache.
-9. At `OAT_POST_ALTER` in `swap_relation_files`, which OID owns the old
-   storage, and can its block count be read there for the empty-table
-   exemption?
-10. Does a table record also cover reads of its TOAST relation and indexes in
-    every guarded path?
-11. (Moot: H is not being built.) Can a `ProcessUtility_hook` commit and
-    start a transaction after `standard_ProcessUtility` returns from REPACK
-    (CONCURRENTLY)?
-12. The own-DDL hole in §6a, as a reproducer, to keep the rejection of E on
-    record.
-13. How does the hook recognise the swap among the other `OAT_POST_ALTER`
-    calls during a REPACK?
-14. The library is loaded server-wide but the extension is created per
-    database: REPACK (CONCURRENTLY) in a database with no record table
-    should refuse.
-15. REPACK, TRUNCATE or DROP EXTENSION on the record table itself while
-    records are live. Settled at step 9: refused (DROP and TRUNCATE unless
+7. Reads through parallel workers and inlined SQL functions: checked, as are
+   views and partitioned parents (`specs/reader_guard_edges.spec`). Workers
+   start at the first `ExecGather` call (`nodeGather.c (ExecGather)`), after
+   the leader's check; non-inlined functions run their own `ExecutorStart`
+   (`specs/repack_concurrently_cursor.spec`).
+8. Overhead of the reader check: at most about 3% for one pgbench client and
+   noise for eight, with the per-backend cache (step 7; measured in step 13).
+9. Old storage's block count at `OAT_POST_ALTER` in `swap_relation_files`:
+   readable there, since `r1`'s relcache entry still points at the old
+   storage (§6c; `sql/storage_change.sql`).
+10. TOAST and indexes: the writer also records the post-swap TOAST relation,
+    so a direct read of it is refused (`t/005_reader_guard.pl`). Indexes
+    cannot be named in a query.
+11. Moot: approach H is not being built.
+12. The own-DDL hole of E: `specs/reader_guard_edges.spec`, interleaving 11.
+13. Recognising the swap: the relfilenodes before and after differ (§6c);
+    exactly one storage replacement per rewriting command
+    (`sql/storage_change.sql`).
+14. Database without the extension: REPACK (CONCURRENTLY) is refused there
+    (`sql/writer.sql`).
+15. REPACK, TRUNCATE or DROP EXTENSION on the record table while records are
+    live: refused (step 9; DROP and TRUNCATE unless
     `pg_repack_safe.allow_unprotected_drop` is set by a superuser).
-16. Is REFRESH MATERIALIZED VIEW in scope as a fourth wrong-results path?
-    It is a wrong-results path (Q4); not recorded, a known gap under
-    decision 4, like TRUNCATE and rewriting ALTER TABLE.
-
-17. An unprepared standby that starts replay at a checkpoint between the WAL
-    record (I) and the REPACK commit never sees the record and does not stop.
-    Can the window be closed?
-    **Known gap** (developer decision, 2026-11-16). Holding off checkpoints
-    from the record to the commit with `DELAY_CHKPT_START` is not possible:
-    the commit path asserts the flag is clear and clears it
-    (`xact.c (RecordTransactionCommit)`, `1592`; `DELAY_CHKPT_IN_COMMIT` includes the START
-    bit). A second record after the commit was weighed and not built: it
-    narrows the gap but leaves a query between replaying the commit and
-    replaying that record. Conditions for a wrong result: a standby without
-    the library, whose replay starts at a checkpoint whose redo point lies
-    between a REPACK (CONCURRENTLY)'s swap and its commit, reaching
-    consistency before the commit, and a snapshot taken there before the
-    commit is replayed that then reads the table. Reproducer (manual; needs
-    a build with injection points to make deterministic): pause REPACK
-    (CONCURRENTLY) after the swap, before commit (for example a debugger
-    breakpoint after `swap_relation_files`); run `CHECKPOINT` and take a
-    base backup; start a standby from it without the library, open a
-    REPEATABLE READ snapshot there before resuming; resume the REPACK; read
-    the table on that standby: 0 rows.
-18. PREPARE TRANSACTION: irrelevant for REPACK (CONCURRENTLY), which cannot
-    run in a transaction block, but the general detector must handle or
-    refuse it before TRUNCATE or ALTER are switched on.
+16. REFRESH MATERIALIZED VIEW as a fourth wrong-results path: see 4.
+17. A standby without the library whose replay starts at a checkpoint
+    between the WAL record (I) and the REPACK commit never sees the record
+    and does not stop. **Not a gap in the guarantee: wrong results under
+    misconfiguration** (developer decision, 2026-11-23; recorded as a known
+    gap on 2026-11-16). The guarantee requires the library on every server
+    that replays the WAL; a standby with it checks reads against the
+    records, which reach it as table data wherever its replay starts. The
+    record only makes a misconfigured standby stop, best effort.
+    Conditions for a wrong result: a standby without the library, whose
+    replay starts at a checkpoint whose redo point lies between a REPACK
+    (CONCURRENTLY)'s swap and its commit, reaching consistency before the
+    commit, and a snapshot taken there before the commit is replayed that
+    then reads the table. Reproducer (manual; needs a build with injection
+    points to make deterministic): pause REPACK (CONCURRENTLY) after the
+    swap, before commit (for example a debugger breakpoint after
+    `swap_relation_files`); run `CHECKPOINT` and take a base backup; start a
+    standby from it without the library, open a REPEATABLE READ snapshot
+    there before resuming; resume the REPACK; read the table on that
+    standby: 0 rows.
+    Ways to make the safeguard complete, weighed and not built:
+    - `DELAY_CHKPT_START` from the record to the commit: not possible, the
+      commit path asserts the flag is clear and clears it
+      (`xact.c (RecordTransactionCommit)`; `DELAY_CHKPT_IN_COMMIT` includes
+      the START bit).
+    - A second record after the commit: leaves a query between replaying
+      the commit and replaying that record.
+    - `DELAY_CHKPT_COMPLETE` (2026-11-23, from the source, not prototyped):
+      set it in an `XACT_EVENT_PRE_COMMIT` callback before writing the
+      record there, clear it at commit or abort. `CreateCheckPoint` does not
+      write its checkpoint record while the flag is set
+      (`xlog.c (CreateCheckPoint)`), and the commit path asserts only the
+      `DELAY_CHKPT_IN_COMMIT` bits, so any checkpoint whose redo point
+      follows the record writes its checkpoint record after the commit.
+      Every way a hot standby reaches consistency (backup end, a
+      restartpoint's `minRecoveryPoint`, the end of local WAL after a crash)
+      lies at or after the end of the checkpoint record it started from
+      (`xlogrecovery.c (InitWalRecovery)`, `xlog.c (CreateRestartPoint)`),
+      so such a standby is consistent only after the commit. Costs: an
+      extension writing a core `PGPROC` field; with synchronous replication
+      the flag stays set through the commit's wait for the standby
+      (`SyncRepWaitForLSN` runs before `XACT_EVENT_COMMIT`), so a checkpoint
+      can wait as long as that commit. `pg_rewind` and PITR not checked.
+18. PREPARE TRANSACTION: no wrong result in the shipped scope. Settled
+    2026-11-23 by the developer from the source argument below, with no test
+    (a divergence from principle 2, decided explicitly).
+    - REPACK (CONCURRENTLY) cannot be prepared: it calls
+      `PreventInTransactionBlock` (`repack.c (ExecRepack)`).
+    - The library registers no transaction or subtransaction callback, so
+      PREPARE leaves no per-transaction state behind.
+    - A prepared transaction reads nothing more and holds no snapshot
+      (`twophase.c (MarkAsPreparingGuts)`).
+    - `pg_repack_safe_prune_records()` in a transaction that is then
+      prepared is a deleter D whose XID follows the records' it deletes,
+      which is all `deleteOlderRecords` relies on, whenever D commits. The
+      prepared transaction keeps its XID in the proc array until COMMIT
+      PREPARED, so VACUUM keeps the rows on the primary, and their removal
+      reaches a standby with a conflict horizon of at least D. Readers scan
+      with `SnapshotAny`, so a pending delete changes nothing for them;
+      `holdsDeletedRecord` counts an uncommitted deleter, so rewrites of the
+      record table are refused meanwhile; ROLLBACK PREPARED leaves the
+      records in place.
+    The part that is still to do, if TRUNCATE or ALTER are ever recorded, is
+    a precondition of decision 4.
 19. XID wraparound of records. Settled 2026-11-16 (developer decision): the
     column is `xid8`. A record at least 2^31 transactions older than the
     next XID precedes every live snapshot's xmin (XIDs stop short of oldest
-    datfrozenxid + 2^31, `varsup.c (SetTransactionIdLimit)`, `varsup.c (GetNewTransactionId)`) and
-    passes without a commit-log lookup; any other record's 32-bit form is
-    unambiguous; a record at or past the next XID is refused as corrupt.
-    [R] `t/006_record_xid8.pl` on a cluster at epoch 1; with the age rule
-    disabled the test fails, as a 32-bit column would.
-
-How these group:
-- **Needed to build the guard:** 5, 7, 8, 9, 10, 13, 14, 15, 17. All but 8
-  and 17 have a proposed answer in §6c, each awaiting its probe.
-- **Other possible wrong results in stock PG19, found during the research and
-  independent of the guard.** Each needs a reproducer to learn whether it is
-  real and, if so, whether the guard catches it or it becomes a known gap:
-  1, 2, 3, 4, 6, 16.
-- **Bookkeeping:** 11 (moot), 12 (regression test for a rejected design).
+    datfrozenxid + 2^31, `varsup.c (SetTransactionIdLimit)`,
+    `varsup.c (GetNewTransactionId)`) and passes without a commit-log lookup;
+    any other record's 32-bit form is unambiguous; a record at or past the
+    next XID is refused as corrupt. `t/006_record_xid8.pl` on a cluster at
+    epoch 1; with the age rule disabled the test fails, as a 32-bit column
+    would.
 
 ## Interleavings that would prove each claim
 
-s1 = REPACK (CONCURRENTLY), driven by `injection_points` at
-`repack-concurrently-before-lock` (needs a build with injection points; the
-local build has them off); s2 = victim; s3 = AccessShareLock blocker.
+s1 = REPACK (CONCURRENTLY), s2 = victim, s3 = AccessShareLock blocker. The
+numbers are cited by step 5 and the specs. Each one but 10 is a test.
 
-1. s2 RR BEGIN, read other → s1 REPACK → s2 count(t): 0 stock [R], 40001 with G.
-2. s1 paused at the injection point → s2 RR snapshot → s1 commits → s2
-   count(t) = 0: proves "before commit, not before start".
-3. s3 locks t → s1 waits → s2 snapshot then count(t) queues → s3 commits → s2
-   = 0 [R]; 40001 with G.
-4. RC cursor + STABLE function: 40001 at first FETCH with G.
-5. Negative control: s2 touches t first → s1 waits, correct counts, no error.
-6. 1 and 3 for TRUNCATE and ALTER TABLE ... ALTER COLUMN TYPE: still 0 with G
-   unless decision 4 is reversed; pins the known gap.
-7. VACUUM FULL instead: correct counts, no error with G.
-8. COPY t TO STDOUT after s1 commits: 40001 (ProcessUtility path).
-9. GRANT on t after s2's snapshot, no REPACK: no error.
-10. Writer-side race: check passes → s2 snapshot → s1 commits → s2 reads 0:
-    proves A and B are not race-free.
-11. s2 snapshot → s1 REPACK → s2 GRANT on t → s2 count(t): 40001 with G (the
-    own-DDL hole of E).
-12. s2 snapshot → s1 REPACK → VACUUM FULL t → s2 count(t): 40001 with G (the
-    record outlives a safe rewrite).
-13. Table created after s2's snapshot → s2 count: 0, no error.
-14. Empty table (zero blocks): s2 snapshot → s1 REPACK → s2 count: 0, no
-    error (exemption).
-15. s2 snapshot → s3 deletes all rows → s1 REPACK → s2 count: 40001 (real
-    wrong result; proves the exemption is not too wide).
-16. s2 snapshot → s3 inserts into the previously empty t → s1 REPACK → s2
-    count: 40001, stock gives a correct 0 (the accepted spurious error).
+| # | Interleaving | Expected with the guard | Test |
+| --- | --- | --- | --- |
+| 1 | s2 RR BEGIN, read other → s1 REPACK → s2 count(t) | 40001 (stock: 0) | `repack_concurrently_snapshot`, `t/005` |
+| 2 | s2 takes its snapshot after s1 starts, before it commits | 40001: "before commit", not "before start" | covered by 3 (the snapshot is taken while s1 waits at the swap) |
+| 3 | s3 locks t → s1 waits → s2 snapshot, then reads t → s3 commits | 40001 (stock: 0) | `t/001` (pg_dump), `t/008` (COPY), `t/013` |
+| 4 | RC cursor + STABLE function, REPACK between DECLARE and FETCH | 40001 at the first FETCH | `repack_concurrently_cursor` |
+| 5 | s2 touches t first → s1 waits | correct counts, no error | `repack_concurrently_snapshot`, `repack_concurrently_cursor` (controls) |
+| 6 | 1 for TRUNCATE and ALTER TABLE ... ALTER COLUMN TYPE | still 0 (decision 4) | `stock_rewrites` |
+| 7 | VACUUM FULL instead | correct counts, no error | `reader_guard_edges` |
+| 8 | COPY t TO STDOUT after s1 commits | 40001 | `t/008_copy_guard.pl` |
+| 9 | GRANT on t after s2's snapshot, no REPACK | no error | `reader_guard_edges` |
+| 10 | Writer-side check passes → s2 snapshot → s1 commits → s2 reads 0 | proves A and B are not race-free | none: needs a pause between the check at the swap and the commit, i.e. injection points (§3) |
+| 11 | s2 snapshot → s1 REPACK → s2 GRANT on t → s2 count(t) | 40001 (the own-DDL hole of E) | `reader_guard_edges` |
+| 12 | s2 snapshot → s1 REPACK → VACUUM FULL t → s2 count(t) | 40001 (the record outlives a safe rewrite) | `reader_guard_edges` |
+| 13 | table created after s2's snapshot → s2 count | 0, no error | `reader_guard_edges` |
+| 14 | empty table: s2 snapshot → s1 REPACK → s2 count | 0, no error (exemption) | `reader_guard_edges` |
+| 15 | s2 snapshot → s3 deletes all rows → s1 REPACK → s2 count | 40001 (exemption not too wide) | `reader_guard_edges` |
+| 16 | s2 snapshot → s3 inserts into empty t → s1 REPACK → s2 count | 40001; stock gives a correct 0 (accepted spurious error) | `reader_guard_edges` |
 
 ## Mailing-list sources
 

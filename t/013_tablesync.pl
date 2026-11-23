@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 #
 # Logical replication's initial table synchronization racing
-# REPACK (CONCURRENTLY) on the publisher (doc/research/fix-design.md, open
+# REPACK (CONCURRENTLY) on the publisher (doc/research/fix-design.md, research
 # question 2).
 #
 # The table sync worker runs, on a replication connection to the publisher,

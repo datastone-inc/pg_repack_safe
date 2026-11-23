@@ -21,3 +21,8 @@ SELECT pg_export_snapshot() AS snapshot \gset
 -- prints pg_dump's exit status and the number of rows in the dump.
 \! pg_dump --data-only --table=orders --snapshot="$DEMO_SNAPSHOT" > "$DEMO_DIR/orders.dump"; echo "pg_dump exit status: $?"; echo "rows in the dump: $(grep -c '^[0-9]' "$DEMO_DIR/orders.dump")"
 COMMIT;
+
+-- The dump runs again with a snapshot of its own. With the extension this is
+-- the retry the failed dump calls for. On stock PostgreSQL nothing calls for
+-- it, and the dump above has already been kept as a backup.
+\! pg_dump --data-only --table=orders > "$DEMO_DIR/orders.dump"; echo "pg_dump exit status: $?"; echo "rows in the dump: $(grep -c '^[0-9]' "$DEMO_DIR/orders.dump")"

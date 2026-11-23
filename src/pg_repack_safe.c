@@ -102,6 +102,7 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(pg_repack_safe_records_protected);
 PG_FUNCTION_INFO_V1(pg_repack_safe_records_writer_only);
 PG_FUNCTION_INFO_V1(pg_repack_safe_prune_records);
+PG_FUNCTION_INFO_V1(pg_repack_safe_status);
 
 #define EXTENSION_NAME "pg_repack_safe"
 #define RECORD_TABLE_NAME "pg_repack_safe_rewrites"
@@ -791,20 +792,112 @@ checkRelationRecords(Oid relid, Snapshot snapshot)
 }
 
 /**
- * @brief Reader check for a query: every relation in its range table
+ * @brief Add an INSERT's unread range-table entries to two sets
+ * @param plan The top node of a plan or of a subplan; may be NULL
+ * @param targets Set to add the INSERT's target entries to
+ * @param excluded Set to add its ON CONFLICT EXCLUDED entry to
+ *
+ * Only a ModifyTable at the top of a plan or subplan is looked at, which is
+ * where the planner puts one, the main statement's and each data-modifying
+ * CTE's. A ModifyTable anywhere else would be missed, leaving its target
+ * checked: the miss can only refuse, never let a read through.
+ *
+ * exclRelRTI is read only for DO UPDATE and DO SELECT, the actions that
+ * have an EXCLUDED entry (analyze.c, transformOnConflictClause). Otherwise
+ * it is 0 in the planner's output and then offset like every index of a
+ * subplan (setrefs.c, set_plan_refs), so it names an unrelated entry.
+ */
+static void
+addUnreadInsertEntries(Plan *plan, Bitmapset **targets, Bitmapset **excluded)
+{
+    ModifyTable *modify;
+
+    if (plan == NULL || !IsA(plan, ModifyTable))
+        return;
+    modify = (ModifyTable *) plan;
+    if (modify->operation != CMD_INSERT)
+        return;
+
+    foreach_int(rti, modify->resultRelations)
+        *targets = bms_add_member(*targets, rti);
+    if (modify->onConflictAction == ONCONFLICT_UPDATE ||
+        modify->onConflictAction == ONCONFLICT_SELECT)
+        *excluded = bms_add_member(*excluded, modify->exclRelRTI);
+}
+
+/**
+ * @brief Tell whether a table has a foreign key that references itself
+ * @param relid The table; the caller holds a lock on it
+ * @return True if a foreign-key check on the table reads the table
+ *
+ * Such a check reads the referenced table with the transaction snapshot,
+ * outside the executor (ri_triggers.c, ri_FastPathCheck), so the INSERT's
+ * target is read after all and stays checked.
+ */
+static bool
+referencesItself(Oid relid)
+{
+    Relation    rel = table_open(relid, NoLock);
+    bool        result = false;
+
+    foreach_node(ForeignKeyCacheInfo, fk, RelationGetFKeyList(rel))
+    {
+        if (fk->confrelid == relid)
+        {
+            result = true;
+            break;
+        }
+    }
+    table_close(rel, NoLock);
+    return result;
+}
+
+/**
+ * @brief Reader check for a query: every relation in its range table that
+ *        the query reads
  * @param queryDesc Query being started; its relation locks are held
+ *
+ * Invariant: every range-table entry is checked except an INSERT's target
+ * and its ON CONFLICT EXCLUDED entry. An INSERT writes its target without
+ * reading it through a snapshot: uniqueness and exclusion checks use a
+ * dirty snapshot, and ON CONFLICT raises its own serialization failure for
+ * a conflicting row the snapshot does not see (nodeModifyTable.c,
+ * ExecCheckTupleVisible). A read of the same table in the same statement
+ * (INSERT ... SELECT, a subquery, the outer query of a data-modifying CTE)
+ * is a separate range-table entry and is checked. A target with a foreign
+ * key to itself is checked, since that check reads it.
  */
 static void
 checkUnsafeRewriteRecords(QueryDesc *queryDesc)
 {
+    PlannedStmt *pstmt = queryDesc->plannedstmt;
+    Bitmapset  *targets = NULL;
+    Bitmapset  *excluded = NULL;
+
     if (!recordCacheHasRecords())
         return;
 
-    foreach_node(RangeTblEntry, rte, queryDesc->plannedstmt->rtable)
+    addUnreadInsertEntries(pstmt->planTree, &targets, &excluded);
+    foreach_ptr(Plan, subplan, pstmt->subplans)
+        addUnreadInsertEntries(subplan, &targets, &excluded);
+
+    foreach_node(RangeTblEntry, rte, pstmt->rtable)
     {
-        if (rte->rtekind == RTE_RELATION)
-            checkRelationRecords(rte->relid, queryDesc->snapshot);
+        /* Range-table indexes start at 1. */
+        int         rti = foreach_current_index(rte) + 1;
+
+        if (rte->rtekind != RTE_RELATION)
+            continue;
+        /* EXCLUDED is the composite-type pseudo-relation, never a table. */
+        if (bms_is_member(rti, excluded) &&
+            rte->relkind == RELKIND_COMPOSITE_TYPE)
+            continue;
+        if (bms_is_member(rti, targets) && !referencesItself(rte->relid))
+            continue;
+        checkRelationRecords(rte->relid, queryDesc->snapshot);
     }
+    bms_free(targets);
+    bms_free(excluded);
 }
 
 /**
@@ -1135,9 +1228,10 @@ precheckOldSnapshots(Oid relid, bool atSwap)
  * Written at the swap, so it precedes the rewriter's commit record. A
  * standby without this library cannot check reads; replaying this record
  * there fails (rmgr.c, RmgrNotFound), so its replay stops before the commit
- * instead of serving the rewritten table to old snapshots. Known gap (open
- * question 17): a standby whose replay starts at a checkpoint between this
- * record and the commit never sees it.
+ * instead of serving the rewritten table to old snapshots. A best-effort
+ * safeguard against that misconfiguration, not part of the guarantee: a
+ * standby whose replay starts at a checkpoint between this record and the
+ * commit never sees it (research question 17).
  */
 static void
 logUnsafeRewrite(Oid relid)
@@ -2120,6 +2214,34 @@ pg_repack_safe_prune_records(PG_FUNCTION_ARGS)
     table_close(rel, NoLock);
 
     PG_RETURN_INT64((int64) deleted);
+}
+
+/**
+ * @brief SQL function: whether the guard is in force on this server
+ * @return True if this server loaded the library through
+ *         shared_preload_libraries; false, with a WARNING, if not
+ *
+ * The extension can exist in a database whose server does not preload the
+ * library. It then looks installed and guards nothing: no hook runs in a
+ * backend that has not loaded the library, so REPACK (CONCURRENTLY) writes no
+ * record and no read is checked (t/009_not_preloaded.pl). This reports
+ * loadedAtServerStart, the flag the writer's refusal tests
+ * (lockRecordTableForWriter), so it states the fact rather than parsing the
+ * setting. If the calling backend had not loaded the library, the call loads
+ * it, after which that backend refuses REPACK (CONCURRENTLY) like any late
+ * load.
+ */
+Datum
+pg_repack_safe_status(PG_FUNCTION_ARGS)
+{
+    if (!loadedAtServerStart)
+        ereport(WARNING,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_repack_safe is not in force: the server did not load it through shared_preload_libraries"),
+                 errdetail("REPACK (CONCURRENTLY) is not recorded and reads are not checked, so snapshots older than a repack can read the table as empty."),
+                 errhint("Add pg_repack_safe to shared_preload_libraries and restart the server.")));
+
+    PG_RETURN_BOOL(loadedAtServerStart);
 }
 
 /* ----------------------------------------------------------------

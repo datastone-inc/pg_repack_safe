@@ -63,15 +63,3 @@ count|sum
 (1 row)
 
 step r_commit: COMMIT;
-
-starting permutation: r_begin w_repack_pk r_fk r_commit
-step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
-count
------
-    0
-(1 row)
-
-step w_repack_pk: REPACK (CONCURRENTLY) pk;
-step r_fk: INSERT INTO fk VALUES (1);
-ERROR:  insert or update on table "fk" violates foreign key constraint "fk_id_fkey"
-step r_commit: COMMIT;

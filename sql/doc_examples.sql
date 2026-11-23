@@ -15,6 +15,24 @@ CREATE EXTENSION pg_repack_safe;
 
 SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_repack_safe';
 
+-- README.md, Installation; doc/installation.md, Verifying the Installation
+SELECT pg_repack_safe_status();
+
+DROP EXTENSION pg_repack_safe;
+
+-- README.md, Standby errors caused by pg_repack_safe. The database OID and
+-- the filenode vary from run to run, so the lookups take them from the
+-- catalogs; 1663 is pg_default. The log line they come from is checked in
+-- t/017_standby_record_cleanup.pl.
+CREATE EXTENSION pg_repack_safe;
+SELECT oid AS db_oid FROM pg_database WHERE datname = current_database() \gset
+SELECT pg_relation_filenode('pg_repack_safe_rewrites') AS rec_filenode \gset
+SELECT datname = current_database() AS is_this_database FROM pg_database WHERE oid = :db_oid;
+SELECT pg_filenode_relation(1663, :rec_filenode);
+
+-- The storage parameter that logs every autovacuum of the record table.
+ALTER TABLE pg_repack_safe_rewrites SET (log_autovacuum_min_duration = 0);
+SELECT reloptions FROM pg_class WHERE oid = 'pg_repack_safe_rewrites'::regclass;
 DROP EXTENSION pg_repack_safe;
 
 -- README.md, Optional pre-check
@@ -47,14 +65,75 @@ CREATE TABLE de_t (id int PRIMARY KEY);
 INSERT INTO de_t SELECT generate_series(1, 3);
 REPACK (CONCURRENTLY) de_t;
 
--- Step 2.
-SELECT pg_repack_safe_prune_records();
+-- Step 1: nothing is being repacked.
+SELECT pid, datname, relid, command FROM pg_stat_progress_repack;
 
--- Step 3: no snapshot here needs the record.
-VACUUM pg_repack_safe_rewrites;
+-- Step 2: the query run in each database by the shell loop.
+SELECT format('database %I: schema %s', current_database(), extnamespace::regnamespace) AS found
+FROM pg_extension WHERE extname = 'pg_repack_safe';
+
+-- Step 2, an extension in another schema: without the search_path the
+-- record table is not found; with it, it is.
+CREATE SCHEMA ext;
+ALTER EXTENSION pg_repack_safe SET SCHEMA ext;
+SELECT extnamespace::regnamespace FROM pg_extension WHERE extname = 'pg_repack_safe';
+SELECT pg_relation_size('pg_repack_safe_rewrites') > 0 AS has_blocks;
+SET search_path = ext, public;
+SELECT pg_relation_size('pg_repack_safe_rewrites') > 0 AS has_blocks;
+RESET search_path;
+ALTER EXTENSION pg_repack_safe SET SCHEMA public;
+DROP SCHEMA ext;
+
+-- Step 3. vacuum_truncate is turned off for the table first, to show that
+-- the TRUNCATE option overrides it.
+SELECT pg_repack_safe_prune_records();
+ALTER TABLE pg_repack_safe_rewrites SET (vacuum_truncate = off);
+VACUUM (TRUNCATE) pg_repack_safe_rewrites;
 SELECT pg_relation_size('pg_repack_safe_rewrites') = 0 AS empty;
+
+-- Step 3, what holds back the cleanup: nothing here.
+SELECT 'session' AS holder, pid::text AS id, backend_xmin AS xmin
+FROM pg_stat_activity
+WHERE datname = current_database() AND backend_xmin IS NOT NULL
+  AND pid <> pg_backend_pid()
+UNION ALL
+SELECT 'prepared transaction', gid, transaction
+FROM pg_prepared_xacts WHERE database = current_database()
+UNION ALL
+SELECT 'replication slot', slot_name::text, xmin
+FROM pg_replication_slots WHERE xmin IS NOT NULL
+UNION ALL
+SELECT 'standby feedback', application_name, backend_xmin
+FROM pg_stat_replication WHERE backend_xmin IS NOT NULL;
 
 -- Step 4.
 DROP EXTENSION pg_repack_safe;
+SELECT count(*) = 0 AS dropped FROM pg_extension WHERE extname = 'pg_repack_safe';
+
+-- Step 5. The WAL position varies from run to run, so only its presence is
+-- shown here. This instance is not a standby, so the standby's check
+-- returns NULL; on a standby it returns true once the drops are replayed.
+SELECT pg_current_wal_lsn() IS NOT NULL AS has_position;
+SELECT pg_last_wal_replay_lsn() >= '0/3000148' AS replayed;
+
+-- Step 5, where the setting comes from. The temporary instance sets it in
+-- postgresql.conf, whose path varies, so only the file's presence is shown.
+SELECT setting, source, sourcefile IS NOT NULL AS has_sourcefile, sourceline IS NOT NULL AS has_sourceline
+FROM pg_settings WHERE name = 'shared_preload_libraries';
+
+-- Step 5, the ALTER SYSTEM forms. They write postgresql.auto.conf and take
+-- effect only at a restart, which this temporary instance never has; the
+-- RESET leaves the file as it was.
+ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements';
+ALTER SYSTEM RESET shared_preload_libraries;
+SHOW shared_preload_libraries;
+
+-- The override: a drop with a record left, in one session.
+CREATE EXTENSION pg_repack_safe;
+REPACK (CONCURRENTLY) de_t;
+SELECT count(*) > 0 AS has_record FROM pg_repack_safe_rewrites;
+SET pg_repack_safe.allow_unprotected_drop = on;
+DROP EXTENSION pg_repack_safe;
+RESET pg_repack_safe.allow_unprotected_drop;
 
 DROP TABLE de_t;

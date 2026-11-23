@@ -78,6 +78,11 @@ sub dumpArgs
     my $ok = IPC::Run::run([dumpArgs("--snapshot=$snapshot")],
         '>', \$out, '2>', \$err);
     ok(!$ok, 'GUARDED: pg_dump with a pre-REPACK exported snapshot fails');
+
+    # The retry the error asks for: a dump with its own, newer snapshot.
+    my ($retry) = run_command([dumpArgs()]);
+    is(dumpedRows($retry), $rows,
+        'GUARDED: exported snapshot: pg_dump run again dumps every row');
     like($err, $guard_error,
         'GUARDED: exported snapshot: pg_dump reports the guard error');
 
@@ -141,4 +146,52 @@ is($node->safe_psql('postgres', 'SELECT count(*) FROM customers'), $rows,
     'customers still holds every row');
 
 $node->stop;
+
+# Stock PostgreSQL 19, without the library: case 1 again. pg_dump succeeds
+# and the dump holds no rows of customers. Restored, the dump gives an empty
+# table without an error, so nothing between the dump and the restore says
+# that the backup lacks the table's data.
+{
+    my $stock = preloadedNode('stock', libraries => '');
+    $stock->start;
+    $stock->safe_psql('postgres', qq{
+        CREATE TABLE customers (id int PRIMARY KEY, name text NOT NULL);
+        INSERT INTO customers SELECT g, 'customer ' || g FROM generate_series(1, $rows) g;
+        CREATE DATABASE restored;
+    });
+
+    my $holder = $stock->background_psql('postgres');
+    $holder->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+    my $snapshot = $holder->query_safe('SELECT pg_export_snapshot()');
+    chomp $snapshot;
+
+    $stock->safe_psql('postgres', $repack_sql);
+
+    my ($out, $err) = ('', '');
+    my $ok = IPC::Run::run(['pg_dump', '--data-only', '--table=customers',
+            '--dbname=' . $stock->connstr('postgres'), "--snapshot=$snapshot"],
+        '>', \$out, '2>', \$err);
+    ok($ok, 'STOCK: pg_dump with a pre-REPACK exported snapshot exits 0')
+        or diag($err);
+    is(dumpedRows($out), 0, 'STOCK: the dump holds no rows of customers');
+
+    $holder->query_safe('COMMIT');
+    $holder->quit;
+
+    $stock->safe_psql('restored',
+        'CREATE TABLE customers (id int PRIMARY KEY, name text NOT NULL)');
+    my ($restoreOut, $restoreErr) = ('', '');
+    my $restored = IPC::Run::run(['psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1',
+            '--dbname=' . $stock->connstr('restored')],
+        '<', \$out, '>', \$restoreOut, '2>', \$restoreErr);
+    ok($restored, 'STOCK: the dump restores without an error')
+        or diag($restoreErr);
+    is($stock->safe_psql('restored', 'SELECT count(*) FROM customers'), '0',
+        'STOCK: the restored customers table is empty');
+    is($stock->safe_psql('postgres', 'SELECT count(*) FROM customers'), $rows,
+        'STOCK: the source table still holds every row');
+
+    $stock->stop;
+}
+
 done_testing();

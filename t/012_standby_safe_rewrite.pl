@@ -3,7 +3,7 @@
 #
 # KNOWN GAP, pinned: VACUUM FULL and REPACK without CONCURRENTLY on the
 # primary, against a hot standby without hot_standby_feedback
-# (doc/research/fix-design.md, open question 1).
+# (doc/research/fix-design.md, research question 1).
 #
 # These rewrites keep every row version a snapshot on the primary may need,
 # but nothing a standby snapshot needs: rows deleted after the standby

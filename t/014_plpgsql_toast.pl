@@ -1,7 +1,7 @@
 # Copyright (c) 2026 dataStone Inc.
 # SPDX-License-Identifier: MIT
 #
-# Open question 6 (doc/research/fix-design.md): a PL/pgSQL procedure that
+# Research question 6 (doc/research/fix-design.md): a PL/pgSQL procedure that
 # commits inside a loop holds a row with a TOASTed value across
 # REPACK (CONCURRENTLY), which swaps in a new TOAST relation and drops the
 # old one (repack.c, swap by relation). The procedure then uses the value.

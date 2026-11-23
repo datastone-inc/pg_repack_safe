@@ -10,7 +10,8 @@
 #   rows, the DELETE removes 0 rows and leaves orders without a customer,
 #   and pg_dump exits 0 with no rows in the dump, each without an error;
 # - with the extension each of the four gets the reader's error instead,
-#   and none of the wrong results appears.
+#   and none of the wrong results appears; the report's failed transaction
+#   rolls back, and its retry in a new transaction gets the right figures.
 # So the demo cannot drift from the behaviour, and the stock half pins the
 # wrong results this extension exists for.
 
@@ -30,7 +31,10 @@ my ($out, $err) = ('', '');
 my $ok = IPC::Run::run([$demo], '>&', \$out);
 ok($ok, 'the demo runs to the end') or diag($out);
 
-my ($stock, $guarded) = split /^PostgreSQL \S+ with pg_repack_safe.*$/m, $out;
+# The heading carries pg_config --version, which packaged builds extend
+# with spaces ("PostgreSQL 19.0 (Ubuntu 19.0-2.pgdg24.04+1)").
+my ($stock, $guarded) =
+  split /^PostgreSQL [^\n]* with pg_repack_safe: an error instead$/m, $out;
 ok(defined $guarded, 'the output has a stock half and an extension half');
 $guarded //= '';
 
@@ -57,7 +61,25 @@ unlike($guarded, qr/^DELETE \d+$/m, 'extension: nothing is deleted');
 like($guarded, qr/^ +1 \| +10$/m,
     'extension: the customer and its ten orders are still there');
 
-# In both halves a new transaction sees every order.
+# The report, as the HINT asks: the failed transaction rolls back, and the
+# whole report runs again in a new transaction, which reads 100 customers,
+# then 1000 orders worth 10000.00, and commits without an error.
+my ($report) = $guarded =~ /^--- 1_report\.sql ---$(.*?)^--- 2_update\.sql ---$/ms;
+$report //= '';
+my ($retry) = $report =~ /^HINT:  Retry the transaction\.\n.*?^ROLLBACK\n(.*)/ms;
+$retry //= '';
+like($retry, qr/^BEGIN\n.*^ +100\n.*^ +1000 \| 10000\.00\n.*^COMMIT$/ms,
+    'extension: the retried report commits with 100 customers and 1000 orders');
+unlike($retry, qr/ERROR/, 'extension: the retried report gets no error');
+
+# The dump, likewise: it fails, and run again with a snapshot of its own it
+# dumps all 1000 orders.
+like($guarded,
+    qr/^pg_dump exit status: 1\nrows in the dump: 0\n.*^pg_dump exit status: 0\nrows in the dump: 1000$/ms,
+    'extension: pg_dump run again dumps all 1000 orders');
+
+# In both halves the report, run again in a new transaction, sees every
+# order.
 my @totals = $out =~ /^ +1000 \| 10000\.00$/mg;
 is(scalar @totals, 2, 'a new transaction reads all 1000 orders in both halves');
 

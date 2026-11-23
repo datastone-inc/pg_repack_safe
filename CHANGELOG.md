@@ -23,7 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `REPACK (CONCURRENTLY)` of a table it reads fails with SQLSTATE 40001,
   "cannot read table ... with this snapshot", instead of reading the table
   as empty. Checked in the executor and for `COPY relation TO` (including
-  partitioned tables), so `pg_dump` fails instead of dumping no rows. Each
+  partitioned tables), so `pg_dump` fails instead of dumping no rows. An
+  `INSERT`'s target table is written, not read, and is not checked unless
+  it has a foreign key to itself; `INSERT ... VALUES` into a repacked table
+  from an older snapshot succeeds. Each
   backend keeps a copy of the records, so a query does not read the record
   table; the writer invalidates it.
 - `COPY partitioned_table TO` is run as `COPY (SELECT columns FROM
@@ -77,6 +80,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request. A deleted record stays in the table, and readers still obey it,
   until `VACUUM` finds that no snapshot can need it; on a hot standby,
   replaying its removal ends the snapshots that still did.
+- `pg_repack_safe_status()` returns true only where the guard is in force:
+  where the server loaded the library through `shared_preload_libraries`.
+  Without that, the extension is installed but guards nothing, and no error
+  says so; the function returns false with a `WARNING`. The extension's
+  comment, shown by `\dx`, names the check.
 - `VACUUM FULL`, `CLUSTER` and `REPACK` of the record table, and the
   database-wide forms when they reach it, are refused while it holds a
   deleted record, with a hint to run `VACUUM` on it first: they would drop
@@ -84,19 +92,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removing the extension no longer needs the override or a check of every
   standby: delete the records with `pg_repack_safe_prune_records()`, vacuum
   the record table until it is empty, and `DROP EXTENSION` (README,
-  "Removing the extension").
+  "Removing the extension"). Each step of the README's procedure ends with
+  a check, and the procedure lists what holds back the vacuum, uses
+  `VACUUM (TRUNCATE)` so that `vacuum_truncate = off` cannot stall it, and
+  says when the library may be unloaded and the package uninstalled.
 - The optional pre-check's refusal no longer names the other session's
   process ID and transaction start time, which `pg_stat_activity` hides
   from users without `pg_read_all_stats`; its hint points there instead.
 - `demo/demo.sh`: four scenarios (a report, an `UPDATE`, a `DELETE`, a
   `pg_dump`) run
   on a throwaway server without and then with the extension, showing the
-  wrong result on stock PostgreSQL 19 and the error that replaces it.
-  `t/018_demo.pl` checks its output.
+  wrong result on stock PostgreSQL 19 and the error that replaces it. With
+  the extension, the report and the dump are retried and get the right
+  figures. `t/018_demo.pl` checks its output, and `t/001_repack_pg_dump.pl`
+  restores the incomplete stock dump to show that it restores as an empty
+  table without an error.
 - Custom WAL resource manager (ID 149, reserved on the PostgreSQL wiki): each
   `REPACK (CONCURRENTLY)` logs a record before its commit, so a standby
-  without the library stops replay instead of serving the repacked table to
-  old snapshots.
+  without the library, which is misconfigured, usually stops replay instead
+  of serving the repacked table to old snapshots. Best effort: a standby
+  whose replay starts from a checkpoint between the swap and the commit
+  never sees the record.
 - Optional pre-check, `pg_repack_safe.precheck_snapshot_age` (off by
   default): `REPACK (CONCURRENTLY)` refuses to run, at its start and at the
   swap, while a session in the database holds a snapshot that outlives a
@@ -110,15 +126,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extensions.
 - Documentation: the README's "Outlook" says why the MVCC-safe fix under
   review for PostgreSQL 20 cannot be delivered as an extension;
-  `doc/research/history.md` §7 compares that patch with this extension.
+  `doc/research/history.md` §6 compares that patch with this extension.
+- Documentation: the README's "The problem" says `REPACK (CONCURRENTLY)`
+  is built on pg_squeeze, not pg_repack, that both tools share the caveat,
+  and that core accepted it as a known trade-off.
+- Documentation: the README's "Standby errors caused by pg_repack_safe
+  (without `hot_standby_feedback`)" says what an operator sees when
+  cleanup of the record table ends old standby transactions, which
+  transactions it affects, when it happens (including the replay stall with
+  `max_standby_streaming_delay = -1`), how to tell from the standby's log
+  that the record table caused it (`log_recovery_conflict_waits`, checked
+  in `t/017_standby_record_cleanup.pl`), and what to do about it.
 - Tests, run by `make installcheck` on temporary instances:
   - regression: `doc_examples`, `storage_change`, `reader_check`, `writer`,
     `protection`, `copy_partitioned`;
   - isolation: `repack_concurrently_snapshot`, `repack_concurrently_cursor`,
-    `reader_guard_edges`, `reader_cache`, `precheck`, `copy_attach_race`, and
-    `known_gaps`, which pins what the extension does not cover (TRUNCATE,
-    rewriting ALTER TABLE, REFRESH MATERIALIZED VIEW, the foreign-key
-    check);
+    `reader_guard_edges` (including the foreign-key check's stock error),
+    `reader_cache`, `precheck`, `copy_attach_race`, and `stock_rewrites`,
+    which pins the stock behaviour of the commands the extension does not
+    guard (TRUNCATE, rewriting ALTER TABLE, REFRESH MATERIALIZED VIEW);
   - TAP (`t/001` to `t/016`): `pg_dump`, `pg_upgrade`, hot standbys, hook
     chaining with `pg_stat_statements` and with the test-only module
     `test/modules/oat_observer`, COPY, the pre-check, logical replication's

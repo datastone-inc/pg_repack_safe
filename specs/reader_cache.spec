@@ -14,11 +14,14 @@
 #   cache was loaded before the record existed; the invalidation sent with
 #   the record arrives at the commit. A REPACK step does not stop between
 #   writing its record and committing, so the record is written by
-#   test_insert_record (test/modules/test_record), which does what the writer
-#   does: simple_heap_insert and a relcache invalidation of the record table,
-#   no trigger. The same under session_replication_role = replica: the
-#   writer's path does not depend on triggers, so the setting changes
-#   nothing.
+#   test_insert_record (test/modules/test_record), which inserts the way the
+#   writer does for what this spec tests: a heap insert that fires no
+#   trigger, then a relcache invalidation of the record table. The same
+#   under session_replication_role = replica, which disables every trigger
+#   not enabled ALWAYS: readers learn of a record from the writer's own
+#   invalidation, not from a trigger, so the setting changes nothing. The
+#   permutation guards that: were the invalidation moved into a trigger, it
+#   would fail.
 #
 # - o_truncate: the one SQL statement that can change the records, a
 #   TRUNCATE under pg_repack_safe.allow_unprotected_drop. The reader, whose
@@ -71,7 +74,7 @@ permutation r_warm r_begin p_repack r_t r_commit
 permutation p_repack r_warm r_begin p_repack r_t r_commit
 # A record whose transaction is open when the reader takes its snapshot.
 permutation r_warm o_begin o_record r_begin o_commit r_t r_commit
-# The same under session_replication_role = replica.
+# The same under session_replication_role = replica: no trigger is involved.
 permutation r_warm o_replica o_record r_begin o_commit r_t r_commit
 # The records are truncated under the override while a reader needs one.
 permutation r_begin_sp p_repack r_t r_back o_truncate r_t r_commit

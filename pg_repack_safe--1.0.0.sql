@@ -90,3 +90,17 @@ AS 'MODULE_PATHNAME'
 LANGUAGE C VOLATILE;
 
 REVOKE ALL ON FUNCTION pg_repack_safe_prune_records() FROM PUBLIC;
+
+-- Whether the guard is in force on this server: true if it loaded the
+-- library through shared_preload_libraries. Without that, the extension
+-- still looks installed but guards nothing: REPACK (CONCURRENTLY) writes no
+-- record and no read is checked. The function then returns false with a
+-- WARNING that says so. The extension's comment, which \dx shows, points
+-- here. Calling the function loads the library in the calling backend if it
+-- was not loaded, and fails if the library is not installed at all. It
+-- reveals no more than SHOW shared_preload_libraries, so any role may call
+-- it.
+CREATE FUNCTION pg_repack_safe_status()
+RETURNS boolean
+AS 'MODULE_PATHNAME'
+LANGUAGE C VOLATILE;

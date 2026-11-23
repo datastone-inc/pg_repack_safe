@@ -53,7 +53,7 @@ On hot standbys that run queries, also set `hot_standby_feedback = on`,
 ideally with a physical replication slot. It prevents a stock PostgreSQL
 problem the extension does not cover: `VACUUM FULL`, `CLUSTER` and plain
 `REPACK` on the primary can otherwise drop rows a standby query still
-needs (README, "Known gaps").
+needs (README, "What pg_repack_safe does not guarantee").
 
 ## Enabling the Extension
 
@@ -71,7 +71,7 @@ The extension creates the table `pg_repack_safe_rewrites` in its schema.
 It needs a superuser to create. Its settings:
 
 | Setting | Default | Who | Meaning |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `pg_repack_safe.precheck_snapshot_age` | `-1` (off) | any user | refuse `REPACK (CONCURRENTLY)` while a session could later read the table with an older snapshot (README, "Optional pre-check") |
 | `pg_repack_safe.allow_unprotected_drop` | `off` | superuser | let `DROP` and `TRUNCATE` remove the record table, its triggers or the extension while the record table holds records; old snapshots then read repacked tables as empty (README, "Removing the extension") |
 | `pg_repack_safe.trace_storage_changes` | `off` | superuser | report each detected replacement of a table's storage as a NOTICE (diagnostics) |
@@ -189,7 +189,7 @@ A library listed after `pg_repack_safe` in `shared_preload_libraries` sees
 every statement first, the refused ones included. So list `pg_repack_safe`
 before an audit or statistics library that should record refused attempts:
 
-```
+```ini
 shared_preload_libraries = 'pg_repack_safe, pg_stat_statements'
 ```
 
@@ -198,6 +198,20 @@ It registers a custom WAL resource manager with ID 149, reserved for
 ([CustomWALResourceManagers](https://wiki.postgresql.org/wiki/CustomWALResourceManagers)).
 
 ## Verifying the Installation
+
+On each server, and in each database with the extension:
+
+```sql
+SELECT pg_repack_safe_status();
+```
+
+It must return `t`. With `f`, and a `WARNING` that says why, the server did
+not load the library through `shared_preload_libraries`, and the extension
+guards nothing there.
+Nothing else reports this state: the extension is still listed by `\dx`,
+and `REPACK (CONCURRENTLY)` runs without an error.
+
+To run the test suites:
 
 ```bash
 make installcheck
@@ -216,4 +230,8 @@ record table, which the extension otherwise refuses, so do not run
 See the README, "Removing the extension": dropping it is refused while its
 record table holds records, deleted ones included, and the safe order is to
 delete the records with `pg_repack_safe_prune_records()`, vacuum the record
-table until it is empty, drop the extension, and then remove the library.
+table until it is empty, and drop the extension. Removing the library from
+`shared_preload_libraries` afterwards is optional: kept, it refuses
+`REPACK (CONCURRENTLY)` in every database; removed, the command runs
+unguarded. Uninstall the package only once no base backup or archived WAL
+from before the drop is kept, since restoring those needs the library.

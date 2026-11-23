@@ -11,10 +11,11 @@
 # with the library replays the record (a no-op) and keeps protecting its old
 # snapshots. The primary's own crash recovery replays it too.
 #
-# Known gap, not tested here (open question 17): a standby without the
-# library whose replay starts from a checkpoint between the swap and the
-# commit never sees the record. Placing a checkpoint there needs injection
-# points, which this build lacks.
+# The record is a best-effort safeguard against that misconfiguration, not
+# part of the guarantee. Not tested here (research question 17): a standby
+# without the library whose replay starts from a checkpoint between the swap
+# and the commit never sees the record. Placing a checkpoint there needs
+# injection points, which this build lacks.
 
 use strict;
 use warnings FATAL => 'all';

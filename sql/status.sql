@@ -1,0 +1,48 @@
+/*
+ * Copyright (c) 2026 dataStone Inc.
+ * SPDX-License-Identifier: MIT
+ */
+
+/**
+ * @file status.sql
+ * @brief pg_repack_safe_status() on a server that preloads the library
+ *
+ * The extension can exist in a database whose server does not preload the
+ * library; it then looks installed and guards nothing. The status function
+ * returns true only on a server that preloads it, and false with a WARNING
+ * otherwise; the extension's comment, which \dx shows, points to it. The
+ * not-preloaded case is in t/009_not_preloaded.pl.
+ */
+
+CREATE EXTENSION pg_repack_safe;
+
+-- \dx shows the comment, which names the check.
+SELECT obj_description(oid, 'pg_extension') AS comment
+FROM pg_extension WHERE extname = 'pg_repack_safe';
+
+-- This instance preloads the library (test/temp_instance.conf): true, and
+-- no warning.
+SELECT pg_repack_safe_status();
+
+-- Any role may call it.
+CREATE ROLE status_user;
+SET ROLE status_user;
+SELECT pg_repack_safe_status();
+RESET ROLE;
+DROP ROLE status_user;
+
+-- With the package uninstalled, the call fails with "could not access
+-- file" (README, "Removing the extension", step 5). The installed library
+-- cannot be removed here, since the other suites use it, so this pins the
+-- error PostgreSQL raises for the same function in a file that does not
+-- exist. It raises it as soon as the function is declared, since CREATE
+-- FUNCTION loads a C function's file.
+CREATE FUNCTION status_missing_library() RETURNS boolean
+AS '$libdir/pg_repack_safe_missing', 'pg_repack_safe_status'
+LANGUAGE C;
+
+DROP EXTENSION pg_repack_safe;
+
+-- After DROP EXTENSION the function is gone with it (README, "Removing the
+-- extension", step 5).
+SELECT pg_repack_safe_status();

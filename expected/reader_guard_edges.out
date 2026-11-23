@@ -167,6 +167,119 @@ step r_parent: SELECT count(*) FROM p;
 ERROR:  cannot read table "p1" with this snapshot
 step r_commit: COMMIT;
 
+starting permutation: r_begin p_repack r_ins r_t r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) t;
+step r_ins: INSERT INTO t VALUES (6, 6);
+step r_t: SELECT count(*), sum(v) FROM t;
+ERROR:  cannot read table "t" with this snapshot
+step r_commit: COMMIT;
+
+starting permutation: r_begin p_repack r_cte r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) t;
+step r_cte: WITH i AS (INSERT INTO t VALUES (8, 8) RETURNING id) SELECT count(*) FROM i;
+count
+-----
+    1
+(1 row)
+
+step r_commit: COMMIT;
+
+starting permutation: r_begin p_repack r_ins_sel r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) t;
+step r_ins_sel: INSERT INTO t SELECT id + 10, v FROM t;
+ERROR:  cannot read table "t" with this snapshot
+step r_commit: COMMIT;
+
+starting permutation: r_begin p_repack r_ins_sub r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) t;
+step r_ins_sub: INSERT INTO t VALUES (7, (SELECT count(*) FROM t));
+ERROR:  cannot read table "t" with this snapshot
+step r_commit: COMMIT;
+
+starting permutation: r_begin p_repack r_cte_read r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) t;
+step r_cte_read: WITH i AS (INSERT INTO t VALUES (8, 8) RETURNING id) SELECT count(*) FROM t;
+ERROR:  cannot read table "t" with this snapshot
+step r_commit: COMMIT;
+
+starting permutation: r_begin p_repack r_ins_nothing r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) t;
+step r_ins_nothing: INSERT INTO t VALUES (1, 1) ON CONFLICT DO NOTHING;
+ERROR:  could not serialize access due to concurrent update
+step r_commit: COMMIT;
+
+starting permutation: r_begin p_repack r_ins_update r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) t;
+step r_ins_update: INSERT INTO t VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET v = t.v + 1;
+ERROR:  could not serialize access due to concurrent update
+step r_commit: COMMIT;
+
+starting permutation: r_begin p_repack r_ins_select r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) t;
+step r_ins_select: INSERT INTO t VALUES (1, 1) ON CONFLICT (id) DO SELECT RETURNING id;
+ERROR:  could not serialize access due to concurrent update
+step r_commit: COMMIT;
+
+starting permutation: r_begin p_repack_s r_ins_self r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_repack_s: REPACK (CONCURRENTLY) s;
+step r_ins_self: INSERT INTO s VALUES (6, 1);
+ERROR:  cannot read table "s" with this snapshot
+step r_commit: COMMIT;
+
 starting permutation: r_begin o_insert_e p_repack_e r_e r_commit
 step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
 count
@@ -191,4 +304,16 @@ step o_create_n: CREATE TABLE n (id int PRIMARY KEY); INSERT INTO n VALUES (1);
 step p_repack_n: REPACK (CONCURRENTLY) n;
 step r_n: SELECT count(*) FROM n;
 ERROR:  cannot read table "n" with this snapshot
+step r_commit: COMMIT;
+
+starting permutation: r_begin p_repack_pk r_fk r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step p_repack_pk: REPACK (CONCURRENTLY) pk;
+step r_fk: INSERT INTO fk VALUES (1);
+ERROR:  insert or update on table "fk" violates foreign key constraint "fk_id_fkey"
 step r_commit: COMMIT;

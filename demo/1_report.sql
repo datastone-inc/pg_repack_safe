@@ -20,5 +20,10 @@ SELECT count(*) AS customers FROM customers;
 SELECT count(*) AS orders, sum(amount) AS revenue FROM orders;
 COMMIT;
 
--- What a new transaction sees.
+-- The report runs again in a new transaction. With the extension this is
+-- the retry the error asks for. On stock PostgreSQL nothing asks for it, and
+-- the report above has already given its wrong figures.
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) AS customers FROM customers;
 SELECT count(*) AS orders, sum(amount) AS revenue FROM orders;
+COMMIT;

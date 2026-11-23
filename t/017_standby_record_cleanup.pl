@@ -20,6 +20,10 @@
 # - "idle" is idle in its transaction then: terminated.
 # None of them ever gets a row count for t.
 #
+# With log_recovery_conflict_waits on, the standby's log names the record
+# table as the relation whose cleanup the replay waits on: the README's way
+# to tell these conflicts from those of other vacuums.
+#
 # Then the removal procedure of the README ("Removing the extension"):
 # pruned and vacuumed to zero blocks, the extension is dropped without
 # pg_repack_safe.allow_unprotected_drop.
@@ -51,6 +55,8 @@ $standby->init_from_backup($primary, 'base', has_streaming => 1);
 $standby->append_conf('postgresql.conf', q{
 hot_standby_feedback = off
 max_standby_streaming_delay = 200ms
+log_recovery_conflict_waits = on
+deadlock_timeout = 50ms
 });
 $standby->start;
 
@@ -113,6 +119,9 @@ $early->quit;
 
 # The primary has no snapshot that needs the record, so VACUUM removes it.
 my $logOffset = -s $standby->logfile;
+my ($dbOid, $filenode) = split /\|/, $primary->safe_psql('postgres', q{
+    SELECT d.oid, pg_relation_filenode('pg_repack_safe_rewrites')
+    FROM pg_database d WHERE d.datname = current_database()});
 $primary->safe_psql('postgres', 'VACUUM pg_repack_safe_rewrites');
 is($primary->safe_psql('postgres', $versions),
     '0', 'primary: VACUUM removed the deleted record');
@@ -132,6 +141,23 @@ like(slurp_file($standby->logfile, $logOffset),
     qr/FATAL:  terminating connection due to conflict with recovery/,
     'standby: the idle reader was terminated by the conflict');
 eval { $idle->quit; };
+
+# The wait is logged after deadlock_timeout, before the readers are ended,
+# with the WAL record being replayed, which names the record table as
+# tablespace/database/filenode; the README maps it back with
+# pg_filenode_relation.
+my $conflictLog = slurp_file($standby->logfile, $logOffset);
+like($conflictLog,
+    qr/LOG:  recovery still waiting after [\d.]+ ms: recovery conflict on snapshot\n.*DETAIL:  Conflicting processes: .*$idlePid/,
+    'standby: the wait on the conflict is logged with the readers it ends');
+my ($spcOid) = $conflictLog =~
+    m{recovery still waiting.*\n.*\n.*CONTEXT:  WAL redo at .* rel (\d+)/$dbOid/$filenode\b};
+ok(defined $spcOid,
+    'standby: the logged WAL record names the record table');
+is($standby->safe_psql('postgres',
+        "SELECT pg_filenode_relation(" . ($spcOid // 'NULL') . ", $filenode)"),
+    'pg_repack_safe_rewrites',
+    'standby: pg_filenode_relation maps the logged relation to the record table');
 
 is($standby->safe_psql('postgres', $versions),
     '0', 'standby: the record is removed');

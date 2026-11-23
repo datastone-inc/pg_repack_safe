@@ -38,7 +38,7 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install PostgreSQL 19
         run: |
@@ -67,7 +67,7 @@ jobs:
 
       - name: Keep the test output
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-output-${{ matrix.runner }}
           if-no-files-found: ignore
@@ -83,7 +83,7 @@ jobs:
     name: REL_19_STABLE from source, clang, assertions
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
@@ -118,7 +118,7 @@ jobs:
 
       - name: Keep the test output
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-output-upstream
           if-no-files-found: ignore
