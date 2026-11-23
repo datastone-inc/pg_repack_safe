@@ -47,7 +47,7 @@ RESET ROLE;
 DROP ROLE status_user;
 
 -- With the package uninstalled, the call fails with "could not access
--- file" (README, "Removing the extension", step 5). The installed library
+-- file" (doc/removal.md, step 5). The installed library
 -- cannot be removed here, since the other suites use it, so this pins the
 -- error PostgreSQL raises for the same function in a file that does not
 -- exist. It raises it as soon as the function is declared, since CREATE
@@ -58,8 +58,8 @@ LANGUAGE C;
 
 DROP EXTENSION pg_repack_safe;
 
--- After DROP EXTENSION the function is gone with it (README, "Removing the
--- extension", step 5).
+-- After DROP EXTENSION the function is gone with it (doc/removal.md,
+-- step 5).
 SELECT repack_safe.status();
 
 -- DROP EXTENSION leaves the schema, which is not a member of the extension.

@@ -21,10 +21,10 @@
 # None of them ever gets a row count for t.
 #
 # With log_recovery_conflict_waits on, the standby's log names the record
-# table as the relation whose cleanup the replay waits on: the README's way
+# table as the relation whose cleanup the replay waits on: the way doc/standbys.md gives
 # to tell these conflicts from those of other vacuums.
 #
-# Then the removal procedure of the README ("Removing the extension"):
+# Then the removal procedure of doc/removal.md:
 # pruned and vacuumed to zero blocks, the extension is dropped without
 # pg_repack_safe.allow_unprotected_removal.
 
@@ -144,7 +144,7 @@ eval { $idle->quit; };
 
 # The wait is logged after deadlock_timeout, before the readers are ended,
 # with the WAL record being replayed, which names the record table as
-# tablespace/database/filenode; the README maps it back with
+# tablespace/database/filenode; doc/standbys.md maps it back with
 # pg_filenode_relation.
 my $conflictLog = slurp_file($standby->logfile, $logOffset);
 like($conflictLog,

@@ -134,5 +134,25 @@ leaves its instance in place for inspection.
 make PG_CONFIG=/path/to/pg19/bin/pg_config install installcheck
 ```
 
+## Documentation layout
+
+`README.md` is the first screen: the problem, what the extension does, how
+to install and verify it, what it costs, what it guarantees and what it
+does not. Everything longer is in `doc/`:
+
+- `problem.md`: the problem in detail and the demo's output;
+- `installation.md`: requirements, settings, upgrades, logical replication;
+- `design.md`: the argument that the guard is sound, with the function, the
+  PostgreSQL source and the test behind each step, and the costs;
+- `limits.md`: errors where a result might have been correct, known gaps,
+  and what is lost when a requirement is not met;
+- `standbys.md`: recovery conflicts on standbys without
+  `hot_standby_feedback`;
+- `removal.md`: removing the extension without exposing a snapshot;
+- `research/`: the notes and history the design came from.
+
+A change to a hook or to what a check covers updates `design.md` in the
+same commit.
+
 Every SQL example in the documentation has a matching test in
 `sql/doc_examples.sql`, headed by the document and section it comes from.

@@ -18,9 +18,15 @@ SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_repack_safe';
 -- README.md, Installation; doc/installation.md, Verifying the Installation
 SELECT repack_safe.status();
 
+-- The same two sections: the library's version, which varies from release
+-- to release, so only its form is shown.
+SELECT module_name, version ~ '^[0-9]+\.[0-9]+\.[0-9]+$' AS has_version
+FROM pg_get_loaded_modules()
+WHERE module_name = 'pg_repack_safe';
+
 DROP EXTENSION pg_repack_safe;
 
--- README.md, Standby errors caused by pg_repack_safe. The database OID and
+-- doc/standbys.md, How to tell it was the record table. The database OID and
 -- the filenode vary from run to run, so the lookups take them from the
 -- catalogs; 1663 is pg_default. The log line they come from is checked in
 -- t/017_standby_record_cleanup.pl.
@@ -35,7 +41,7 @@ ALTER TABLE repack_safe.rewrites SET (log_autovacuum_min_duration = 0);
 SELECT reloptions FROM pg_class WHERE oid = 'repack_safe.rewrites'::regclass;
 DROP EXTENSION pg_repack_safe;
 
--- README.md, Optional pre-check
+-- doc/installation.md, Optional pre-check
 SET pg_repack_safe.precheck_snapshot_age = '10min';
 SHOW pg_repack_safe.precheck_snapshot_age;
 RESET pg_repack_safe.precheck_snapshot_age;
@@ -62,7 +68,7 @@ WHERE pubname = 'my_publication' AND schemaname = 'repack_safe'
 DROP PUBLICATION my_publication;
 DROP EXTENSION pg_repack_safe;
 
--- README.md, Removing the extension
+-- doc/removal.md
 CREATE EXTENSION pg_repack_safe;
 CREATE TABLE de_t (id int PRIMARY KEY);
 INSERT INTO de_t SELECT generate_series(1, 3);
@@ -100,6 +106,7 @@ FROM pg_stat_replication WHERE backend_xmin IS NOT NULL;
 -- Step 4.
 DROP EXTENSION pg_repack_safe;
 SELECT count(*) = 0 AS dropped FROM pg_extension WHERE extname = 'pg_repack_safe';
+DROP SCHEMA repack_safe;
 
 -- Step 5. The WAL position varies from run to run, so only its presence is
 -- shown here. This instance is not a standby, so the standby's check
@@ -119,7 +126,8 @@ ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements';
 ALTER SYSTEM RESET shared_preload_libraries;
 SHOW shared_preload_libraries;
 
--- The override: a drop with a record left, in one session.
+-- README.md, Turning it off; doc/removal.md, the override: a drop with a
+-- record left, in one session.
 CREATE EXTENSION pg_repack_safe;
 REPACK (CONCURRENTLY) de_t;
 SELECT count(*) > 0 AS has_record FROM repack_safe.rewrites;

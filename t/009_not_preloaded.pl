@@ -185,7 +185,7 @@ is($node->safe_psql('postgres',
     '0', 'KNOWN GAP: library never loaded, no record is written');
 
 # Where the library cannot be installed, PostgreSQL itself can switch
-# REPACK (CONCURRENTLY) off for the whole server (README, "Without the
+# REPACK (CONCURRENTLY) off for the whole server (doc/limits.md, "Without the
 # extension"): it needs a replication slot from a pool of its own, and
 # refuses when that pool is empty. REPACK without CONCURRENTLY, which is
 # MVCC-safe, does not use it.
@@ -234,8 +234,8 @@ $node->stop;
 
 # Known gap, pinned: the refusal to drop the extension while its record
 # table holds records is in the library's object access hook, so a server
-# that no longer preloads the library drops it anyway (README, "Removing the
-# extension", step 5). The same drop on the same records is refused while
+# that no longer preloads the library drops it anyway (doc/removal.md,
+# step 5). The same drop on the same records is refused while
 # the library is preloaded.
 {
     my $unloaded = PostgreSQL::Test::Cluster->new('unloaded_drop');
