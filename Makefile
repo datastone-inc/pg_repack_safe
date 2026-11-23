@@ -19,7 +19,7 @@ REGRESS_OPTS = --temp-instance=./tmp_check_regress \
 # instance set up like the REGRESS one (test/temp_instance.conf).
 ISOLATION = repack_concurrently_snapshot repack_concurrently_cursor \
             reader_guard_edges reader_cache precheck stock_rewrites \
-            copy_attach_race record_prune
+            copy_attach_race record_prune unread_relations
 ISOLATION_OPTS = --temp-instance=./tmp_check_iso \
                  --temp-config=$(srcdir)/test/temp_instance.conf
 

@@ -79,7 +79,7 @@ It needs a superuser to create. Its settings:
 | Setting | Default | Who | Meaning |
 | --- | --- | --- | --- |
 | `pg_repack_safe.precheck_snapshot_age` | `-1` (off) | any user | refuse `REPACK (CONCURRENTLY)` while a session could later read the table with an older snapshot; a time (milliseconds without a unit, or e.g. `'10min'`), `0` for any age (README, "Optional pre-check") |
-| `pg_repack_safe.allow_unprotected_drop` | `off` | superuser | let `DROP` and `TRUNCATE` remove the record table, its triggers or the extension while the record table holds records; old snapshots then read repacked tables as empty (README, "Removing the extension") |
+| `pg_repack_safe.allow_unprotected_drop` | `off` | superuser | let `DROP` and `TRUNCATE` remove the record table, its triggers or the extension, and let the record table be renamed or moved to another schema, while the record table holds records; old snapshots then read repacked tables as empty (README, "Removing the extension") |
 | `pg_repack_safe.trace_storage_changes` | `off` | superuser | report each detected replacement of a table's storage as a NOTICE (diagnostics) |
 
 ## Upgrading PostgreSQL

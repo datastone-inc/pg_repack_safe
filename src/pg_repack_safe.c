@@ -23,11 +23,14 @@
  *   writer). The same hook protects the record table: it refuses a rewrite
  *   that would not keep the records, any change to when its triggers fire,
  *   any index on it and any change to its columns, and, while the table
- *   holds records, its drop or truncation and the drop of its triggers or of
- *   the extension.
+ *   holds records, its drop or truncation, the drop of its triggers or of
+ *   the extension, and a change of its name or schema that would leave the
+ *   extension unable to find it.
  * - ProcessUtility_hook: classifies the innermost utility statement. Only
  *   REPACK with the CONCURRENTLY option counts as an unsafe rewriter, and it
- *   is refused unless the record table exists and is locked first. COPY
+ *   is refused unless the record table exists and is locked first. ALTER
+ *   EXTENSION pg_repack_safe SET SCHEMA is the one statement that may move
+ *   the record table to another schema while it holds records. COPY
  *   relation TO, which reads outside the executor, gets the reader check
  *   here; for a partitioned table it is turned into COPY (query) TO, which
  *   the executor hook checks.
@@ -95,6 +98,7 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
 #include "nodes/value.h"
 #include "replication/logicalworker.h"
@@ -102,6 +106,7 @@
 #include "storage/lmgr.h"
 #include "storage/lock.h"
 #include "storage/proc.h"
+#include "storage/sinval.h"
 #include "utils/backend_status.h"
 #include "utils/timestamp.h"
 #include "tcop/utility.h"
@@ -170,7 +175,8 @@ static bool traceStorageChanges = false;
 
 /*
  * GUC: let DROP and TRUNCATE remove the record table, its triggers or the
- * extension while the record table holds records.
+ * extension, and let the record table be renamed or moved to another
+ * schema, while the record table holds records.
  */
 static bool allowUnprotectedDrop = false;
 
@@ -199,6 +205,14 @@ static Oid rewriterRecordTable = InvalidOid;
  * it.
  */
 static bool inMvccSafeRewriter = false;
+
+/*
+ * True while the innermost utility statement is ALTER EXTENSION
+ * pg_repack_safe SET SCHEMA, which moves the extension and its member
+ * objects together (protectRecordTableName,
+ * protectRecordTableFromExtensionMove).
+ */
+static bool inExtensionSchemaMove = false;
 
 /**
  * @brief Tell whether the innermost utility statement is an unsafe rewriter
@@ -261,7 +275,7 @@ static HTAB *recordCache = NULL;
 static RecordCacheState recordCacheState = RECORD_CACHE_INVALID;
 static Oid recordCacheTable = InvalidOid;
 
-/* What a caller needs the record table for (see exemptInBinaryUpgrade). */
+/* What a caller needs the record table for (see recordTableIncomplete). */
 typedef enum RecordTableUse
 {
   RECORD_TABLE_FOR_READER, /* the reader check */
@@ -350,6 +364,28 @@ isRecordTriggerFunction(Oid funcOid, const char *name)
 }
 
 /**
+ * @brief Tell whether an invalidation message arrived since a point in time
+ * @param counter SharedInvalidMessageCounter as read at that point
+ * @return True if this backend has since received a message or a reset of
+ *         its message queue
+ *
+ * The lookups and the cache load in this file repeat when this is true and
+ * one of their callbacks fired while they ran. A callback alone does not
+ * tell: with debug_discard_caches set, every AcceptInvalidationMessages
+ * call runs every registered callback although nothing changed (inval.c,
+ * AcceptInvalidationMessages and InvalidateSystemCachesExtended), and a
+ * loop that repeated on the callback would never end. The counter advances
+ * for every message received and for a queue reset (sinval.c,
+ * ReceiveSharedInvalidMessages) and not for that discard, which is how
+ * RangeVarGetRelidExtended (namespace.c) decides to repeat its lookup.
+ */
+static inline bool
+invalidatedSince(uint64 counter)
+{
+  return SharedInvalidMessageCounter != counter;
+}
+
+/**
  * @brief Syscache callback: forget the cached record table OID
  * @param arg Unused
  * @param cacheid Cache that was invalidated
@@ -376,39 +412,59 @@ recordTableCacheCallback(Datum arg, int cacheid, uint32 hashvalue)
 }
 
 /**
- * @brief Tell whether a record table check is skipped in binary-upgrade mode
+ * @brief Tell whether the reader check passes a record table that is still
+ *        being created
  * @param use What the caller needs the record table for
- * @return True for the reader check while the server runs in binary-upgrade
- *         mode
+ * @return True for the reader check in binary-upgrade mode, and for the
+ *         reader check while this backend runs one of the extension's own
+ *         scripts
  *
- * The one exemption from "a record table that cannot be used is refused",
- * decided by the developer (fix-design.md section 6b). In binary-upgrade
- * mode pg_dump creates the extension empty (pg_dump.c,
- * binary_upgrade_create_empty_extension), adds the record table in a later
- * statement and its triggers after that, and runs queries in between
- * (t/003_pg_upgrade.pl fails without the exemption). So the reader check
- * passes an extension without its record table, and a record table without
- * its triggers. Only superusers can connect in that mode (postinit.c).
- * REPACK (CONCURRENTLY) is never exempt, so no unsafe rewrite can happen in
- * either state.
+ * The two exemptions from "a record table that cannot be used is refused".
+ * Under either, the reader check passes an extension without its record
+ * table, and a record table without its triggers; a record table that
+ * exists is still loaded and its records are still checked. REPACK
+ * (CONCURRENTLY) is never exempt, so no unsafe rewrite can happen in either
+ * state.
+ *
+ * - Binary-upgrade mode, decided by the developer (fix-design.md section
+ *   6b). pg_dump creates the extension empty (pg_dump.c,
+ *   binary_upgrade_create_empty_extension), adds the record table in a
+ *   later statement and its triggers after that, and runs queries in
+ *   between (t/003_pg_upgrade.pl fails without the exemption). Only
+ *   superusers can connect in that mode (postinit.c).
+ * - A script of this extension, decided by the developer (fix-design.md
+ *   section 6b), run by CREATE EXTENSION or ALTER EXTENSION UPDATE in this
+ *   backend (extension.c, execute_extension_script, sets
+ *   creating_extension and CurrentExtensionObject for the script and
+ *   clears them however it ends). The install script creates the table in
+ *   one command and its triggers in later ones, and an event trigger
+ *   fires for each command of a script, so its function's queries run
+ *   between them (t/020_create_with_event_trigger.pl). The script's changes
+ *   are not committed, so no other backend sees either state.
  */
 static bool
-exemptInBinaryUpgrade(RecordTableUse use)
+recordTableIncomplete(RecordTableUse use)
 {
-  return use == RECORD_TABLE_FOR_READER && IsBinaryUpgrade;
+  if (use != RECORD_TABLE_FOR_READER)
+    return false;
+  if (IsBinaryUpgrade)
+    return true;
+  return creating_extension &&
+         CurrentExtensionObject == get_extension_oid(EXTENSION_NAME, true);
 }
 
 /**
  * @brief Find the unsafe-rewrite record table in the current database
  * @param use What the caller needs the table for; decides the
- *        binary-upgrade exemption from the missing-table error
+ *        exemption from the missing-table error (recordTableIncomplete)
  * @return OID of the record table, or InvalidOid when the extension is not
  *         created in this database, or under that exemption
  *
- * Invariant: the returned OID comes from lookups during which no pg_class
- * invalidation arrived. The catalog lookups can process invalidation
- * messages, so the cache is marked valid before they run; a callback that
- * fires during them clears the mark and the lookup is repeated.
+ * Invariant: the returned OID comes from lookups during which no
+ * invalidation of the entries they read arrived. The catalog lookups can
+ * process invalidation messages, so the cache is marked valid before they
+ * run; if a callback clears the mark during them and a message arrived
+ * (invalidatedSince), the lookup is repeated.
  *
  * An extension without its record table is catalog state that neither the
  * reader check nor an unsafe rewriter can work with, so it raises an error.
@@ -420,6 +476,7 @@ lookupRecordTable(RecordTableUse use)
   {
     Oid extensionOid;
     Oid tableOid = InvalidOid;
+    uint64 counter = SharedInvalidMessageCounter;
 
     CHECK_FOR_INTERRUPTS();
 
@@ -442,7 +499,7 @@ lookupRecordTable(RecordTableUse use)
       recordTableNameHashSet = true;
       tableOid = get_relname_relid(RECORD_TABLE_NAME, schemaOid);
     }
-    if (!recordTableOidKnown)
+    if (!recordTableOidKnown && invalidatedSince(counter))
       continue;
 
     if (OidIsValid(extensionOid) && !OidIsValid(tableOid))
@@ -450,8 +507,8 @@ lookupRecordTable(RecordTableUse use)
       /* Not cached: every query looks again until the state is fixed. */
       recordTableOidKnown = false;
 
-      /* pg_upgrade has created the extension but not yet the table. */
-      if (exemptInBinaryUpgrade(use))
+      /* The extension is created, but not yet the table. */
+      if (recordTableIncomplete(use))
         return InvalidOid;
 
       ereport(ERROR,
@@ -459,9 +516,10 @@ lookupRecordTable(RecordTableUse use)
                errmsg("pg_repack_safe cannot find its record table"),
                errdetail("The extension \"%s\" exists in this database, but the table \"%s\" is not in its schema.",
                          EXTENSION_NAME, RECORD_TABLE_NAME),
-               errhint("Restore the table's name and schema, or drop and re-create the extension.")));
+               errhint("Restore the table's name and schema, or drop and re-create the extension, which discards its records.")));
     }
     recordTableOid = tableOid;
+    recordTableOidKnown = true;
   }
 
   return recordTableOid;
@@ -506,7 +564,7 @@ hasRecordTrigger(Relation rel, const char *functionName, int16 level,
  *        reader expect
  * @param rel The record table, locked by the caller
  * @param use What the caller needs the table for; decides the
- *        binary-upgrade exemption from the trigger check
+ *        exemption from the trigger check (recordTableIncomplete)
  *
  * The writer forms its rows from this definition and the reader scans the
  * table with heap semantics, so any other definition is refused: two columns
@@ -521,10 +579,10 @@ checkRecordTableDefinition(Relation rel, RecordTableUse use)
    * The triggers are checked for here as well as protected by the object
    * access hook, so that a backend without the library, which no hook can
    * stop, cannot leave the table unprotected without every read and
-   * REPACK (CONCURRENTLY) refusing. Skipped while pg_upgrade has created
-   * the table but not yet its triggers.
+   * REPACK (CONCURRENTLY) refusing. Skipped while the table is created but
+   * not yet its triggers.
    */
-  if (!exemptInBinaryUpgrade(use) &&
+  if (!recordTableIncomplete(use) &&
       (!hasRecordTrigger(rel, PROTECTED_TRIGGER_FUNCTION,
                          TRIGGER_TYPE_STATEMENT, TRIGGER_TYPE_BEFORE,
                          TRIGGER_TYPE_UPDATE | TRIGGER_TYPE_DELETE |
@@ -637,16 +695,18 @@ rewriteHiddenFromSnapshot(FullTransactionId fxid, FullTransactionId next,
  * @param tableOid The record table found by lookupRecordTable
  * @return False if there is no record table to load from, in which case
  *         there is nothing to check: the extension was dropped meanwhile, or
- *         the binary-upgrade exemption applies (exemptInBinaryUpgrade). An
+ *         the table is still being created (recordTableIncomplete). An
  *         extension left without its record table raises an error instead
  *         (lookupRecordTable).
  *
  * Invariant: when this returns true, the cache holds every row version of
  * the record table as of a scan that no invalidation of the table followed.
  * The state is set to RECORD_CACHE_LOADING before the table is locked and
- * scanned; taking the lock processes pending invalidations, and a callback
- * that fires then or later sets it to RECORD_CACHE_INVALID, so the load is
- * repeated.
+ * scanned; taking the lock processes pending invalidations. If a callback
+ * sets the state to RECORD_CACHE_INVALID after that and a message arrived
+ * (invalidatedSince), the load is repeated. The table's OID is accepted the
+ * same way: the lookup is repeated if a message arrived while the lock was
+ * taken and the cached OID is no longer this one.
  */
 static bool
 loadRecordCache(Oid tableOid)
@@ -658,13 +718,15 @@ loadRecordCache(Oid tableOid)
     TableScanDesc scan;
     HeapTuple tuple;
     TupleDesc desc;
+    uint64 counter = SharedInvalidMessageCounter;
 
     CHECK_FOR_INTERRUPTS();
 
     recordCacheState = RECORD_CACHE_LOADING;
     recordCacheTable = tableOid;
     rel = try_table_open(tableOid, AccessShareLock);
-    if (rel == NULL || !recordTableOidKnown || recordTableOid != tableOid)
+    if (rel == NULL || (invalidatedSince(counter) &&
+                        (!recordTableOidKnown || recordTableOid != tableOid)))
     {
       if (rel != NULL)
         table_close(rel, AccessShareLock);
@@ -675,6 +737,9 @@ loadRecordCache(Oid tableOid)
         return false;
       continue;
     }
+    /* The lock is held: only a message from here on repeats the load. */
+    counter = SharedInvalidMessageCounter;
+    recordCacheState = RECORD_CACHE_LOADING;
     checkRecordTableDefinition(rel, RECORD_TABLE_FOR_READER);
 
     if (recordCacheContext == NULL)
@@ -726,7 +791,7 @@ loadRecordCache(Oid tableOid)
     table_endscan(scan);
     table_close(rel, AccessShareLock);
 
-    if (recordCacheState == RECORD_CACHE_LOADING)
+    if (recordCacheState == RECORD_CACHE_LOADING || !invalidatedSince(counter))
     {
       recordCacheState = RECORD_CACHE_CURRENT;
       return true;
@@ -869,12 +934,80 @@ referencesItself(Oid relid)
 }
 
 /**
+ * @brief Tell whether a plan state tree contains a custom scan
+ * @param planstate Node to examine, with the nodes below it; may be NULL
+ * @param context Unused
+ * @return True if the node or one below it is a CustomScanState
+ */
+static bool
+containsCustomScan(PlanState *planstate, void *context)
+{
+  if (planstate == NULL)
+    return false;
+  if (IsA(planstate, CustomScanState))
+    return true;
+  return planstate_tree_walker(planstate, containsCustomScan, context);
+}
+
+/**
+ * @brief Tell whether the executor's open relations are every relation the
+ *        query can read
+ * @param queryDesc Query that ExecutorStart has just started
+ * @return True if a range-table relation the started executor has not
+ *         opened is not read by the query
+ *
+ * Checking only the opened relations is the developer's decision
+ * (fix-design.md section 6b); the argument for it:
+ *
+ * A plan node reads a range-table relation through the Relation that
+ * ExecGetRangeTableRelation (execUtils.c) opens and stores in
+ * EState.es_relations; no other executor code opens a range-table entry's
+ * relation. Its callers all run while the plan is initialized, inside
+ * standard_ExecutorStart: ExecOpenScanRelation, from the init function of
+ * every scan node; ExecInitResultRelation, from ExecInitModifyTable;
+ * InitPlan (execMain.c), for row marks; and the partition pruning setup
+ * (execPartition.c). EvalPlanQual initializes its copy of a plan subtree
+ * later, with the same array and the same pruning result (execMain.c,
+ * EvalPlanQualStart), so it opens nothing new. Left unopened are a relation
+ * the planner removed from the plan (a useless left join, a scan with
+ * constant-false quals), a partition pruned when the executor starts, and
+ * the entries that exist for permission checks and locks only, such as a
+ * view's.
+ *
+ * False when that cannot be relied on: the hooks called before this one
+ * left no executor state, or the plan has a CustomScan, whose provider is
+ * free to open the range table's relations itself (planstate_tree_walker
+ * reaches the plan, its init plans and subplans, and a custom scan's child
+ * nodes; es_subplanstates holds every subplan).
+ */
+static bool
+openRelationsAreAllRead(QueryDesc *queryDesc)
+{
+  EState *estate = queryDesc->estate;
+
+  if (estate == NULL || estate->es_relations == NULL ||
+      queryDesc->planstate == NULL)
+    return false;
+  if (containsCustomScan(queryDesc->planstate, NULL))
+    return false;
+  foreach_ptr(PlanState, subplanstate, estate->es_subplanstates)
+  {
+    if (containsCustomScan(subplanstate, NULL))
+      return false;
+  }
+  return true;
+}
+
+/**
  * @brief Reader check for a query: every relation in its range table that
  *        the query reads
- * @param queryDesc Query being started; its relation locks are held
+ * @param queryDesc Query that ExecutorStart has just started; its relation
+ *        locks are held
  *
- * Invariant: every range-table entry is checked except an INSERT's target
- * and its ON CONFLICT EXCLUDED entry. An INSERT writes its target without
+ * Invariant: every range-table relation the executor has opened is checked,
+ * and every range-table relation when the opened ones may not be all the
+ * query reads (openRelationsAreAllRead), except an INSERT's target and its
+ * ON CONFLICT EXCLUDED entry. An INSERT writes its target without
  * reading it through a snapshot: uniqueness and exclusion checks use a
  * dirty snapshot, and ON CONFLICT raises its own serialization failure for
  * a conflicting row the snapshot does not see (nodeModifyTable.c,
@@ -889,9 +1022,11 @@ checkUnsafeRewriteRecords(QueryDesc *queryDesc)
   PlannedStmt *pstmt = queryDesc->plannedstmt;
   Bitmapset *targets = NULL;
   Bitmapset *excluded = NULL;
+  bool onlyOpened;
 
   if (!recordCacheHasRecords())
     return;
+  onlyOpened = openRelationsAreAllRead(queryDesc);
 
   addUnreadInsertEntries(pstmt->planTree, &targets, &excluded);
   foreach_ptr(Plan, subplan, pstmt->subplans)
@@ -903,6 +1038,8 @@ checkUnsafeRewriteRecords(QueryDesc *queryDesc)
     int rti = foreach_current_index(rte) + 1;
 
     if (rte->rtekind != RTE_RELATION)
+      continue;
+    if (onlyOpened && queryDesc->estate->es_relations[rti - 1] == NULL)
       continue;
     /* EXCLUDED is the composite-type pseudo-relation, never a table. */
     if (bms_is_member(rti, excluded) && rte->relkind == RELKIND_COMPOSITE_TYPE)
@@ -1050,8 +1187,9 @@ checkCopyTo(PlannedStmt *pstmt, bool readOnlyTree)
  * The lock keeps the table from being dropped, renamed or moved to another
  * schema (each needs AccessExclusiveLock) while the caller writes or deletes
  * records. Taking it processes pending invalidation messages, so the OID is
- * accepted only if the cache still holds it once the lock is held; the
- * table's definition is checked under the lock. A record table that cannot
+ * accepted only if the cache still holds it once the lock is held or no
+ * message arrived meanwhile (invalidatedSince); the table's definition is
+ * checked under the lock. A record table that cannot
  * be found, or has another definition, raises an error (lookupRecordTable,
  * checkRecordTableDefinition).
  */
@@ -1062,6 +1200,7 @@ lockRecordTableForChange(void)
   {
     Oid tableOid;
     Relation rel;
+    uint64 counter;
 
     CHECK_FOR_INTERRUPTS();
 
@@ -1069,8 +1208,10 @@ lockRecordTableForChange(void)
     if (!OidIsValid(tableOid))
       return InvalidOid;
 
+    counter = SharedInvalidMessageCounter;
     LockRelationOid(tableOid, RowExclusiveLock);
-    if (recordTableOidKnown && recordTableOid == tableOid)
+    if (!invalidatedSince(counter) ||
+        (recordTableOidKnown && recordTableOid == tableOid))
     {
       rel = try_table_open(tableOid, NoLock);
       if (rel != NULL)
@@ -1697,8 +1838,9 @@ noteRelationAltered(Oid relid)
  * Record table protection
  *
  * Refusals of the statements that would remove records or the triggers
- * that guard them, give the table an index its writer does not maintain, or
- * change its columns. The refusals of UPDATE, DELETE and INSERT are the
+ * that guard them, give the table an index its writer does not maintain,
+ * change its columns, or leave the extension unable to find it. The
+ * refusals of UPDATE, DELETE and INSERT are the
  * table's trigger functions, further down.
  * ----------------------------------------------------------------
  */
@@ -1910,6 +2052,185 @@ protectRecordTableFromRewrite(Oid relid)
              errmsg("cannot rewrite the pg_repack_safe record table while it holds deleted records"),
              errdetail("The rewrite would drop a deleted record without ending the snapshots on standbys that still need it."),
              errhint("Run VACUUM on the record table first, then repeat the command. VACUUM keeps a deleted record for as long as a snapshot on this server needs it.")));
+}
+
+/**
+ * @brief Find a relation by name as the current command left it
+ * @param name Relation name
+ * @param schemaOid Schema to look in
+ * @return OID from the pg_class row of that name and schema visible to
+ *         SnapshotSelf, or InvalidOid when no such row exists
+ *
+ * Invariant: if the current transaction wrote the row, the row it wrote is
+ * found, whatever the command counter, and a row version it replaced is not
+ * (selfVisibleRelfilenode gives the argument).
+ */
+static Oid
+selfVisibleRelationByName(const char *name, Oid schemaOid)
+{
+  Relation classRel;
+  ScanKeyData key[2];
+  SysScanDesc scan;
+  HeapTuple tuple;
+  Oid result = InvalidOid;
+
+  classRel = table_open(RelationRelationId, AccessShareLock);
+  ScanKeyInit(&key[0], Anum_pg_class_relname, BTEqualStrategyNumber, F_NAMEEQ,
+              CStringGetDatum(name));
+  ScanKeyInit(&key[1], Anum_pg_class_relnamespace, BTEqualStrategyNumber,
+              F_OIDEQ, ObjectIdGetDatum(schemaOid));
+  scan = systable_beginscan(classRel, ClassNameNspIndexId, true, SnapshotSelf,
+                            2, key);
+  tuple = systable_getnext(scan);
+  if (HeapTupleIsValid(tuple))
+    result = ((Form_pg_class)GETSTRUCT(tuple))->oid;
+  systable_endscan(scan);
+  table_close(classRel, AccessShareLock);
+
+  return result;
+}
+
+/**
+ * @brief Find an extension's schema as the current command left it
+ * @param extensionOid Extension OID
+ * @return extnamespace from the pg_extension row visible to SnapshotSelf, or
+ *         InvalidOid when no such row exists
+ */
+static Oid
+selfVisibleExtensionSchema(Oid extensionOid)
+{
+  Relation extensionRel;
+  ScanKeyData key;
+  SysScanDesc scan;
+  HeapTuple tuple;
+  Oid result = InvalidOid;
+
+  extensionRel = table_open(ExtensionRelationId, AccessShareLock);
+  ScanKeyInit(&key, Anum_pg_extension_oid, BTEqualStrategyNumber, F_OIDEQ,
+              ObjectIdGetDatum(extensionOid));
+  scan = systable_beginscan(extensionRel, ExtensionOidIndexId, true,
+                            SnapshotSelf, 1, &key);
+  tuple = systable_getnext(scan);
+  if (HeapTupleIsValid(tuple))
+    result = ((Form_pg_extension)GETSTRUCT(tuple))->extnamespace;
+  systable_endscan(scan);
+  table_close(extensionRel, AccessShareLock);
+
+  return result;
+}
+
+/**
+ * @brief Refuse a statement that leaves the extension unable to find its
+ *        record table while the table holds records
+ * @param tableOid The record table
+ *
+ * isRecordTable, and with it every DROP refusal (protectRecordsFromDrop),
+ * finds the record table by its name in the extension's schema. Under any
+ * other name, or in any other schema, DROP EXTENSION and DROP TABLE drop it
+ * and its records as an ordinary table. Any block counts as holding
+ * records, and a superuser can override with
+ * pg_repack_safe.allow_unprotected_drop, both as for DROP
+ * (refuseUnprotectedDrop).
+ */
+static void
+refuseUnfindableRecordTable(Oid tableOid)
+{
+  Relation rel;
+  BlockNumber blocks;
+
+  if (allowUnprotectedDrop)
+    return;
+  rel = try_table_open(tableOid, AccessShareLock);
+  if (rel == NULL)
+    return;
+  blocks = RelationGetNumberOfBlocks(rel);
+  table_close(rel, AccessShareLock);
+  if (blocks == 0)
+    return;
+
+  ereport(ERROR,
+          (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+           errmsg("cannot rename or move the pg_repack_safe record table while it holds records"),
+           errdetail("The extension finds its record table by the name \"%s\" in its own schema. Under another name or in another schema the table could be dropped with its records, and a snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.",
+                     RECORD_TABLE_NAME),
+           errhint("Delete the records with pg_repack_safe_prune_records() and run VACUUM on the record table until it is empty (see the README, \"Removing the extension\"). A superuser can set pg_repack_safe.allow_unprotected_drop instead.")));
+}
+
+/**
+ * @brief OAT_POST_ALTER of the record table: refuse a change of its name or
+ *        schema
+ * @param relid The record table
+ *
+ * Invariant: while the record table holds records, it keeps its name, and
+ * it leaves the extension's schema only together with the extension.
+ *
+ * The statements that change a table's name or schema, and the function in
+ * tablecmds.c that reports each, before the command counter advances, so
+ * that the catalog cache still holds the previous name and schema and a
+ * SnapshotSelf scan returns the new ones:
+ * - ALTER TABLE ... RENAME TO, also spelled ALTER INDEX, ALTER VIEW,
+ *   ALTER SEQUENCE, ALTER MATERIALIZED VIEW or ALTER FOREIGN TABLE:
+ *   RenameRelationInternal;
+ * - ALTER TABLE ... SET SCHEMA in the same spellings, and ALTER EXTENSION
+ *   ... SET SCHEMA for each member table (extension.c,
+ *   AlterExtensionNamespace, through AlterObjectNamespace_oid):
+ *   AlterRelationNamespaceInternal.
+ *
+ * A new schema is allowed under ALTER EXTENSION pg_repack_safe SET SCHEMA
+ * (inExtensionSchemaMove): that statement then moves the extension itself,
+ * and protectRecordTableFromExtensionMove checks that the table is in the
+ * extension's new schema. A row no SnapshotSelf scan finds leaves the new
+ * name unknown and is refused.
+ */
+static void
+protectRecordTableName(Oid relid)
+{
+  Oid oldSchema = get_rel_namespace(relid);
+
+  if (selfVisibleRelationByName(RECORD_TABLE_NAME, oldSchema) == relid)
+    return;
+  if (inExtensionSchemaMove)
+    return;
+  refuseUnfindableRecordTable(relid);
+}
+
+/**
+ * @brief OAT_POST_ALTER of the extension: refuse a move to another schema
+ *        that leaves the record table behind
+ * @param extensionOid The altered extension
+ *
+ * ALTER EXTENSION ... SET SCHEMA moves the extension's member objects and
+ * then the extension, and reports the extension once both are done
+ * (extension.c, AlterExtensionNamespace). A record table that ALTER
+ * EXTENSION ... DROP TABLE detached is not a member and stays where it was,
+ * out of the extension's new schema. The same event is reported for ALTER
+ * EXTENSION ... ADD, DROP and UPDATE, which leave the schema as it was.
+ *
+ * get_extension_schema reads pg_extension with a catalog snapshot, which
+ * does not see the current command's update, so it returns the schema
+ * before the move.
+ */
+static void
+protectRecordTableFromExtensionMove(Oid extensionOid)
+{
+  Oid oldSchema;
+  Oid newSchema;
+  Oid leftBehind;
+
+  if (extensionOid != get_extension_oid(EXTENSION_NAME, true))
+    return;
+
+  oldSchema = get_extension_schema(extensionOid);
+  newSchema = selfVisibleExtensionSchema(extensionOid);
+  if (newSchema == oldSchema)
+    return;
+  if (OidIsValid(newSchema) &&
+      OidIsValid(selfVisibleRelationByName(RECORD_TABLE_NAME, newSchema)))
+    return;
+
+  leftBehind = selfVisibleRelationByName(RECORD_TABLE_NAME, oldSchema);
+  if (OidIsValid(leftBehind))
+    refuseUnfindableRecordTable(leftBehind);
 }
 
 /**
@@ -2377,7 +2698,10 @@ pg_repack_safe_status(PG_FUNCTION_ARGS)
  *
  * A pg_class alteration is first examined for a storage replacement
  * (noteRelationAltered), then, if it is the record table's, refused unless
- * the rewrite keeps its records (protectRecordTableFromRewrite).
+ * the rewrite keeps its records (protectRecordTableFromRewrite) and the
+ * table can still be found (protectRecordTableName). An alteration of the
+ * extension is refused if it moves the extension away from its record table
+ * (protectRecordTableFromExtensionMove).
  *
  * A column is reported with its number as subId, by OAT_POST_CREATE,
  * OAT_DROP or OAT_POST_ALTER; protectRecordTableColumns sees all three and
@@ -2411,10 +2735,15 @@ objectAccessHook(ObjectAccessType access, Oid classId, Oid objectId, int subId,
       if (inUnsafeRewriter() || traceStorageChanges)
         noteRelationAltered(objectId);
       if (isRecordTable(objectId))
+      {
         protectRecordTableFromRewrite(objectId);
+        protectRecordTableName(objectId);
+      }
     }
     else if (classId == TriggerRelationId)
       protectRecordTrigger(objectId);
+    else if (classId == ExtensionRelationId)
+      protectRecordTableFromExtensionMove(objectId);
     else
       protectRecordTableColumns(access, classId, objectId, subId);
     break;
@@ -2456,9 +2785,34 @@ isConcurrentRepack(Node *parsetree)
 }
 
 /**
+ * @brief Tell whether a utility statement is ALTER EXTENSION pg_repack_safe
+ *        SET SCHEMA
+ * @param parsetree Utility statement node
+ * @return True for that statement
+ *
+ * The grammar has one form, AlterObjectSchemaStmt with OBJECT_EXTENSION and
+ * the extension's name as a String node (gram.y, AlterObjectSchemaStmt),
+ * and ExecAlterObjectSchemaStmt (alter.c) is the only caller of
+ * AlterExtensionNamespace.
+ */
+static bool
+isExtensionSchemaMove(Node *parsetree)
+{
+  AlterObjectSchemaStmt *stmt;
+
+  if (!IsA(parsetree, AlterObjectSchemaStmt))
+    return false;
+
+  stmt = (AlterObjectSchemaStmt *)parsetree;
+  return stmt->objectType == OBJECT_EXTENSION &&
+         strcmp(strVal(stmt->object), EXTENSION_NAME) == 0;
+}
+
+/**
  * @brief Run the rest of the ProcessUtility chain under a classification
  * @param recordTable rewriterRecordTable for the statement
  * @param mvccSafeRewriter inMvccSafeRewriter for the statement
+ * @param extensionSchemaMove inExtensionSchemaMove for the statement
  * @param pstmt Planned statement wrapping the utility statement
  * @param queryString Source text
  * @param readOnlyTree Whether the tree must not be modified
@@ -2468,25 +2822,27 @@ isConcurrentRepack(Node *parsetree)
  * @param dest Result receiver
  * @param qc Completion tag output
  *
- * Sets the two classification variables for the statement and restores
+ * Sets the three classification variables for the statement and restores
  * the enclosing statement's values however it ends. A function of its own
  * so that nothing it uses after the setjmp in PG_TRY is modified before
  * it (the caller replaces pstmt and readOnlyTree for COPY TO).
  */
 static void
-runUtilityAs(Oid recordTable, bool mvccSafeRewriter, PlannedStmt *pstmt,
-             const char *queryString, bool readOnlyTree,
+runUtilityAs(Oid recordTable, bool mvccSafeRewriter, bool extensionSchemaMove,
+             PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
              ProcessUtilityContext context, ParamListInfo params,
              QueryEnvironment *queryEnv, DestReceiver *dest,
              QueryCompletion *qc)
 {
   Oid savedRewriterRecordTable = rewriterRecordTable;
   bool savedInMvccSafeRewriter = inMvccSafeRewriter;
+  bool savedInExtensionSchemaMove = inExtensionSchemaMove;
 
   Assert(!(OidIsValid(recordTable) && mvccSafeRewriter));
 
   rewriterRecordTable = recordTable;
   inMvccSafeRewriter = mvccSafeRewriter;
+  inExtensionSchemaMove = extensionSchemaMove;
 
   PG_TRY();
   {
@@ -2501,6 +2857,7 @@ runUtilityAs(Oid recordTable, bool mvccSafeRewriter, PlannedStmt *pstmt,
   {
     rewriterRecordTable = savedRewriterRecordTable;
     inMvccSafeRewriter = savedInMvccSafeRewriter;
+    inExtensionSchemaMove = savedInExtensionSchemaMove;
   }
   PG_END_TRY();
 }
@@ -2567,8 +2924,9 @@ processUtilityHook(PlannedStmt *pstmt, const char *queryString,
   mvccSafeRewriter = !unsafeRewriter && (IsA(pstmt->utilityStmt, VacuumStmt) ||
                                          IsA(pstmt->utilityStmt, RepackStmt));
 
-  runUtilityAs(recordTable, mvccSafeRewriter, pstmt, queryString, readOnlyTree,
-               context, params, queryEnv, dest, qc);
+  runUtilityAs(recordTable, mvccSafeRewriter,
+               isExtensionSchemaMove(pstmt->utilityStmt), pstmt, queryString,
+               readOnlyTree, context, params, queryEnv, dest, qc);
 }
 
 /**
@@ -2633,7 +2991,7 @@ _PG_init(void)
                            NULL, &traceStorageChanges, false, PGC_SUSET, 0,
                            NULL, NULL, NULL);
   DefineCustomBoolVariable("pg_repack_safe.allow_unprotected_drop",
-                           "Lets DROP and TRUNCATE remove the record table, its triggers or the extension while records exist.",
+                           "Lets DROP and TRUNCATE remove the record table, its triggers or the extension, and lets the record table be renamed or moved, while records exist.",
                            "Snapshots taken before a recorded REPACK (CONCURRENTLY) may then read the rewritten tables as empty.",
                            &allowUnprotectedDrop, false, PGC_SUSET, 0, NULL,
                            NULL, NULL);

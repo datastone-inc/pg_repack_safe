@@ -13,6 +13,10 @@
  *   of the record table, by any route (session_replication_role, CASCADE),
  *   are refused unless a superuser sets
  *   pg_repack_safe.allow_unprotected_drop;
+ * - renaming the record table, moving it to another schema, and moving the
+ *   extension to another schema without it, are refused under the same
+ *   rule: the DROP refusals find the table by its name in the extension's
+ *   schema;
  * - rewrites of the record table other than VACUUM FULL, CLUSTER and REPACK
  *   without CONCURRENTLY, which keep every record that is not deleted
  *   unchanged, are refused: REPACK (CONCURRENTLY) and rewriting ALTER TABLE
@@ -426,6 +430,37 @@ WHERE classid = 'pg_class'::regclass
                    0
 (1 row)
 
+-- The drop refusals find the record table by its name in the extension's
+-- schema, so while it holds records it cannot be renamed or moved out of
+-- that schema: DROP EXTENSION would then drop it unrecognized.
+CREATE SCHEMA pr_m;
+ALTER TABLE pg_repack_safe_rewrites RENAME TO pr_renamed;
+ERROR:  cannot rename or move the pg_repack_safe record table while it holds records
+DETAIL:  The extension finds its record table by the name "pg_repack_safe_rewrites" in its own schema. Under another name or in another schema the table could be dropped with its records, and a snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+HINT:  Delete the records with pg_repack_safe_prune_records() and run VACUUM on the record table until it is empty (see the README, "Removing the extension"). A superuser can set pg_repack_safe.allow_unprotected_drop instead.
+ALTER TABLE pg_repack_safe_rewrites SET SCHEMA pr_m;
+ERROR:  cannot rename or move the pg_repack_safe record table while it holds records
+DETAIL:  The extension finds its record table by the name "pg_repack_safe_rewrites" in its own schema. Under another name or in another schema the table could be dropped with its records, and a snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+HINT:  Delete the records with pg_repack_safe_prune_records() and run VACUUM on the record table until it is empty (see the README, "Removing the extension"). A superuser can set pg_repack_safe.allow_unprotected_drop instead.
+-- Nor can the extension move to another schema without the table, once the
+-- table is no longer its member.
+ALTER EXTENSION pg_repack_safe DROP TABLE pg_repack_safe_rewrites;
+ALTER EXTENSION pg_repack_safe SET SCHEMA pr_m;
+ERROR:  cannot rename or move the pg_repack_safe record table while it holds records
+DETAIL:  The extension finds its record table by the name "pg_repack_safe_rewrites" in its own schema. Under another name or in another schema the table could be dropped with its records, and a snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+HINT:  Delete the records with pg_repack_safe_prune_records() and run VACUUM on the record table until it is empty (see the README, "Removing the extension"). A superuser can set pg_repack_safe.allow_unprotected_drop instead.
+ALTER EXTENSION pg_repack_safe ADD TABLE pg_repack_safe_rewrites;
+DROP SCHEMA pr_m;
+SELECT count(*) AS records FROM pg_repack_safe_rewrites;
+ records 
+---------
+       1
+(1 row)
+
+DROP EXTENSION pg_repack_safe;
+ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
+DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+HINT:  Delete the records with pg_repack_safe_prune_records() and run VACUUM on the record table until it is empty (see the README, "Removing the extension"). A superuser can set pg_repack_safe.allow_unprotected_drop instead.
 -- The extension can be moved to another schema; the record table is still
 -- found there, with its records, and still protected.
 CREATE SCHEMA pr_s;
@@ -480,10 +515,12 @@ SET pg_repack_safe.allow_unprotected_drop = on;
 ERROR:  permission denied to set parameter "pg_repack_safe.allow_unprotected_drop"
 RESET ROLE;
 DROP ROLE pr_user;
--- With the override, DROP and TRUNCATE are allowed; ALTER TABLE rewrites,
--- UPDATE, DELETE, INSERT, the triggers, indexes and column changes stay
--- refused.
+-- With the override, DROP, TRUNCATE and renaming are allowed; ALTER TABLE
+-- rewrites, UPDATE, DELETE, INSERT, the triggers, indexes and column changes
+-- stay refused.
 SET pg_repack_safe.allow_unprotected_drop = on;
+ALTER TABLE pg_repack_safe_rewrites RENAME TO pr_renamed;
+ALTER TABLE pr_renamed RENAME TO pg_repack_safe_rewrites;
 ALTER TABLE pg_repack_safe_rewrites SET UNLOGGED;
 ERROR:  cannot rewrite the pg_repack_safe record table with this command
 DETAIL:  Only VACUUM FULL, CLUSTER and REPACK without CONCURRENTLY keep every record unchanged.

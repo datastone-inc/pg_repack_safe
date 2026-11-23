@@ -5,7 +5,7 @@ Research notes, 2026-11-15, against PostgreSQL REL_19_STABLE at db9095b9026
 Tags: **[V]** read in the code, **[I]** inferred and needs a reproducer,
 **[R]** confirmed by this repo's tests. Source references name the file and,
 in parentheses, the function. **Status: direction chosen 2026-11-15
-(record-based reader guard, see "Design direction").
+(record-based reader guard, see "Design direction").**
 
 ## Bottom line
 
@@ -80,8 +80,10 @@ through `cluster_rel` (`vacuum.c (vacuum_rel)`; CLUSTER is a `RepackStmt`). Snap
 scan keeping RECENTLY_DEAD rows (`heapam_handler.c (heapam_relation_copy_for_cluster)`);
 `rewrite_heap_tuple` copies xmin/xmax verbatim (`rewriteheap.c (rewrite_heap_tuple)`),
 freezing only below FreezeLimit ≤ OldestXmin (`vacuum.c (vacuum_get_cutoffs)`;
-`procarray.c (ComputeXidHorizons)`). [I] Open: a standby without hot_standby_feedback may
-need rows VACUUM FULL dropped as DEAD, with no conflict to cancel its query.
+`procarray.c (ComputeXidHorizons)`). [R] Not on a standby without
+hot_standby_feedback: its query may need rows VACUUM FULL dropped as DEAD,
+and no conflict cancels it, so it silently misses them (research question
+1, `t/012_standby_safe_rewrite.pl`; a known gap in stock PostgreSQL).
 
 **Other wrong-results modes in REPACK CONCURRENTLY**
 
@@ -253,7 +255,8 @@ standbys through WAL.
 
 **Reader.** Same interception points as above (ExecutorStart after calling
 through, ProcessUtility for COPY TO). Per RTE_RELATION with storage, after the
-lock is held, snapshot S:
+lock is held, snapshot S (in ExecutorStart only for the relations the
+executor opened: "Relations the plan does not read", below):
 
 1. Fast path: if the record table has zero blocks, pass.
 2. Scan the record table with `SnapshotAny` (deleted rows included) for the
@@ -287,6 +290,43 @@ which costs a second full scan per REPACK (no hook inside the copy) and stops
 working once any row is frozen. Rows deleted after S are a real wrong result
 and must error.
 
+**Relations the plan does not read (developer decision, 2026-11-23).** In
+ExecutorStart the reader checks the range-table relations the executor has
+opened, not every RTE_RELATION entry. Reason: the range table also holds
+relations the plan never scans, and checking them refused queries that read
+no row of the repacked table and that stock PostgreSQL answers correctly: a
+table removed as a useless left join (`analyzejoins.c
+(remove_useless_joins)` leaves the entry in place), a scan replaced by an
+empty Result for constant-false quals, and a partition pruned when the
+executor starts (`execPartition.c (ExecDoInitialPruning)`).
+`specs/unread_relations.spec` has the three cases and a control for each
+that reads the table and is still refused.
+
+Why it is acceptable:
+
+- A plan node reads a range-table relation only through the Relation that
+  `execUtils.c (ExecGetRangeTableRelation)` opens and stores in
+  `EState.es_relations`. No other executor code opens a range-table entry's
+  relation; the other `table_open` calls in `src/backend/executor` are for
+  trigger targets, their ancestors and tuple-routing partitions, which are
+  not range-table reads.
+- Its callers all run while the plan is initialized, inside
+  `standard_ExecutorStart`, before the check: `ExecOpenScanRelation` from
+  every scan node's init function, `ExecInitResultRelation` from
+  `ExecInitModifyTable`, `execMain.c (InitPlan)` for row marks, and the
+  partition pruning setup. `execMain.c (EvalPlanQualStart)` initializes its
+  plan copy later with the same array and the same pruning result, so it
+  opens nothing new.
+- When that argument does not apply, every RTE_RELATION entry is checked as
+  before: the hooks called before this one left no executor state, or the
+  plan contains a CustomScan, whose provider may open range-table relations
+  itself (`openRelationsAreAllRead` in `src/pg_repack_safe.c`).
+
+The argument is for PostgreSQL 19's executor. A later major that opens a
+range-table relation after ExecutorStart, or by another route, would need
+it made again. COPY relation TO is unchanged: it checks the one relation it
+names.
+
 **Divergence from principle 1 (AGENTS.md).** The pg_class variant errored on
 any storage change it did not recognise. This variant is silent on any rewrite
 the writer side did not record, so safety rests on the writer census above.
@@ -301,7 +341,8 @@ tables unacceptable (2026-11-15). Remaining fail-open cases:
   results; the WAL record (step 10) stops such a standby's replay, except in
   the case of research question 17;
 - readers that bypass the executor and COPY;
-- binary-upgrade mode (below).
+- binary-upgrade mode (below);
+- the session that runs one of the extension's own scripts (below).
 
 **Binary-upgrade exemption (developer decision, 2026-11-16).** The reader
 check refuses a query when the extension exists but its record table cannot
@@ -335,6 +376,36 @@ The exemption cannot hide an unsafe rewrite, for two reasons:
   when REPACK (CONCURRENTLY) ran under `-b` with the record table present. A
   superuser can preset the OIDs with the `binary_upgrade_set_next_*`
   functions, so this alone is not a guarantee.
+
+**Extension-script exemption (developer decision, 2026-11-23).** The reader
+check also passes an extension without its record table, and a record table
+without its triggers, in a backend that is running one of the extension's
+own scripts: `creating_extension` is set and `CurrentExtensionObject` is
+this extension (`extension.c (execute_extension_script)`). Reason: the
+install script creates the record table in one command and its triggers in
+later ones, and event triggers fire for each command of an extension
+script. A `ddl_command_start` or `ddl_command_end` trigger whose function
+runs a query therefore reached the reader check in both states, and
+`CREATE EXTENSION pg_repack_safe` failed in any database with such a
+trigger, a DDL audit trigger for example
+(`t/020_create_with_event_trigger.pl` reproduced it).
+
+Why it is acceptable:
+
+- Only the two "cannot be used" errors are skipped. A record table that
+  exists is still loaded, and its records are still checked against the
+  query's snapshot.
+- The script's changes are not committed, so no other backend sees the
+  extension without its table or the table without its triggers.
+- REPACK (CONCURRENTLY) is not exempt, as in binary-upgrade mode, and it
+  cannot run in a transaction block, so it cannot run inside a script.
+- During `CREATE EXTENSION` the table is new and holds no record.
+
+PostgreSQL sets the same two variables for `ALTER EXTENSION ... UPDATE`, so
+the exemption applies to update scripts too. That is part of the decision:
+a future update script that replaces the triggers would otherwise fail the
+same way, and the points above hold for it. No update script exists yet
+(prerelease), so no test covers that path.
 
 ### 6c. Build questions investigated 2026-11-15
 
@@ -860,7 +931,7 @@ order unless noted.
   foreign-key violation (23503) instead of 40001. Not wrong rows; pinned as
   a known gap. Q1, Q2, Q3 and Q6: see the questions. README "Known gaps"
   lists each with its test.
-- [ ] **13. Productize.** README guarantees and non-guarantees, installation
+- [x] **13. Productize.** README guarantees and non-guarantees, installation
   and standby requirements, `doc_examples`, hook audit, an optimised-build
   benchmark, the resource manager ID claim.
   - Resource manager ID (2026-11-21): 149, reserved for `pg_repack_safe` on

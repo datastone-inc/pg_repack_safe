@@ -26,9 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   partitioned tables), so `pg_dump` fails instead of dumping no rows. An
   `INSERT`'s target table is written, not read, and is not checked unless
   it has a foreign key to itself; `INSERT ... VALUES` into a repacked table
-  from an older snapshot succeeds. Each
+  from an older snapshot succeeds. A table the query names but its plan
+  does not read is not checked either: a left join the planner removed, a
+  scan with constant-false quals, a partition pruned when the executor
+  starts (`specs/unread_relations.spec`). Each
   backend keeps a copy of the records, so a query does not read the record
-  table; the writer invalidates it.
+  table; the writer invalidates it. The copy is reloaded only when an
+  invalidation message arrived, so queries also finish with
+  `debug_discard_caches` set (`t/021_discard_caches.pl`); before, every
+  query in a database with the extension hung there.
 - `COPY partitioned_table TO` is run as `COPY (SELECT columns FROM
   partitioned_table) TO`, so that a partition attached during the COPY
   cannot be scanned unchecked and no lock beyond COPY's own is taken. The
@@ -41,8 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A query is refused when the extension exists but its record table cannot
   be found (renamed, moved to another schema, or dropped) or lacks any of
   its two triggers firing ALWAYS. Both refusals are skipped in binary-upgrade
-  mode so that `pg_upgrade` works; `REPACK (CONCURRENTLY)` stays refused
-  there. `pg_upgrade` carries the records over unchanged; `pg_dump` leaves
+  mode so that `pg_upgrade` works, and in the session that is running
+  `CREATE EXTENSION pg_repack_safe`, whose script creates the table and its
+  triggers in separate commands: without that, the install failed in a
+  database with a DDL event trigger whose function runs a query.
+  `REPACK (CONCURRENTLY)` stays refused in both. `pg_upgrade` carries the records over unchanged; `pg_dump` leaves
   them behind.
 - The record table is protected. `INSERT` (by any route: `COPY ... FROM`,
   `MERGE`, logical replication), `UPDATE` and `DELETE` of records,
@@ -53,7 +62,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which would make every query in the database fail, are refused too. While
   it holds records, `DROP` of the table, its triggers or the extension, and
   `TRUNCATE`, are refused unless a superuser sets
-  `pg_repack_safe.allow_unprotected_drop`. The README
+  `pg_repack_safe.allow_unprotected_drop`. Under the same rule the table
+  cannot be renamed or moved to another schema, and the extension cannot be
+  moved to another schema without it: the drop refusals find the table by
+  its name in the extension's schema, and after
+  `ALTER TABLE pg_repack_safe_rewrites RENAME TO ...` a `DROP EXTENSION`
+  dropped the records with no override. `ALTER EXTENSION pg_repack_safe SET
+  SCHEMA` still moves the extension and the table together. The README
   describes how to remove the extension safely.
 - Only `REPACK (CONCURRENTLY)` writes records. A row-level
   `BEFORE INSERT` trigger on the record table, enabled ALWAYS, refuses every

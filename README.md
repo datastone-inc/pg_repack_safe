@@ -380,7 +380,11 @@ of its trigger functions:
 - While it holds records, `DROP` of the table, its triggers or the
   extension, and `TRUNCATE` of the table, are refused unless a superuser
   sets `pg_repack_safe.allow_unprotected_drop` (see
-  [Removing the extension](#removing-the-extension)). `UPDATE` and `DELETE`
+  [Removing the extension](#removing-the-extension)). So are renaming the
+  table and moving it to another schema, because the extension finds the
+  table by its name in its own schema and would no longer protect it;
+  `ALTER EXTENSION pg_repack_safe SET SCHEMA` moves both together and is
+  allowed (`t/023_record_table_rename.pl`). `UPDATE` and `DELETE`
   of records, rewrites that do not keep every record unchanged (a rewriting
   `ALTER TABLE`, `REPACK (CONCURRENTLY)`), and changes to when its triggers
   fire are always refused. `VACUUM` of it is always allowed.
@@ -465,7 +469,8 @@ What `REPACK (CONCURRENTLY)` with this extension still costs: errors where
 a result might have been correct, and what is lost when a requirement is not
 met. Commands other than `REPACK (CONCURRENTLY)` are out of scope (see
 [What pg_repack_safe does not guarantee](#what-pg_repack_safe-does-not-guarantee)). Within that
-scope, no case of wrong rows is known while the requirements are met.
+scope, the one known case of a wrong result while the requirements are met
+is [Contrib functions the guard does not see](#contrib-functions-the-guard-does-not-see).
 
 ### Errors, not wrong rows
 
@@ -492,6 +497,29 @@ in a new transaction gets past, and each says why the guard cannot tell.
   that snapshot does not see. So the error's message, that the key is not
   present, is false, but no wrong rows are returned or written
   (`specs/reader_guard_edges.spec`).
+
+### Contrib functions the guard does not see
+
+The guard checks the tables a query's plan reads and the table
+`COPY ... TO` names. Two contrib functions read a table that is neither:
+they take it as an argument and scan it themselves with the transaction's
+snapshot. Called with a snapshot that does not see a committed
+`REPACK (CONCURRENTLY)` of that table, they see no rows in it and return a
+wrong answer with no error:
+
+- **`pgrowlocks('t')`** reports no row locks, whatever rows are locked
+  (`contrib/pgrowlocks/pgrowlocks.c`, `pgrowlocks`).
+- **`bt_index_check(index, heapallindexed => true)`** and
+  `bt_index_parent_check` with the same option, from `amcheck`, find no
+  heap row to look up in the index, so they report success without having
+  verified that any row is indexed (`contrib/amcheck/verify_nbtree.c`,
+  `bt_check_every_level`).
+
+Neither returns the table's rows, and a call in a new transaction is not
+affected. A query of the same table in the same transaction gets the
+guard's error. PostgreSQL has no hook on a table scan, so the guard cannot
+see these reads; no other function in PostgreSQL 19 or its contrib modules
+scans a table this way (`t/019_contrib_readers.pl`).
 
 ### Standby errors caused by pg_repack_safe (without `hot_standby_feedback`)
 

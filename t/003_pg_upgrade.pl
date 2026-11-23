@@ -107,8 +107,11 @@ is($new->safe_psql('postgres', 'SELECT pg_repack_safe_prune_records()'),
     $liveRecords, 'the remaining records can be deleted in the new cluster');
 
 # Outside binary-upgrade mode the refusal is in force.
-$new->safe_psql('postgres',
-    'ALTER TABLE pg_repack_safe_rewrites RENAME TO renamed');
+# The table still holds the deleted records' blocks, so renaming it needs the
+# override (sql/protection.sql).
+$new->safe_psql('postgres', q{
+    SET pg_repack_safe.allow_unprotected_drop = on;
+    ALTER TABLE pg_repack_safe_rewrites RENAME TO renamed});
 my ($ret, $stdout, $stderr) = $new->psql('postgres', 'SELECT 1');
 isnt($ret, 0, 'query refused when the record table is missing');
 like(

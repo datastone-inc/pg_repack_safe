@@ -1,0 +1,87 @@
+Parsed test spec with 2 sessions
+
+starting permutation: r_begin p_repack r_join r_rollback
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    2
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) t;
+step r_join: SELECT count(*) FROM other o LEFT JOIN t ON o.id = t.id;
+count
+-----
+    2
+(1 row)
+
+step r_rollback: ROLLBACK;
+
+starting permutation: r_begin p_repack r_join_read r_rollback
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    2
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) t;
+step r_join_read: SELECT count(t.v) FROM other o LEFT JOIN t ON o.id = t.id;
+ERROR:  cannot read table "t" with this snapshot
+step r_rollback: ROLLBACK;
+
+starting permutation: r_begin p_repack r_false r_rollback
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    2
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) t;
+step r_false: SELECT count(*) FROM t WHERE false;
+count
+-----
+    0
+(1 row)
+
+step r_rollback: ROLLBACK;
+
+starting permutation: r_begin p_repack r_qual_read r_rollback
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    2
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) t;
+step r_qual_read: SELECT count(*) FROM t WHERE v < 0;
+ERROR:  cannot read table "t" with this snapshot
+step r_rollback: ROLLBACK;
+
+starting permutation: r_prepare r_begin p_repack_p1 r_pruned r_rollback
+step r_prepare: PREPARE in_p(int) AS SELECT count(*) FROM p WHERE id = $1; SET plan_cache_mode = force_generic_plan;
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    2
+(1 row)
+
+step p_repack_p1: REPACK (CONCURRENTLY) p1;
+step r_pruned: EXECUTE in_p(150);
+count
+-----
+    1
+(1 row)
+
+step r_rollback: ROLLBACK;
+
+starting permutation: r_prepare r_begin p_repack_p1 r_unpruned r_rollback
+step r_prepare: PREPARE in_p(int) AS SELECT count(*) FROM p WHERE id = $1; SET plan_cache_mode = force_generic_plan;
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    2
+(1 row)
+
+step p_repack_p1: REPACK (CONCURRENTLY) p1;
+step r_unpruned: EXECUTE in_p(1);
+ERROR:  cannot read table "p1" with this snapshot
+step r_rollback: ROLLBACK;

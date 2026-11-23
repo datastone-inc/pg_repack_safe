@@ -14,6 +14,10 @@
  *   of the record table, by any route (session_replication_role, CASCADE),
  *   are refused unless a superuser sets
  *   pg_repack_safe.allow_unprotected_drop;
+ * - renaming the record table, moving it to another schema, and moving the
+ *   extension to another schema without it, are refused under the same
+ *   rule: the DROP refusals find the table by its name in the extension's
+ *   schema;
  * - rewrites of the record table other than VACUUM FULL, CLUSTER and REPACK
  *   without CONCURRENTLY, which keep every record that is not deleted
  *   unchanged, are refused: REPACK (CONCURRENTLY) and rewriting ALTER TABLE
@@ -228,6 +232,21 @@ SELECT count(*) AS column_dependencies FROM pg_depend
 WHERE classid = 'pg_class'::regclass
   AND objid = 'pg_repack_safe_rewrites'::regclass AND objsubid <> 0;
 
+-- The drop refusals find the record table by its name in the extension's
+-- schema, so while it holds records it cannot be renamed or moved out of
+-- that schema: DROP EXTENSION would then drop it unrecognized.
+CREATE SCHEMA pr_m;
+ALTER TABLE pg_repack_safe_rewrites RENAME TO pr_renamed;
+ALTER TABLE pg_repack_safe_rewrites SET SCHEMA pr_m;
+-- Nor can the extension move to another schema without the table, once the
+-- table is no longer its member.
+ALTER EXTENSION pg_repack_safe DROP TABLE pg_repack_safe_rewrites;
+ALTER EXTENSION pg_repack_safe SET SCHEMA pr_m;
+ALTER EXTENSION pg_repack_safe ADD TABLE pg_repack_safe_rewrites;
+DROP SCHEMA pr_m;
+SELECT count(*) AS records FROM pg_repack_safe_rewrites;
+DROP EXTENSION pg_repack_safe;
+
 -- The extension can be moved to another schema; the record table is still
 -- found there, with its records, and still protected.
 CREATE SCHEMA pr_s;
@@ -252,10 +271,12 @@ SET pg_repack_safe.allow_unprotected_drop = on;
 RESET ROLE;
 DROP ROLE pr_user;
 
--- With the override, DROP and TRUNCATE are allowed; ALTER TABLE rewrites,
--- UPDATE, DELETE, INSERT, the triggers, indexes and column changes stay
--- refused.
+-- With the override, DROP, TRUNCATE and renaming are allowed; ALTER TABLE
+-- rewrites, UPDATE, DELETE, INSERT, the triggers, indexes and column changes
+-- stay refused.
 SET pg_repack_safe.allow_unprotected_drop = on;
+ALTER TABLE pg_repack_safe_rewrites RENAME TO pr_renamed;
+ALTER TABLE pr_renamed RENAME TO pg_repack_safe_rewrites;
 ALTER TABLE pg_repack_safe_rewrites SET UNLOGGED;
 ALTER TABLE pg_repack_safe_rewrites
     ALTER COLUMN relid TYPE oid USING (relid::text)::oid;

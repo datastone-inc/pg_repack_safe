@@ -12,10 +12,11 @@
 
 - a PostgreSQL 19 build configured with TAP tests enabled
   (`--enable-tap-tests`), and the Perl module `IPC::Run`;
-- the contrib modules `pg_stat_statements` (`t/004_hook_chain.pl`) and
+- the contrib modules `pg_stat_statements` (`t/004_hook_chain.pl`),
   `pageinspect` (`t/002_standby_record_removal.pl`,
   `t/003_pg_upgrade.pl`, `t/017_standby_record_cleanup.pl`,
-  `sql/writer.sql`, `sql/records_prune.sql`) installed.
+  `sql/writer.sql`, `sql/records_prune.sql`), and `pgrowlocks` and
+  `amcheck` (`t/019_contrib_readers.pl`) installed.
 
 ## Clone and Build
 
