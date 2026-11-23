@@ -4,13 +4,7 @@ starting permutation: c_declare p_repack c_fetchall c_commit
 step c_declare: BEGIN; DECLARE c CURSOR FOR SELECT o.id, customer_name(o.customer_id) AS name FROM orders o ORDER BY o.id;
 step p_repack: REPACK (CONCURRENTLY) customers USING INDEX customers_pkey;
 step c_fetchall: FETCH ALL FROM c;
-id|name
---+----
- 1|    
- 2|    
- 3|    
-(3 rows)
-
+ERROR:  cannot read table "customers" with this snapshot
 step c_commit: COMMIT;
 
 starting permutation: c_declare c_fetch1 p_repack c_fetchall c_commit

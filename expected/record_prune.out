@@ -1,0 +1,173 @@
+Parsed test spec with 3 sessions
+
+starting permutation: r_begin w_repack w_prune w_vacuum w_size r_t r_commit w_vacuum w_size o_t
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step w_repack: REPACK (CONCURRENTLY) t;
+step w_prune: SELECT pg_repack_safe_prune_records() > 0 AS deleted_some;
+deleted_some
+------------
+t           
+(1 row)
+
+step w_vacuum: VACUUM pg_repack_safe_rewrites;
+step w_size: SELECT pg_relation_size('pg_repack_safe_rewrites') > 0 AS has_blocks;
+has_blocks
+----------
+t         
+(1 row)
+
+step r_t: SELECT count(*) FROM t;
+ERROR:  cannot read table "t" with this snapshot
+step r_commit: COMMIT;
+step w_vacuum: VACUUM pg_repack_safe_rewrites;
+step w_size: SELECT pg_relation_size('pg_repack_safe_rewrites') > 0 AS has_blocks;
+has_blocks
+----------
+f         
+(1 row)
+
+step o_t: SELECT count(*) FROM t;
+count
+-----
+    5
+(1 row)
+
+
+starting permutation: r_begin w_repack w_prune w_vacuum r_t r_t r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step w_repack: REPACK (CONCURRENTLY) t;
+step w_prune: SELECT pg_repack_safe_prune_records() > 0 AS deleted_some;
+deleted_some
+------------
+t           
+(1 row)
+
+step w_vacuum: VACUUM pg_repack_safe_rewrites;
+step r_t: SELECT count(*) FROM t;
+ERROR:  cannot read table "t" with this snapshot
+step r_t: SELECT count(*) FROM t;
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+step r_commit: COMMIT;
+
+starting permutation: w_repack r_begin w_repack w_prune w_vacuum r_t r_commit
+step w_repack: REPACK (CONCURRENTLY) t;
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step w_repack: REPACK (CONCURRENTLY) t;
+step w_prune: SELECT pg_repack_safe_prune_records() > 0 AS deleted_some;
+deleted_some
+------------
+t           
+(1 row)
+
+step w_vacuum: VACUUM pg_repack_safe_rewrites;
+step r_t: SELECT count(*) FROM t;
+ERROR:  cannot read table "t" with this snapshot
+step r_commit: COMMIT;
+
+starting permutation: w_repack r_begin w_prune w_vacuum r_t r_commit
+step w_repack: REPACK (CONCURRENTLY) t;
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step w_prune: SELECT pg_repack_safe_prune_records() > 0 AS deleted_some;
+deleted_some
+------------
+t           
+(1 row)
+
+step w_vacuum: VACUUM pg_repack_safe_rewrites;
+step r_t: SELECT count(*) FROM t;
+count
+-----
+    5
+(1 row)
+
+step r_commit: COMMIT;
+
+starting permutation: w_repack r_begin w_repack w_vacuum r_t r_commit
+step w_repack: REPACK (CONCURRENTLY) t;
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step w_repack: REPACK (CONCURRENTLY) t;
+step w_vacuum: VACUUM pg_repack_safe_rewrites;
+step r_t: SELECT count(*) FROM t;
+ERROR:  cannot read table "t" with this snapshot
+step r_commit: COMMIT;
+
+starting permutation: r_begin w_repack w_repack w_vacuum r_t r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step w_repack: REPACK (CONCURRENTLY) t;
+step w_repack: REPACK (CONCURRENTLY) t;
+step w_vacuum: VACUUM pg_repack_safe_rewrites;
+step r_t: SELECT count(*) FROM t;
+ERROR:  cannot read table "t" with this snapshot
+step r_commit: COMMIT;
+
+starting permutation: w_repack w_begin w_prune o_repack w_commit o_t
+step w_repack: REPACK (CONCURRENTLY) t;
+step w_begin: BEGIN;
+step w_prune: SELECT pg_repack_safe_prune_records() > 0 AS deleted_some;
+deleted_some
+------------
+t           
+(1 row)
+
+step o_repack: REPACK (CONCURRENTLY) t; <waiting ...>
+step w_commit: COMMIT;
+step o_repack: <... completed>
+step o_t: SELECT count(*) FROM t;
+count
+-----
+    5
+(1 row)
+
+
+starting permutation: w_repack w_begin w_prune o_prune w_commit o_prune
+step w_repack: REPACK (CONCURRENTLY) t;
+step w_begin: BEGIN;
+step w_prune: SELECT pg_repack_safe_prune_records() > 0 AS deleted_some;
+deleted_some
+------------
+t           
+(1 row)
+
+step o_prune: SELECT pg_repack_safe_prune_records() > 0 AS deleted_some;
+deleted_some
+------------
+f           
+(1 row)
+
+step w_commit: COMMIT;
+step o_prune: SELECT pg_repack_safe_prune_records() > 0 AS deleted_some;
+deleted_some
+------------
+f           
+(1 row)
+

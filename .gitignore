@@ -4,12 +4,15 @@
 *.a
 *.dylib
 *.dll
+.deps/
 
 # PGXS Build Output
 /regression.diffs
 /regression.out
 /results/
 /output_iso/
+/tmp_check_iso/
+/tmp_check_regress/
 /tmp_check/
 /log/
 
@@ -18,6 +21,9 @@
 /expected/regression.out
 
 # Editor and IDE
+# The workspace file and CLAUDE.local.md hold one machine's paths.
+/pg_repack_safe.code-workspace
+/CLAUDE.local.md
 .vscode/
 .idea/
 *.swp

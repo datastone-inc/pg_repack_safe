@@ -8,7 +8,7 @@ query will see correct results, refuse the operation.**
 ## The problem
 
 Stock PG19 documents `REPACK` with `CONCURRENTLY` as not MVCC-safe
-(`/opt/pg19/src/doc/src/sgml/ref/repack.sgml`, the `<warning>` near line 321;
+(`doc/src/sgml/ref/repack.sgml`, the `<warning>` about `CONCURRENTLY`;
 `doc/src/sgml/mvcc.sgml` § "Caveats", `id="mvcc-caveats"`). After the repack
 commits, a transaction whose snapshot was taken before the repack started, and
 which had not yet touched the table, sees the table as **empty**. Successive
@@ -41,16 +41,16 @@ or a PG source citation settles it.
    quietly pick an interpretation, and never weaken a test to match the code.
 
    - *Unproven safety claims.* "This path can't produce wrong results" is a
-     claim. Back it with a `file:line` in the PG19 source or a test that
-     exercises it, in the same breath. Otherwise list it as an open question.
+     claim. Back it with the PG19 source or a test that exercises it, in the
+     same breath. Otherwise list it as an open question.
    - *Declining to fix.* "Out of scope", "can't happen in practice" and
      "upstream's problem" are divergences too, and they are the claims nobody
      re-checks. Give the evidence right away or put the item on the fix list.
    - *Known gaps.* A wrong-results case the extension does not yet close is
      written down in `doc/` with a reproducer, never left implicit.
-   - *PG internals.* Read the PG19 source (`/opt/pg19/src`, mainly
+   - *PG internals.* Read the PostgreSQL 19 source (mainly
      `src/backend/commands/repack.c` and `repack_worker.c`) before asserting
-     how `REPACK` behaves. Cite the line. Check memory against the code.
+     how `REPACK` behaves. Check memory against the code.
 
 3. **Clean, correct design over clever design.**
 
@@ -83,9 +83,9 @@ or a PG source citation settles it.
    functions) goes in `sql/` + `expected/` through `REGRESS`. Every SQL
    example in the docs has a test in `sql/doc_examples.sql`.
 
-   Run against PG19:
-   `. ~/dev/datastone/pg19/env.sh && make && make install && make installcheck`.
-   The default `pg_config` on `PATH` is PG18, which will not do.
+   Run against PostgreSQL 19, with its `pg_config` first on `PATH` or named
+   in `PG_CONFIG`: `make && make install && make installcheck`. An older
+   major will not do.
 
 6. **No multi-step work without a per-step verification plan.**
 
@@ -97,9 +97,7 @@ or a PG source citation settles it.
 
 7. **Style.**
 
-   Follow the dataStone extension constitution
-   (`~/dev/pg-extension-template/.specify/memory/constitution.md`): Allman
-   braces, 4-space indent, no tabs. Internal C symbols are camelCase and
+   Allman braces, 4-space indent, no tabs. Internal C symbols are camelCase and
    SQL-callable C functions are snake_case. SQL keywords are UPPERCASE. Every
    C and SQL file carries the header `Copyright (c) 2026 dataStone Inc.` +
    `SPDX-License-Identifier: MIT` + a doxygen `@file`/`@brief` block. Function
@@ -108,7 +106,9 @@ or a PG source citation settles it.
    Comments describe the code as it is now, not the change that produced it
    (no "added for...", "was previously..."). They state the invariant and
    why. The history of a change goes in the commit message. Deferred work is
-   marked `TODO(owner YYYY-MM-DD): ...`.
+   marked `TODO(owner YYYY-MM-DD): ...`. A reference to PostgreSQL's source
+   names the file and the function, never a line number: line numbers go
+   stale with every release.
 
 ## Documentation maintenance
 
@@ -117,12 +117,11 @@ or a PG source citation settles it.
   the code.
 - `CHANGELOG.md` follows Keep a Changelog. Every user-visible change gets an
   `[Unreleased]` entry.
-- Repo layout and doc-file conventions: `project_template.md`.
+- Repo layout, tests and doc conventions: `doc/development.md`.
 
 ## Target versions
 
-- PostgreSQL 19 (local build `/opt/pg19`, currently 19rc2, source at
-  `/opt/pg19/src`). `REPACK` does not exist before 19. Don't add
-  compatibility shims for older majors.
+- PostgreSQL 19 (tested on 19.0). `REPACK` does not exist before 19. Don't
+  add compatibility shims for older majors.
 - Release state: prerelease. Edit `pg_repack_safe--1.0.0.sql` in place. No
   version bumps or upgrade scripts until the first release.

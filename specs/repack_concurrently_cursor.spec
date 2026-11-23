@@ -10,14 +10,21 @@
 # DECLARE takes no lock on customers; the first lock comes with the first
 # function call. If REPACK (CONCURRENTLY) customers commits between DECLARE
 # and the first FETCH, every lookup runs against the repacked table with the
-# pre-repack snapshot and finds nothing. The expected output pins that wrong
-# result: every name comes back NULL although each customer exists.
+# pre-repack snapshot and finds nothing: on stock PostgreSQL 19 every name
+# comes back NULL although each customer exists. With pg_repack_safe the
+# expected output is an error at the first FETCH, raised by the lookup inside
+# customer_name(). isolationtester prints only the primary message, so the
+# SQLSTATE (40001) is not pinned here.
 #
 # Control: once a row has been fetched, the cursor holds ACCESS SHARE on
 # customers and REPACK waits for the cursor's transaction to end.
+#
+# The extension is created once and never dropped: the instance is temporary,
+# and dropping it while it holds records is refused (sql/protection.sql).
 
 setup
 {
+    CREATE EXTENSION IF NOT EXISTS pg_repack_safe;
     CREATE TABLE customers (id int PRIMARY KEY, name text NOT NULL);
     INSERT INTO customers SELECT g, 'customer ' || g FROM generate_series(1, 3) g;
     CREATE TABLE orders (id int PRIMARY KEY, customer_id int NOT NULL);
@@ -42,7 +49,7 @@ step c_commit   { COMMIT; }
 session repacker
 step p_repack   { REPACK (CONCURRENTLY) customers USING INDEX customers_pkey; }
 
-# Wrong result: every name is NULL.
+# Stock: every name is NULL. Expected: c_fetchall errors.
 permutation c_declare p_repack c_fetchall c_commit
 
 # Control: the first FETCH locks customers, so REPACK waits for COMMIT.

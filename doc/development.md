@@ -7,6 +7,15 @@
 - Git
 - Make
 
+`make installcheck` also needs:
+
+- a PostgreSQL 19 build configured with TAP tests enabled
+  (`--enable-tap-tests`), and the Perl module `IPC::Run`;
+- the contrib modules `pg_stat_statements` (`t/004_hook_chain.pl`) and
+  `pageinspect` (`t/002_standby_record_removal.pl`,
+  `t/003_pg_upgrade.pl`, `t/017_standby_record_cleanup.pl`,
+  `sql/writer.sql`, `sql/records_prune.sql`) installed.
+
 ## Clone and Build
 
 ```bash
@@ -14,6 +23,10 @@ git clone https://github.com/datastone-inc/pg_repack_safe.git
 cd pg_repack_safe
 make
 ```
+
+The build enables `-Wall -Wextra`. `make WERROR=1` also turns warnings into
+errors, in the library and in the test modules; use it before sending a
+change.
 
 ## Testing
 
@@ -27,15 +40,67 @@ make installcheck
 
 A failing run leaves `regression.diffs` in the repository root.
 
-`make installcheck` runs three suites:
+## Demo
 
-- `sql/` + `expected/` (`REGRESS`): single-session tests.
+`demo/demo.sh` creates a throwaway server in a temporary directory and runs
+the scenarios `demo/[0-9]_*.sql` against it, first without the library and
+then with the extension. Each scenario is one psql script that runs the
+other session's statements with `\!`, so the interleaving is fixed.
+`t/018_demo.pl` runs the demo and checks both halves of its output, which
+also makes it the one test of what stock PostgreSQL 19 does in these cases.
+
+## Continuous Integration
+
+`.github/workflows/ci.yml` runs on every push and pull request:
+
+- PostgreSQL 19 from the apt.postgresql.org packages, built with gcc on
+  x86_64 and arm64, with `make WERROR=1`, then `make installcheck`.
+
+Weekly, and on request, it also builds the tip of PostgreSQL's
+`REL_19_STABLE` branch from source with clang, assertions and injection
+points, and runs the suites against it. The extension relies on server
+internals, and this is where a change in them shows up first.
+
+`make installcheck` runs three suites. None of them uses the server that
+`PGHOST`/`PGPORT` point at; each starts its own instances from the installed
+binaries.
+
+- `sql/` + `expected/` (`REGRESS`): single-session tests, on a temporary
+  instance under `tmp_check_regress/`.
 - `specs/*.spec` + `expected/*.out` (`ISOLATION`): concurrency
-  interleavings, run against the configured server, which must have
-  `wal_level = replica` or higher for `REPACK (CONCURRENTLY)`. A failing run
-  leaves its diffs under `output_iso/`.
-- `t/*.pl` (`TAP_TESTS`): cases that drive separate client programs such as
-  `pg_dump`. Each creates its own temporary cluster under `tmp_check/`.
+  interleavings, on a temporary instance under `tmp_check_iso/`. A failing
+  run leaves its diffs under `output_iso/`.
+- `t/*.pl` (`TAP_TESTS`): cases that need their own server setup or separate
+  client programs such as `pg_dump`. Each creates its own clusters under
+  `tmp_check/`. Helpers they share (a preloaded cluster, a session holding
+  an old snapshot, running a statement and collecting its errors, waiting
+  for a queued lock request) are in `t/RepackSafeTest.pm`.
+
+`make installcheck` first installs two test-only modules from
+`test/modules/` into the PostgreSQL library directory; `make install` does
+not install them.
+
+- `oat_observer`: a second `object_access_hook`, loaded next to the library
+  by `t/015_oat_hook_chain.pl`.
+- `test_record`: the C function `test_insert_record(record_table regclass,
+  relid oid, rewrite_xid xid8)`, which each test that uses it creates with
+  `CREATE FUNCTION ... AS 'test_record' LANGUAGE C`. The extension refuses
+  every insert into its record table except the one `REPACK (CONCURRENTLY)`
+  makes, and that one always records its own transaction. Tests of the
+  reader check need records with other transaction IDs (aborted, from
+  another epoch, not yet assigned), and this function writes them much as
+  the extension's writer does: `simple_heap_insert`, which fires no trigger,
+  and a relcache invalidation of the record table. Unlike the writer's, its
+  insert is visible to logical decoding, which `t/016_publication.pl` uses
+  to send a record to a subscriber. Also used by `sql/reader_check.sql`,
+  `sql/records_prune.sql`, `specs/reader_cache.spec` and
+  `t/006_record_xid8.pl`.
+
+The `REGRESS` and `ISOLATION` instances get the settings in
+`test/temp_instance.conf`: the library in `shared_preload_libraries`, which
+the reader guard needs and without which `REPACK (CONCURRENTLY)` is refused,
+and `wal_level = replica`, which `REPACK (CONCURRENTLY)` needs. A failing run
+leaves its instance in place for inspection.
 
 `pg_config` on `PATH` (or `PG_CONFIG`) must point at PostgreSQL 19:
 
@@ -44,4 +109,4 @@ make PG_CONFIG=/path/to/pg19/bin/pg_config install installcheck
 ```
 
 Every SQL example in the documentation has a matching test in
-`sql/doc_examples.sql` (see `project_template.md`).
+`sql/doc_examples.sql`, headed by the document and section it comes from.
