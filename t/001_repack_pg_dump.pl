@@ -131,13 +131,13 @@ sub dumpArgs
 # (doc/installation.md, "Dump and Restore").
 {
     isnt($node->safe_psql('postgres',
-            'SELECT count(*) FROM pg_repack_safe_rewrites'),
+            'SELECT count(*) FROM repack_safe.rewrites'),
         '0', 'the record table holds records');
     my ($out, $err) = run_command(
         [ 'pg_dump', '--dbname=' . $node->connstr('postgres') ]);
     like($out, qr/^CREATE EXTENSION IF NOT EXISTS pg_repack_safe\b/m,
         'a full dump creates the extension');
-    unlike($out, qr/pg_repack_safe_rewrites/,
+    unlike($out, qr/repack_safe.rewrites/,
         'a full dump does not carry the records');
 }
 

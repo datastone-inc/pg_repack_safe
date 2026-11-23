@@ -5,7 +5,7 @@
 # rewritten table.
 #
 # The reader takes a REPEATABLE READ snapshot without touching t, and t is
-# then repacked. The record is deleted (pg_repack_safe_prune_records) and
+# then repacked. The record is deleted (repack_safe.prune_records) and
 # the record table vacuumed. The reader's read of t must still fail: VACUUM
 # cannot remove the deleted row version while the reader's snapshot is
 # alive, and the reader loads every row version.
@@ -39,14 +39,14 @@ step r_commit    { COMMIT; }
 
 session writer
 step w_repack    { REPACK (CONCURRENTLY) t; }
-step w_prune     { SELECT pg_repack_safe_prune_records() > 0 AS deleted_some; }
-step w_vacuum    { VACUUM pg_repack_safe_rewrites; }
-step w_size      { SELECT pg_relation_size('pg_repack_safe_rewrites') > 0 AS has_blocks; }
+step w_prune     { SELECT repack_safe.prune_records() > 0 AS deleted_some; }
+step w_vacuum    { VACUUM repack_safe.rewrites; }
+step w_size      { SELECT pg_relation_size('repack_safe.rewrites') > 0 AS has_blocks; }
 step w_begin     { BEGIN; }
 step w_commit    { COMMIT; }
 
 session other
-step o_prune     { SELECT pg_repack_safe_prune_records() > 0 AS deleted_some; }
+step o_prune     { SELECT repack_safe.prune_records() > 0 AS deleted_some; }
 step o_repack    { REPACK (CONCURRENTLY) t; }
 step o_t         { SELECT count(*) FROM t; }
 

@@ -53,7 +53,7 @@ $holder->query_safe('COMMIT');
 $holder->quit;
 
 $node->safe_psql('postgres', qq{
-    SELECT test_insert_record('pg_repack_safe_rewrites', 't'::regclass,
+    SELECT test_insert_record('repack_safe.rewrites', 't'::regclass,
                               '@{[ $x - 4294967296 ]}');
 });
 my ($out, $err) = runIn($reader, 'SELECT count(*) FROM t');
@@ -61,7 +61,7 @@ is($err, '', "epoch-0 record with X's low 32 bits: no error");
 is($out, '5', "epoch-0 record with X's low 32 bits: every row");
 
 $node->safe_psql('postgres', qq{
-    SELECT test_insert_record('pg_repack_safe_rewrites', 't'::regclass, '$x');
+    SELECT test_insert_record('repack_safe.rewrites', 't'::regclass, '$x');
 });
 ($out, $err) = runIn($reader, 'SELECT count(*) FROM t');
 like($err, qr/cannot read table "t" with this snapshot/,
@@ -72,9 +72,9 @@ $reader->quit;
 # A record from a transaction ID not yet assigned.
 # Emptying the record table takes the superuser override (protection.sql).
 $node->safe_psql('postgres', q{
-    SET pg_repack_safe.allow_unprotected_drop = on;
-    TRUNCATE pg_repack_safe_rewrites;
-    SELECT test_insert_record('pg_repack_safe_rewrites', 't'::regclass,
+    SET pg_repack_safe.allow_unprotected_removal = on;
+    TRUNCATE repack_safe.rewrites;
+    SELECT test_insert_record('repack_safe.rewrites', 't'::regclass,
         (pg_current_xact_id()::text::bigint + 1000000)::text::xid8);
 });
 my ($ret, $stdout, $stderr) = $node->psql('postgres', 'SELECT count(*) FROM t');

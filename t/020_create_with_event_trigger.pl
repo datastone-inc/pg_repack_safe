@@ -33,7 +33,9 @@ $node->safe_psql('postgres', q{
     CREATE TABLE ddl_log (event text, tag text);
     CREATE FUNCTION log_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$
     BEGIN
-        INSERT INTO ddl_log VALUES (tg_event, tg_tag);
+        -- Named with its schema: an extension's script runs with the
+        -- extension's schema as its search_path.
+        INSERT INTO public.ddl_log VALUES (tg_event, tg_tag);
     END $$;
     CREATE EVENT TRIGGER log_ddl_start ON ddl_command_start
         EXECUTE FUNCTION log_ddl();

@@ -5,7 +5,7 @@
 
 /**
  * @file records_prune.sql
- * @brief Deleting records: pg_repack_safe_prune_records() and what a
+ * @brief Deleting records: repack_safe.prune_records() and what a
  *        deleted record changes
  *
  * A record is deleted, never removed, by the extension: the deleted row
@@ -39,55 +39,55 @@ LANGUAGE C STRICT;
 CREATE FUNCTION rp_present() RETURNS boolean
 LANGUAGE sql AS $$
     SELECT count(*) > 0 FROM heap_page_items(
-        get_raw_page('pg_repack_safe_rewrites', 0))
+        get_raw_page('repack_safe.rewrites', 0))
     WHERE lp_len > 0
 $$;
 
 -- Not for everyone.
-SELECT has_function_privilege('public', 'pg_repack_safe_prune_records()',
+SELECT has_function_privilege('public', 'repack_safe.prune_records()',
                               'EXECUTE') AS public_may_execute;
 
 -- An empty record table: nothing to delete.
-SELECT pg_repack_safe_prune_records() AS deleted;
+SELECT repack_safe.prune_records() AS deleted;
 
 CREATE TABLE rp_t (id int PRIMARY KEY);
 INSERT INTO rp_t SELECT generate_series(1, 5);
 REPACK (CONCURRENTLY) rp_t;
 REPACK (CONCURRENTLY) rp_t;
 SELECT count(*) AS records, rp_present() AS present
-FROM pg_repack_safe_rewrites;
+FROM repack_safe.rewrites;
 
 -- A record that names a transaction not older than the deleter's is left:
 -- the deleter's transaction must follow the record's.
 BEGIN;
-SELECT test_insert_record('pg_repack_safe_rewrites', 'rp_t'::regclass,
+SELECT test_insert_record('repack_safe.rewrites', 'rp_t'::regclass,
                           pg_current_xact_id());
-SELECT pg_repack_safe_prune_records() AS deleted;
-SELECT count(*) AS records FROM pg_repack_safe_rewrites;
+SELECT repack_safe.prune_records() AS deleted;
+SELECT count(*) AS records FROM repack_safe.rewrites;
 ROLLBACK;
-SELECT count(*) AS records FROM pg_repack_safe_rewrites;
+SELECT count(*) AS records FROM repack_safe.rewrites;
 
 -- Every committed older record is deleted, whatever table it names, and
 -- stays physically present.
-SELECT pg_repack_safe_prune_records() AS deleted;
+SELECT repack_safe.prune_records() AS deleted;
 SELECT count(*) AS records, rp_present() AS present
-FROM pg_repack_safe_rewrites;
+FROM repack_safe.rewrites;
 SELECT count(*) AS readable FROM rp_t;
 -- Nothing is left to delete.
-SELECT pg_repack_safe_prune_records() AS deleted;
+SELECT repack_safe.prune_records() AS deleted;
 
 -- An aborted prune deletes nothing.
 REPACK (CONCURRENTLY) rp_t;
 BEGIN;
-SELECT pg_repack_safe_prune_records() AS deleted;
+SELECT repack_safe.prune_records() AS deleted;
 ROLLBACK;
-SELECT count(*) AS records FROM pg_repack_safe_rewrites;
-SELECT pg_repack_safe_prune_records() AS deleted;
+SELECT count(*) AS records FROM repack_safe.rewrites;
+SELECT repack_safe.prune_records() AS deleted;
 
 -- While a deleted row version is in the table, the rewrites that are
 -- otherwise allowed are refused.
-VACUUM FULL pg_repack_safe_rewrites;
-REPACK pg_repack_safe_rewrites;
+VACUUM FULL repack_safe.rewrites;
+REPACK repack_safe.rewrites;
 -- The database-wide forms stop at the record table with the same error.
 VACUUM FULL;
 REPACK;
@@ -95,24 +95,24 @@ SELECT rp_present() AS present;
 
 -- VACUUM removes the deleted versions, no snapshot needing them, and the
 -- table is back to zero blocks. The rewrites are allowed again.
-VACUUM pg_repack_safe_rewrites;
-SELECT pg_relation_size('pg_repack_safe_rewrites') AS bytes;
-VACUUM FULL pg_repack_safe_rewrites;
-REPACK pg_repack_safe_rewrites;
+VACUUM repack_safe.rewrites;
+SELECT pg_relation_size('repack_safe.rewrites') AS bytes;
+VACUUM FULL repack_safe.rewrites;
+REPACK repack_safe.rewrites;
 VACUUM FULL;
 REPACK;
 
 -- A live record does not refuse them either.
 REPACK (CONCURRENTLY) rp_t;
-VACUUM FULL pg_repack_safe_rewrites;
-SELECT count(*) AS records FROM pg_repack_safe_rewrites;
+VACUUM FULL repack_safe.rewrites;
+SELECT count(*) AS records FROM repack_safe.rewrites;
 
 -- Removing the extension: prune, VACUUM to zero blocks, then DROP EXTENSION
 -- needs no override.
 DROP EXTENSION pg_repack_safe;
-SELECT pg_repack_safe_prune_records() AS deleted;
-VACUUM pg_repack_safe_rewrites;
-SELECT pg_relation_size('pg_repack_safe_rewrites') AS bytes;
+SELECT repack_safe.prune_records() AS deleted;
+VACUUM repack_safe.rewrites;
+SELECT pg_relation_size('repack_safe.rewrites') AS bytes;
 DROP EXTENSION pg_repack_safe;
 
 DROP TABLE rp_t;

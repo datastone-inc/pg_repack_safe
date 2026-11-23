@@ -45,16 +45,16 @@ VACUUM FULL wr_t;
 CLUSTER wr_t USING wr_t_pkey;
 REPACK wr_t;
 REPACK (CONCURRENTLY false) wr_t;
-SELECT count(*) AS records FROM pg_repack_safe_rewrites;
+SELECT count(*) AS records FROM repack_safe.rewrites;
 
 -- Empty table: the old storage has no blocks, no record.
 REPACK (CONCURRENTLY) wr_empty;
-SELECT count(*) AS records FROM pg_repack_safe_rewrites;
+SELECT count(*) AS records FROM repack_safe.rewrites;
 
 -- Failed REPACK (CONCURRENTLY): no record.
 REPACK (CONCURRENTLY) wr_missing;
 REPACK (CONCURRENTLY) wr_t USING INDEX wr_missing_idx;
-SELECT count(*) AS records FROM pg_repack_safe_rewrites;
+SELECT count(*) AS records FROM repack_safe.rewrites;
 
 -- Unsafe rewrites of non-empty tables: recorded. Each record names the
 -- table or its post-swap TOAST relation, and carries the full XID that wrote
@@ -69,14 +69,14 @@ SELECT CASE r.relid
            WHEN 'wr_deleted'::regclass THEN 'wr_deleted'
        END AS recorded,
        r.rewrite_xid::xid = r.xmin AS by_rewriter
-FROM pg_repack_safe_rewrites r, pg_class c
+FROM repack_safe.rewrites r, pg_class c
 WHERE c.oid = 'wr_t'::regclass;
 
 REPACK (CONCURRENTLY) wr_t;
 SELECT * FROM wr_records ORDER BY recorded;
 SELECT count(*) AS rows,
        bool_and(t.xmin = r.rewrite_xid::xid) AS rows_by_rewriter
-FROM wr_t t, pg_repack_safe_rewrites r
+FROM wr_t t, repack_safe.rewrites r
 WHERE r.relid = 'wr_t'::regclass;
 
 -- With ANALYZE the statement commits after the swap and analyzes in a new
@@ -85,7 +85,7 @@ WHERE r.relid = 'wr_t'::regclass;
 REPACK (CONCURRENTLY, ANALYZE) public.pg_temp_1;
 SELECT * FROM wr_records ORDER BY recorded;
 SELECT bool_and(t.xmin = r.rewrite_xid::xid) AS rows_by_rewriter
-FROM public.pg_temp_1 t, pg_repack_safe_rewrites r
+FROM public.pg_temp_1 t, repack_safe.rewrites r
 WHERE r.relid = 'public.pg_temp_1'::regclass;
 
 REPACK (CONCURRENTLY) wr_deleted;
@@ -102,13 +102,13 @@ REPACK (CONCURRENTLY) wr_t;
 REPACK (CONCURRENTLY) wr_t;
 REPACK (CONCURRENTLY) wr_t;
 SELECT count(*) AS records, count(c.oid) AS naming_a_relation
-FROM pg_repack_safe_rewrites r LEFT JOIN pg_class c ON c.oid = r.relid;
+FROM repack_safe.rewrites r LEFT JOIN pg_class c ON c.oid = r.relid;
 SELECT * FROM wr_records ORDER BY recorded;
-VACUUM pg_repack_safe_rewrites;
+VACUUM repack_safe.rewrites;
 SELECT count(*) AS row_versions
-FROM heap_page_items(get_raw_page('pg_repack_safe_rewrites', 0))
+FROM heap_page_items(get_raw_page('repack_safe.rewrites', 0))
 WHERE lp_len > 0;
-SELECT pg_relation_size('pg_repack_safe_rewrites') /
+SELECT pg_relation_size('repack_safe.rewrites') /
        current_setting('block_size')::int AS blocks;
 
 -- wr_deleted was recorded on its old storage's blocks: its new storage is
@@ -118,13 +118,13 @@ SELECT pg_relation_size('wr_deleted') AS new_size;
 -- The record table is a heap: the reader scans it with SnapshotAny.
 SELECT a.amname
 FROM pg_class c JOIN pg_am a ON a.oid = c.relam
-WHERE c.oid = 'pg_repack_safe_rewrites'::regclass;
+WHERE c.oid = 'repack_safe.rewrites'::regclass;
 
 -- The REPACKs above left records, so removing the extension takes the
 -- superuser override (protection.sql tests the refusal).
-SET pg_repack_safe.allow_unprotected_drop = on;
+SET pg_repack_safe.allow_unprotected_removal = on;
 DROP EXTENSION pg_repack_safe;
-RESET pg_repack_safe.allow_unprotected_drop;
+RESET pg_repack_safe.allow_unprotected_removal;
 DROP VIEW wr_records;
 DROP TABLE wr_t, wr_empty, wr_deleted, public.pg_temp_1;
 DROP EXTENSION pageinspect;

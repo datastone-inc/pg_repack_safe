@@ -12,7 +12,7 @@
 # (invalidatedSince), so they end. A loop that repeated whenever a callback
 # fired never ended, and every query in a database with the extension hung.
 #
-# The reader check, the writer and pg_repack_safe_prune_records() each run
+# The reader check, the writer and repack_safe.prune_records() each run
 # here with the setting on, and the guard still refuses an old snapshot.
 #
 # debug_discard_caches can be set only in a build with assertions; the test
@@ -65,7 +65,7 @@ $reader->query_safe($settings);
   $node->psql('postgres', "$settings REPACK (CONCURRENTLY) t");
 is($ret, 0, 'REPACK (CONCURRENTLY) finishes') or diag($stderr);
 is( $node->safe_psql('postgres',
-        q{SELECT count(*) FROM pg_repack_safe_rewrites
+        q{SELECT count(*) FROM repack_safe.rewrites
           WHERE relid = 't'::regclass}),
     '1', 'and writes its record');
 
@@ -84,8 +84,8 @@ is($out, '5', 'and reads every row');
 
 # The SQL function that locks the record table.
 ($ret, $stdout, $stderr) = $node->psql('postgres',
-    "$settings SELECT pg_repack_safe_prune_records()");
-is($ret, 0, 'pg_repack_safe_prune_records() finishes') or diag($stderr);
+    "$settings SELECT repack_safe.prune_records()");
+is($ret, 0, 'repack_safe.prune_records() finishes') or diag($stderr);
 
 $reader->quit;
 $node->stop;

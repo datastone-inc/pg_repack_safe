@@ -26,7 +26,7 @@
 #
 # Then the removal procedure of the README ("Removing the extension"):
 # pruned and vacuumed to zero blocks, the extension is dropped without
-# pg_repack_safe.allow_unprotected_drop.
+# pg_repack_safe.allow_unprotected_removal.
 
 use strict;
 use warnings FATAL => 'all';
@@ -71,9 +71,9 @@ sub replayAll
 
 # Row versions physically in the record table, deleted or not.
 my $versions = q{
-    SELECT CASE WHEN pg_relation_size('pg_repack_safe_rewrites') = 0 THEN 0
+    SELECT CASE WHEN pg_relation_size('repack_safe.rewrites') = 0 THEN 0
            ELSE (SELECT count(*) FROM heap_page_items(
-                     get_raw_page('pg_repack_safe_rewrites', 0))
+                     get_raw_page('repack_safe.rewrites', 0))
                  WHERE lp_len > 0) END};
 
 replayAll();
@@ -101,11 +101,11 @@ $standby->poll_query_until('postgres', q{
 # The REPACK is recorded, and the record deleted by a later transaction.
 $primary->safe_psql('postgres', 'REPACK (CONCURRENTLY) t');
 is($primary->safe_psql('postgres',
-        'SELECT pg_repack_safe_prune_records()'),
+        'SELECT repack_safe.prune_records()'),
     '1', 'primary: the record is deleted');
 replayAll();
 is($standby->safe_psql('postgres',
-        'SELECT count(*) FROM pg_repack_safe_rewrites'),
+        'SELECT count(*) FROM repack_safe.rewrites'),
     '0', 'standby: the deleted record is invisible to a new snapshot');
 is($standby->safe_psql('postgres', $versions),
     '1', 'standby: the deleted record is still physically present');
@@ -120,9 +120,9 @@ $early->quit;
 # The primary has no snapshot that needs the record, so VACUUM removes it.
 my $logOffset = -s $standby->logfile;
 my ($dbOid, $filenode) = split /\|/, $primary->safe_psql('postgres', q{
-    SELECT d.oid, pg_relation_filenode('pg_repack_safe_rewrites')
+    SELECT d.oid, pg_relation_filenode('repack_safe.rewrites')
     FROM pg_database d WHERE d.datname = current_database()});
-$primary->safe_psql('postgres', 'VACUUM pg_repack_safe_rewrites');
+$primary->safe_psql('postgres', 'VACUUM repack_safe.rewrites');
 is($primary->safe_psql('postgres', $versions),
     '0', 'primary: VACUUM removed the deleted record');
 
@@ -156,7 +156,7 @@ ok(defined $spcOid,
     'standby: the logged WAL record names the record table');
 is($standby->safe_psql('postgres',
         "SELECT pg_filenode_relation(" . ($spcOid // 'NULL') . ", $filenode)"),
-    'pg_repack_safe_rewrites',
+    'repack_safe.rewrites',
     'standby: pg_filenode_relation maps the logged relation to the record table');
 
 is($standby->safe_psql('postgres', $versions),
@@ -167,8 +167,8 @@ is($standby->safe_psql('postgres', 'SELECT count(*) FROM t'),
 # Removing the extension: nothing is left to prune, the record table has no
 # blocks, and DROP EXTENSION needs no override.
 is($primary->safe_psql('postgres',
-        q{SELECT pg_repack_safe_prune_records(),
-                 pg_relation_size('pg_repack_safe_rewrites')}),
+        q{SELECT repack_safe.prune_records(),
+                 pg_relation_size('repack_safe.rewrites')}),
     '0|0', 'primary: pruned and vacuumed, the record table has no blocks');
 $primary->safe_psql('postgres', 'DROP EXTENSION pg_repack_safe');
 replayAll();

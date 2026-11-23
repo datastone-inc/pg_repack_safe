@@ -3,7 +3,7 @@
 EXTENSION = pg_repack_safe
 MODULE_big = pg_repack_safe
 OBJS = src/pg_repack_safe.o
-DATA = pg_repack_safe--1.0.0.sql
+DATA = pg_repack_safe--1.0.sql
 
 # Single-session cases: sql/*.sql, expected/*.out. doc_examples validates
 # the SQL examples from README.md and doc/*.md. They run on a temporary

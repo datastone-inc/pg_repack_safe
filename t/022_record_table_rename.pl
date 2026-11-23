@@ -7,15 +7,13 @@
 # schema (isRecordTable). If the table could be renamed or moved out of that
 # schema, DROP EXTENSION would drop it, and its records, unrecognized, with
 # no override, and an old snapshot would then read the repacked table as
-# empty. These statements make the table unfindable, and each is refused
-# while the table holds records:
+# empty. These statements would make the table unfindable, and each is
+# refused while the table holds records:
 # - ALTER TABLE ... RENAME TO;
-# - ALTER TABLE ... SET SCHEMA;
-# - ALTER EXTENSION ... SET SCHEMA after the table was detached from the
+# - ALTER TABLE ... SET SCHEMA, also after the table was detached from the
 #   extension with ALTER EXTENSION ... DROP TABLE;
-# - the same, with a table of the record table's name, columns and triggers
-#   waiting in the new schema: the extension would take that empty table for
-#   its record table.
+# - ALTER EXTENSION ... SET SCHEMA, with the table or after it was detached,
+#   which PostgreSQL refuses for an extension with a fixed schema.
 # After each attempt DROP EXTENSION is still refused and the old snapshot's
 # read still gets the reader guard's error. sql/protection.sql pins the
 # messages and the superuser override.
@@ -30,30 +28,26 @@ use FindBin;
 use lib $FindBin::RealBin;
 use RepackSafeTest;
 
+my $guardRefusal =
+  qr/cannot rename or move the pg_repack_safe record table while it holds records/;
+my $coreRefusal = qr/extension "pg_repack_safe" does not support SET SCHEMA/;
+
 my %attempts = (
-    rename => 'ALTER TABLE pg_repack_safe_rewrites RENAME TO x',
-    set_schema => 'ALTER TABLE pg_repack_safe_rewrites SET SCHEMA elsewhere',
-    detach_and_move => q{
-        ALTER EXTENSION pg_repack_safe DROP TABLE pg_repack_safe_rewrites;
+    rename => [ 'ALTER TABLE repack_safe.rewrites RENAME TO x',
+        $guardRefusal ],
+    set_schema => [
+        'ALTER TABLE repack_safe.rewrites SET SCHEMA elsewhere',
+        $guardRefusal ],
+    detach_and_set_schema => [ q{
+        ALTER EXTENSION pg_repack_safe DROP TABLE repack_safe.rewrites;
+        ALTER TABLE repack_safe.rewrites SET SCHEMA elsewhere},
+        $guardRefusal ],
+    move_extension => [
+        'ALTER EXTENSION pg_repack_safe SET SCHEMA elsewhere', $coreRefusal ],
+    detach_and_move_extension => [ q{
+        ALTER EXTENSION pg_repack_safe DROP TABLE repack_safe.rewrites;
         ALTER EXTENSION pg_repack_safe SET SCHEMA elsewhere},
-    detach_and_move_to_lookalike => q{
-        ALTER EXTENSION pg_repack_safe DROP TABLE pg_repack_safe_rewrites;
-        CREATE TABLE elsewhere.pg_repack_safe_rewrites
-            (LIKE public.pg_repack_safe_rewrites);
-        CREATE TRIGGER pg_repack_safe_rewrites_writer_only
-            BEFORE INSERT ON elsewhere.pg_repack_safe_rewrites
-            FOR EACH ROW
-            EXECUTE FUNCTION pg_repack_safe_records_writer_only();
-        ALTER TABLE elsewhere.pg_repack_safe_rewrites
-            ENABLE ALWAYS TRIGGER pg_repack_safe_rewrites_writer_only;
-        CREATE TRIGGER pg_repack_safe_rewrites_protected
-            BEFORE UPDATE OR DELETE OR TRUNCATE
-            ON elsewhere.pg_repack_safe_rewrites
-            FOR EACH STATEMENT
-            EXECUTE FUNCTION pg_repack_safe_records_protected();
-        ALTER TABLE elsewhere.pg_repack_safe_rewrites
-            ENABLE ALWAYS TRIGGER pg_repack_safe_rewrites_protected;
-        ALTER EXTENSION pg_repack_safe SET SCHEMA elsewhere});
+        $coreRefusal ]);
 
 foreach my $name (sort keys %attempts)
 {
@@ -71,20 +65,17 @@ foreach my $name (sort keys %attempts)
     $node->safe_psql('postgres', 'REPACK (CONCURRENTLY) t');
 
     my ($ret, $stdout, $stderr) =
-      $node->psql('postgres', $attempts{$name}, on_error_stop => 1);
+      $node->psql('postgres', $attempts{$name}[0], on_error_stop => 1);
     isnt($ret, 0, "$name: refused while the record table holds records");
-    like(
-        $stderr,
-        qr/cannot rename or move the pg_repack_safe record table while it holds records/,
-        "$name: the refusal names the record table");
+    like($stderr, $attempts{$name}[1], "$name: the expected refusal");
 
     # Whatever the attempt left behind, the records are still protected.
     ($ret, $stdout, $stderr) =
       $node->psql('postgres', 'DROP EXTENSION pg_repack_safe');
     isnt($ret, 0, "$name: DROP EXTENSION is still refused");
-    $node->psql('postgres', 'DROP TABLE public.pg_repack_safe_rewrites');
-    $node->psql('postgres', 'DROP TABLE elsewhere.pg_repack_safe_rewrites');
-    $node->psql('postgres', 'DROP TABLE x');
+    $node->psql('postgres', 'DROP TABLE repack_safe.rewrites');
+    $node->psql('postgres', 'DROP TABLE elsewhere.rewrites');
+    $node->psql('postgres', 'DROP TABLE repack_safe.x');
 
     my ($out, $err) = runIn($reader, 'SELECT count(*) FROM t');
     like(
@@ -95,5 +86,14 @@ foreach my $name (sort keys %attempts)
     $reader->quit;
     $node->stop;
 }
+
+# A server that preloads the library logs the library's version when it
+# starts, once, from the postmaster.
+my $logNode = preloadedNode('version_log');
+$logNode->start;
+my @loaded = slurp_file($logNode->logfile) =~
+  /LOG:  pg_repack_safe \d+\.\d+\.\d+ loaded/g;
+is(scalar @loaded, 1, 'the server logs the library version once at start');
+$logNode->stop;
 
 done_testing();

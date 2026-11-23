@@ -73,13 +73,32 @@ CREATE EXTENSION pg_repack_safe;
 and in a session where the library was loaded other than through
 `shared_preload_libraries`.
 
-The extension creates the table `pg_repack_safe_rewrites` in its schema.
-It needs a superuser to create. Its settings:
+The extension needs a superuser to create. Its table, `repack_safe.rewrites`,
+and its functions are always in the schema `repack_safe`: PostgreSQL
+reserves schema names that start with `pg_`, so the schema cannot carry the
+extension's name. `CREATE EXTENSION` creates the schema and lets every role
+look names up in it (`USAGE`), which `repack_safe.status()` needs; the table
+and the other functions are for superusers. The extension cannot be created
+in another schema or moved to one.
+
+If a schema `repack_safe` already exists, the extension is created in it as
+it is, so make sure beforehand that a superuser owns it. The schema can be
+renamed afterwards (`ALTER SCHEMA repack_safe RENAME TO ...`) and the guard
+keeps working; the commands in this documentation then need the new name.
+
+PostgreSQL runs the extension's install script with `repack_safe` as the
+`search_path`. In a database with DDL event triggers, their functions run
+for each command of the script, so a function that names a table without
+its schema fails there and `CREATE EXTENSION` fails with it
+(`relation "..." does not exist`); name the table with its schema in the
+function (`t/020_create_with_event_trigger.pl`).
+
+Its settings:
 
 | Setting | Default | Who | Meaning |
 | --- | --- | --- | --- |
-| `pg_repack_safe.precheck_snapshot_age` | `-1` (off) | any user | refuse `REPACK (CONCURRENTLY)` while a session could later read the table with an older snapshot; a time (milliseconds without a unit, or e.g. `'10min'`), `0` for any age (README, "Optional pre-check") |
-| `pg_repack_safe.allow_unprotected_drop` | `off` | superuser | let `DROP` and `TRUNCATE` remove the record table, its triggers or the extension, and let the record table be renamed or moved to another schema, while the record table holds records; old snapshots then read repacked tables as empty (README, "Removing the extension") |
+| `pg_repack_safe.precheck_snapshot_age` | `-1` (off) | superuser | refuse `REPACK (CONCURRENTLY)` while a session could later read the table with an older snapshot; a time (milliseconds without a unit, or e.g. `'10min'`), `0` for any age (README, "Optional pre-check") |
+| `pg_repack_safe.allow_unprotected_removal` | `off` | superuser | let `DROP` and `TRUNCATE` remove the record table, its triggers or the extension, and let the record table be renamed or moved to another schema, while the record table holds records; old snapshots then read repacked tables as empty (README, "Removing the extension") |
 | `pg_repack_safe.trace_storage_changes` | `off` | superuser | report each detected replacement of a table's storage as a NOTICE (diagnostics) |
 
 ## Upgrading PostgreSQL
@@ -106,14 +125,14 @@ would refuse reads of whichever table now has its OID. Nothing is lost by
 leaving the records behind, because no snapshot survives a dump and
 restore.
 
-For the same reason, rows of `pg_repack_safe_rewrites` cannot be copied
+For the same reason, rows of `repack_safe.rewrites` cannot be copied
 from one database to another, even within one cluster, where relation OIDs
 differ between databases: every `INSERT` and `COPY ... FROM` into the table
 is refused, and only `REPACK (CONCURRENTLY)` writes records.
 
 ## Logical Replication
 
-Keep `pg_repack_safe_rewrites` out of every publication. As with a dump, a
+Keep `repack_safe.rewrites` out of every publication. As with a dump, a
 record's relation OID and transaction ID mean something only in the cluster
 that wrote them. On a subscriber the OID belongs to some other table, or to
 none, and the transaction ID may not have been assigned there yet.
@@ -123,19 +142,18 @@ other table. Exclude it when creating the publication:
 
 ```sql
 CREATE PUBLICATION my_publication
-    FOR ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites);
+    FOR ALL TABLES EXCEPT (TABLE repack_safe.rewrites);
 ```
 
 or afterwards (the list replaces any earlier `EXCEPT` list):
 
 ```sql
 ALTER PUBLICATION my_publication
-    SET ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites);
+    SET ALL TABLES EXCEPT (TABLE repack_safe.rewrites);
 ```
 
-`FOR TABLES IN SCHEMA` has no `EXCEPT`: do not publish the schema the
-extension is installed in, or move the extension to another schema with
-`ALTER EXTENSION pg_repack_safe SET SCHEMA`.
+`FOR TABLES IN SCHEMA` has no `EXCEPT`: do not publish the schema
+`repack_safe`.
 
 If the table is published all the same (`t/016_publication.pl`):
 
@@ -176,7 +194,7 @@ To recover, in this order:
 
 A subscriber without the extension has no such table. Its apply worker
 stops with PostgreSQL's own error, `logical replication target relation
-"public.pg_repack_safe_rewrites" does not exist`, so the exclusion is
+"repack_safe.rewrites" does not exist`, so the exclusion is
 needed there too.
 
 ## Other Extensions
@@ -208,7 +226,7 @@ It registers a custom WAL resource manager with ID 149, reserved for
 On each server, and in each database with the extension:
 
 ```sql
-SELECT pg_repack_safe_status();
+SELECT repack_safe.status();
 ```
 
 It must return `t`. With `f`, and a `WARNING` that says why, the server did
@@ -217,6 +235,21 @@ guards nothing there. If the library is in `session_preload_libraries` or
 `local_preload_libraries`, the `WARNING` names that setting.
 Nothing else reports this state: the extension is still listed by `\dx`,
 and `REPACK (CONCURRENTLY)` runs without an error.
+
+The primary and its standbys must run the same build of the library. On
+each server, with or without the extension in the database:
+
+```sql
+SELECT module_name, version FROM pg_get_loaded_modules()
+WHERE module_name = 'pg_repack_safe';
+```
+
+A server that preloads the library also writes `pg_repack_safe 1.0.0
+loaded` to its log at each start, which shows afterwards which build it ran
+and since when. The library's version (`1.0.0`) names the build; the
+extension's version in `\dx` (`1.0`) names its SQL objects and changes only
+when they do, so a new build of the library needs no `ALTER EXTENSION
+UPDATE` unless its release notes say so.
 
 To run the test suites:
 
@@ -237,7 +270,7 @@ record table, which the extension otherwise refuses, so do not run
 
 See the README, "Removing the extension": dropping it is refused while its
 record table holds records, deleted ones included, and the safe order is to
-delete the records with `pg_repack_safe_prune_records()`, vacuum the record
+delete the records with `repack_safe.prune_records()`, vacuum the record
 table until it is empty, and drop the extension. Removing the library from
 `shared_preload_libraries` afterwards is optional: kept, it refuses
 `REPACK (CONCURRENTLY)` in every database; removed, the command runs

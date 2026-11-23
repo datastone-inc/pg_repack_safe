@@ -4,7 +4,8 @@
  */
 /**
  * @file status.sql
- * @brief pg_repack_safe_status() on a server that preloads the library
+ * @brief repack_safe.status() on a server that preloads the library, the
+ *        extension's fixed schema, and the library's version
  *
  * The extension can exist in a database whose server does not preload the
  * library; it then looks installed and guards nothing. The status function
@@ -12,29 +13,51 @@
  * otherwise; the extension's comment, which \dx shows, points to it. The
  * not-preloaded case is in t/009_not_preloaded.pl.
  */
+-- The extension's schema is fixed: it cannot be created in another one.
+CREATE EXTENSION pg_repack_safe SCHEMA public;
+ERROR:  extension "pg_repack_safe" must be installed in schema "repack_safe"
 CREATE EXTENSION pg_repack_safe;
 -- \dx shows the comment, which names the check.
 SELECT obj_description(oid, 'pg_extension') AS comment
 FROM pg_extension WHERE extname = 'pg_repack_safe';
-                                                                             comment                                                                              
-------------------------------------------------------------------------------------------------------------------------------------------------------------------
- Makes the built-in REPACK (CONCURRENTLY) safe: old snapshots get an error instead of wrong rows. In force only where SELECT pg_repack_safe_status() returns true
+                                                                                                            comment                                                                                                             
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Makes the built-in REPACK (CONCURRENTLY) safe: old snapshots get an error instead of wrong rows. In force only where SELECT repack_safe.status() returns true. SELECT * FROM pg_get_loaded_modules() shows the library version
+(1 row)
+
+-- Its objects are in the schema repack_safe, which CREATE EXTENSION
+-- created, and it is version 1.0.
+SELECT extnamespace::regnamespace AS schema, extrelocatable AS relocatable,
+       extversion AS version
+FROM pg_extension WHERE extname = 'pg_repack_safe';
+   schema    | relocatable | version 
+-------------+-------------+---------
+ repack_safe | f           | 1.0
+(1 row)
+
+-- pg_get_loaded_modules() reports the library's name and that it has a
+-- version, on any server that loaded it, with or without the extension.
+SELECT module_name, version ~ '^[0-9]+\.[0-9]+\.[0-9]+$' AS has_version
+FROM pg_get_loaded_modules() WHERE module_name = 'pg_repack_safe';
+  module_name   | has_version 
+----------------+-------------
+ pg_repack_safe | t
 (1 row)
 
 -- This instance preloads the library (test/temp_instance.conf): true, and
 -- no warning.
-SELECT pg_repack_safe_status();
- pg_repack_safe_status 
------------------------
+SELECT repack_safe.status();
+ status 
+--------
  t
 (1 row)
 
 -- Any role may call it.
 CREATE ROLE status_user;
 SET ROLE status_user;
-SELECT pg_repack_safe_status();
- pg_repack_safe_status 
------------------------
+SELECT repack_safe.status();
+ status 
+--------
  t
 (1 row)
 
@@ -53,8 +76,15 @@ ERROR:  could not access file "pg_repack_safe_missing": No such file or director
 DROP EXTENSION pg_repack_safe;
 -- After DROP EXTENSION the function is gone with it (README, "Removing the
 -- extension", step 5).
-SELECT pg_repack_safe_status();
-ERROR:  function pg_repack_safe_status() does not exist
-LINE 1: SELECT pg_repack_safe_status();
+SELECT repack_safe.status();
+ERROR:  function repack_safe.status() does not exist
+LINE 1: SELECT repack_safe.status();
                ^
-DETAIL:  There is no function of that name.
+-- DROP EXTENSION leaves the schema, which is not a member of the extension.
+SELECT count(*) AS schemas FROM pg_namespace WHERE nspname = 'repack_safe';
+ schemas 
+---------
+       1
+(1 row)
+
+DROP SCHEMA repack_safe;

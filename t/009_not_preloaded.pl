@@ -49,14 +49,14 @@ $node->safe_psql('postgres', q{
 # it loads the library in this backend, which then refuses
 # REPACK (CONCURRENTLY) like any late load.
 my ($ret, $stdout, $stderr) = $node->psql('postgres', q{
-    SELECT pg_repack_safe_status();
+    SELECT repack_safe.status();
 });
-is($stdout, 'f', 'not preloaded: pg_repack_safe_status() returns false');
+is($stdout, 'f', 'not preloaded: repack_safe.status() returns false');
 like($stderr,
     qr/WARNING:  pg_repack_safe is not in force: the server did not load it through shared_preload_libraries/,
     'not preloaded: the warning says what is wrong');
 ($ret, $stdout, $stderr) = $node->psql('postgres', q{
-    SELECT pg_repack_safe_status();
+    SELECT repack_safe.status();
     REPACK (CONCURRENTLY) t;
 });
 like($stderr,
@@ -66,7 +66,7 @@ like($stderr,
 # A call that loads the library warns once, not once for the load and once
 # for the call.
 ($ret, $stdout, $stderr) = $node->psql('postgres', q{
-    SELECT pg_repack_safe_status();
+    SELECT repack_safe.status();
 });
 my @warnings = ($stderr =~ /WARNING:  pg_repack_safe is not in force/g);
 is(scalar(@warnings), 1,
@@ -101,7 +101,7 @@ like($stderr,
 # table is empty.
 ($ret, $stdout, $stderr) = $node->psql('postgres', q{
     BEGIN;
-    TRUNCATE pg_repack_safe_rewrites;
+    TRUNCATE repack_safe.rewrites;
     ROLLBACK;
     REPACK (CONCURRENTLY) t;
 });
@@ -138,10 +138,10 @@ like($stderr,
 
 # The status function gives the same cause.
 ($ret, $stdout, $stderr) = $node->psql('postgres', q{
-    SELECT pg_repack_safe_status();
+    SELECT repack_safe.status();
 });
 is($stdout, 'f',
-    'library in session_preload_libraries: pg_repack_safe_status() returns false');
+    'library in session_preload_libraries: repack_safe.status() returns false');
 @warnings = ($stderr =~ /DETAIL:  pg_repack_safe is listed in session_preload_libraries/g);
 is(scalar(@warnings), 2,
     'library in session_preload_libraries: the connection and the status call both name the setting');
@@ -169,7 +169,7 @@ isnt($node->safe_psql('postgres', q{SELECT pg_relation_filenode('t')}),
     $filenodeBefore,
     'KNOWN GAP: session_preload_libraries, the worker replaced the storage');
 is($node->safe_psql('postgres',
-        'SELECT count(*) FROM pg_repack_safe_rewrites'),
+        'SELECT count(*) FROM repack_safe.rewrites'),
     '0',
     'KNOWN GAP: session_preload_libraries, the worker wrote no record');
 
@@ -181,7 +181,7 @@ $node->reload;
   $node->psql('postgres', 'REPACK (CONCURRENTLY) t');
 is($ret, 0, 'KNOWN GAP: library never loaded, REPACK (CONCURRENTLY) runs');
 is($node->safe_psql('postgres',
-        'SELECT count(*) FROM pg_repack_safe_rewrites'),
+        'SELECT count(*) FROM repack_safe.rewrites'),
     '0', 'KNOWN GAP: library never loaded, no record is written');
 
 # Where the library cannot be installed, PostgreSQL itself can switch
@@ -226,7 +226,7 @@ $node->stop;
         'completed',
         'preloaded: a background worker runs REPACK (CONCURRENTLY)');
     is($preloaded->safe_psql('postgres',
-            q{SELECT count(*) > 0 FROM pg_repack_safe_rewrites
+            q{SELECT count(*) > 0 FROM repack_safe.rewrites
               WHERE relid = 't'::regclass}),
         't', 'preloaded: the background worker\'s REPACK (CONCURRENTLY) is recorded');
     $preloaded->stop;
@@ -250,7 +250,7 @@ $node->stop;
         REPACK (CONCURRENTLY) t;
     });
     is($unloaded->safe_psql('postgres',
-            'SELECT count(*) > 0 FROM pg_repack_safe_rewrites'),
+            'SELECT count(*) > 0 FROM repack_safe.rewrites'),
         't', 'preloaded: REPACK (CONCURRENTLY) wrote a record');
     ($ret, $stdout, $stderr) =
       $unloaded->psql('postgres', 'DROP EXTENSION pg_repack_safe');
@@ -260,7 +260,7 @@ $node->stop;
         "shared_preload_libraries = ''\n");
     $unloaded->restart;
     is($unloaded->safe_psql('postgres',
-            'SELECT count(*) > 0 FROM pg_repack_safe_rewrites'),
+            'SELECT count(*) > 0 FROM repack_safe.rewrites'),
         't', 'not preloaded: the record is still there');
     ($ret, $stdout, $stderr) =
       $unloaded->psql('postgres', 'DROP EXTENSION pg_repack_safe');

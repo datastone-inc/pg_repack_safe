@@ -95,7 +95,7 @@ $reader->quit;
 # flushed when the statement returns, and the default target would be
 # reached before they are replayed.
 my $logOffset = -s $standby->logfile;
-$primary->safe_psql('postgres', 'VACUUM pg_repack_safe_rewrites');
+$primary->safe_psql('postgres', 'VACUUM repack_safe.rewrites');
 $primary->wait_for_catchup($standby, 'replay', $primary->lsn('insert'));
 is($standby->safe_psql('postgres',
         "SELECT count(*) FROM pg_stat_activity WHERE pid = $idlePid"),

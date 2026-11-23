@@ -139,5 +139,5 @@ or a PG source citation settles it.
 
 - PostgreSQL 19 (tested on 19.0). `REPACK` does not exist before 19. Don't
   add compatibility shims for older majors.
-- Release state: prerelease. Edit `pg_repack_safe--1.0.0.sql` in place. No
+- Release state: prerelease. Edit `pg_repack_safe--1.0.sql` in place. No
   version bumps or upgrade scripts until the first release.

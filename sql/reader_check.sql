@@ -33,7 +33,7 @@ LANGUAGE C STRICT;
 -- This test truncates, renames, moves and drops the record table to reach
 -- the reader's lookup failures. protection.sql tests the refusals of those
 -- operations, so the superuser override is on here.
-SET pg_repack_safe.allow_unprotected_drop = on;
+SET pg_repack_safe.allow_unprotected_removal = on;
 
 -- Extension absent: no verdict is needed, the query passes.
 SELECT 1 AS passes;
@@ -47,33 +47,33 @@ CREATE TABLE rc_t (id int PRIMARY KEY);
 
 -- Records this session's snapshots all see: queries pass.
 -- The bootstrap XID precedes every snapshot.
-SELECT test_insert_record('pg_repack_safe_rewrites', 'pg_class'::regclass, '1');
+SELECT test_insert_record('repack_safe.rewrites', 'pg_class'::regclass, '1');
 SELECT count(*) > 0 AS passes FROM pg_class;
 -- A transaction that committed before the snapshot was taken.
 BEGIN;
 SELECT pg_current_xact_id() AS committed_xid \gset
 COMMIT;
-SELECT test_insert_record('pg_repack_safe_rewrites', 'rc_t'::regclass,
+SELECT test_insert_record('repack_safe.rewrites', 'rc_t'::regclass,
                           :'committed_xid');
 SELECT count(*) AS passes FROM rc_t;
 -- An aborted transaction.
 BEGIN;
 SELECT pg_current_xact_id() AS aborted_xid \gset
 ROLLBACK;
-SELECT test_insert_record('pg_repack_safe_rewrites', 'rc_t'::regclass,
+SELECT test_insert_record('repack_safe.rewrites', 'rc_t'::regclass,
                           :'aborted_xid');
 SELECT count(*) AS passes FROM rc_t;
 -- The query's own transaction, whose XID was assigned after its snapshot.
 BEGIN ISOLATION LEVEL REPEATABLE READ;
 SELECT count(*) AS passes FROM rc_t;
-SELECT test_insert_record('pg_repack_safe_rewrites', 'rc_t'::regclass,
+SELECT test_insert_record('repack_safe.rewrites', 'rc_t'::regclass,
                           pg_current_xact_id());
 SELECT count(*) AS passes FROM rc_t;
 COMMIT;
-SELECT count(*) AS records FROM pg_repack_safe_rewrites;
+SELECT count(*) AS records FROM repack_safe.rewrites;
 
 -- TRUNCATE is a utility statement and gives the table zero blocks again.
-TRUNCATE pg_repack_safe_rewrites;
+TRUNCATE repack_safe.rewrites;
 SELECT 1 AS passes;
 
 -- With the record table in place, REPACK (CONCURRENTLY) runs.
@@ -82,24 +82,24 @@ REPACK (CONCURRENTLY) rc_t;
 -- Record table renamed: it cannot be found, so the query is refused, and so
 -- is REPACK (CONCURRENTLY), which would have nowhere to record the rewrite.
 -- The MVCC-safe REPACK is a utility statement and still runs.
-ALTER TABLE pg_repack_safe_rewrites RENAME TO rc_renamed;
+ALTER TABLE repack_safe.rewrites RENAME TO rc_renamed;
 SELECT 1 AS refused;
 REPACK (CONCURRENTLY) rc_t;
 REPACK (CONCURRENTLY true, VERBOSE false) rc_t;
 REPACK rc_t;
-ALTER TABLE rc_renamed RENAME TO pg_repack_safe_rewrites;
+ALTER TABLE repack_safe.rc_renamed RENAME TO rewrites;
 SELECT 1 AS passes;
 
 -- Record table in another schema than the extension's: refused.
 CREATE SCHEMA rc_other;
-ALTER TABLE pg_repack_safe_rewrites SET SCHEMA rc_other;
+ALTER TABLE repack_safe.rewrites SET SCHEMA rc_other;
 SELECT 1 AS refused;
-ALTER TABLE rc_other.pg_repack_safe_rewrites SET SCHEMA public;
+ALTER TABLE rc_other.rewrites SET SCHEMA repack_safe;
 SELECT 1 AS passes;
 
 -- Record table detached from the extension and dropped: refused.
-ALTER EXTENSION pg_repack_safe DROP TABLE pg_repack_safe_rewrites;
-DROP TABLE pg_repack_safe_rewrites;
+ALTER EXTENSION pg_repack_safe DROP TABLE repack_safe.rewrites;
+DROP TABLE repack_safe.rewrites;
 SELECT 1 AS refused;
 
 -- Dropping the extension is a utility statement and ends the refusal.
@@ -113,14 +113,14 @@ SELECT 1 AS passes;
 -- into any table.
 CREATE EXTENSION pg_repack_safe;
 SELECT 1 AS passes;
-ALTER EXTENSION pg_repack_safe DROP TABLE pg_repack_safe_rewrites;
+ALTER EXTENSION pg_repack_safe DROP TABLE repack_safe.rewrites;
 DROP EXTENSION pg_repack_safe CASCADE;
-INSERT INTO pg_repack_safe_rewrites VALUES ('pg_class'::regclass, '1');
+INSERT INTO repack_safe.rewrites VALUES ('pg_class'::regclass, '1');
 SELECT 1 AS passes;
-DROP TABLE pg_repack_safe_rewrites;
+DROP TABLE repack_safe.rewrites;
 
 DROP SCHEMA rc_other;
 DROP TABLE rc_t;
 DROP FUNCTION test_insert_record(regclass, oid, xid8);
 
-RESET pg_repack_safe.allow_unprotected_drop;
+RESET pg_repack_safe.allow_unprotected_removal;

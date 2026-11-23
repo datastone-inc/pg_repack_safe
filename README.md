@@ -317,7 +317,7 @@ table's owner can always grant them back to itself.
 
 Each `REPACK (CONCURRENTLY)` of a table with data writes a record, (table,
 rewriting transaction ID), into the extension's table
-`pg_repack_safe_rewrites`, plus one for the table's TOAST table, and a WAL
+`repack_safe.rewrites`, plus one for the table's TOAST table, and a WAL
 record of its own. Once a query holds its locks, it checks the records of
 the tables it reads against its snapshot; each backend keeps a copy of the
 records, refreshed by cache invalidation, so the check costs about as much
@@ -359,7 +359,7 @@ Logical replication's initial copy of a table published through its
 partitioned root is such a statement; `pg_dump` copies each partition by
 itself and is not affected.
 
-A publication `FOR ALL TABLES` includes `pg_repack_safe_rewrites`. The
+A publication `FOR ALL TABLES` includes `repack_safe.rewrites`. The
 records a `REPACK (CONCURRENTLY)` writes are not sent to subscribers, so
 replication carries on. Exclude the table all the same: a new
 subscription's initial copy reads the records already there, a subscriber
@@ -375,23 +375,23 @@ of its trigger functions:
 - Each `REPACK (CONCURRENTLY)` adds one or two records and deletes every
   older one, so the table stays small. A deleted record still protects: it
   stays in the table until `VACUUM` finds that no snapshot can need it.
-  `pg_repack_safe_prune_records()` deletes the remaining records in a
+  `repack_safe.prune_records()` deletes the remaining records in a
   database that has stopped repacking.
 - While it holds records, `DROP` of the table, its triggers or the
   extension, and `TRUNCATE` of the table, are refused unless a superuser
-  sets `pg_repack_safe.allow_unprotected_drop` (see
+  sets `pg_repack_safe.allow_unprotected_removal` (see
   [Removing the extension](#removing-the-extension)). So are renaming the
   table and moving it to another schema, because the extension finds the
-  table by its name in its own schema and would no longer protect it;
-  `ALTER EXTENSION pg_repack_safe SET SCHEMA` moves both together and is
-  allowed (`t/022_record_table_rename.pl`). `UPDATE` and `DELETE`
+  table by its name in its own schema and would no longer protect it.
+  The extension itself cannot be moved: its schema is fixed
+  (`t/022_record_table_rename.pl`). `UPDATE` and `DELETE`
   of records, rewrites that do not keep every record unchanged (a rewriting
   `ALTER TABLE`, `REPACK (CONCURRENTLY)`), and changes to when its triggers
   fire are always refused. `VACUUM` of it is always allowed.
 - `VACUUM FULL`, `CLUSTER` and `REPACK` of it are refused while it holds a
   deleted record, because they would drop the record without ending the
   standby snapshots that still need it. Run `VACUUM
-  pg_repack_safe_rewrites` first and repeat the command. The database-wide
+  repack_safe.rewrites` first and repeat the command. The database-wide
   `VACUUM FULL` and `REPACK` stop at the record table with the same error
   and the same remedy.
 - `INSERT` into it is always refused, by any route (`COPY ... FROM`,
@@ -430,14 +430,30 @@ Then check, in each database and on each server, that the guard is in
 force:
 
 ```sql
-SELECT pg_repack_safe_status();
+SELECT repack_safe.status();
 ```
 
 It must return `t`. If it returns `f`, with a `WARNING` that says why, the
 server did not load the library through `shared_preload_libraries`: the
 extension is installed but guards nothing. The extension's description in
 `\dx` names this check: "In force only where SELECT
-pg_repack_safe_status() returns true".
+repack_safe.status() returns true".
+
+The extension's table and functions are always in the schema `repack_safe`
+(PostgreSQL reserves schema names that start with `pg_`, so the schema
+cannot carry the extension's name). `CREATE EXTENSION` creates the schema,
+and the extension cannot be created in or moved to another one.
+
+To see which build of the library a server runs, on the primary and on
+each standby:
+
+```sql
+SELECT module_name, version FROM pg_get_loaded_modules()
+WHERE module_name = 'pg_repack_safe';
+```
+
+The versions must match on every server. Each server also logs
+`pg_repack_safe 1.0.0 loaded` when it starts with the library preloaded.
 
 See [doc/installation.md](doc/installation.md).
 
@@ -579,7 +595,7 @@ SELECT datname FROM pg_database WHERE oid = 5;
 SELECT pg_filenode_relation(1663, 16432);
 ```
 
-If the second query returns `pg_repack_safe_rewrites`, the conflict came
+If the second query returns `repack_safe.rewrites`, the conflict came
 from the cleanup of the extension's records. Run the lookup soon after the
 conflict, while the filenode still belongs to the record table: a rewrite of
 the table gives it a new filenode. On the primary, setting the
@@ -666,7 +682,7 @@ standby ([Requirements](#requirements)). Without it:
 - **A session that never loads the library** has no hooks: its
   `REPACK (CONCURRENTLY)` runs unrecorded and its reads are not checked.
   Setting `shared_preload_libraries` leaves no such session. Nothing raises
-  an error when it is missing, but `SELECT pg_repack_safe_status()` returns
+  an error when it is missing, but `SELECT repack_safe.status()` returns
   `f`, with a `WARNING`, and each session that loads the library later
   gets the same `WARNING` when it does. Such a session can also drop the
   extension while its record table holds records, since the refusal is in
@@ -744,36 +760,24 @@ says what to do. Run every SQL command as a superuser.
    ```bash
    psql -XAt -c "SELECT datname FROM pg_database WHERE datallowconn" |
    while IFS= read -r db; do
-       psql -XAt -d "$db" -c "SELECT format('database %I: schema %s'
-                                            , current_database()
-                                            , extnamespace::regnamespace)
+       psql -XAt -d "$db" -c "SELECT format('database %I', current_database())
                                 AS found
                               FROM pg_extension WHERE extname = 'pg_repack_safe'"
    done
    ```
 
    It prints one line for each database that has the extension, such as
-   `database mydb: schema public`.
+   `database mydb`.
 
-   Check: you have the list. The schema is the one that holds the
-   extension's table and functions, `public` unless the extension was
-   created in or moved to another one. If it is not `public`, start each
-   session of steps 3 and 4 in that database with, for a schema `ext`:
-
-   ```sql
-   SET search_path = ext, public;
-   ```
-
-   Otherwise the commands there fail with `relation
-   "pg_repack_safe_rewrites" does not exist`.
+   Check: you have the list.
 
 3. **Delete the records and vacuum them away.** In each database on the
    list, on the primary:
 
    ```sql
-   SELECT pg_repack_safe_prune_records();
-   VACUUM (TRUNCATE) pg_repack_safe_rewrites;
-   SELECT pg_relation_size('pg_repack_safe_rewrites') = 0 AS empty;
+   SELECT repack_safe.prune_records();
+   VACUUM (TRUNCATE) repack_safe.rewrites;
+   SELECT pg_relation_size('repack_safe.rewrites') = 0 AS empty;
    ```
 
    Check: `empty` is `t`. `TRUNCATE` is spelled out so that a
@@ -819,6 +823,14 @@ says what to do. Run every SQL command as a superuser.
    on the extension (a view of the record table, say), look at them and
    drop them yourself.
 
+   The drop leaves the empty schema `repack_safe` behind, since
+   `CREATE EXTENSION` created it without making it part of the extension.
+   Drop it too, unless you keep objects of your own there:
+
+   ```sql
+   DROP SCHEMA repack_safe;
+   ```
+
 5. **Decide whether to take `pg_repack_safe` out of
    `shared_preload_libraries`.** This step is optional. Only do this step 5
    after step 4 has dropped the extension in every database.
@@ -837,11 +849,11 @@ says what to do. Run every SQL command as a superuser.
    >
    > The catalog only shows that the extension is installed, not that it is
    > in force. NOTE HOWEVER that `\dx` does say how to check: the description of
-   > `pg_repack_safe` reads "In force only where SELECT pg_repack_safe_status()
+   > `pg_repack_safe` reads "In force only where SELECT repack_safe.status()
    > returns true". Run that query. If it returns `f` (false) instead of `t`
    > (true), or fails with `could not access file`, the server is
    > misconfigured. (After step 4 the function is gone, so `function
-   > pg_repack_safe_status() does not exist` is expected there.) To fix it,
+   > repack_safe.status() does not exist` is expected there.) To fix it,
    > reinstall the package if the file is missing, put `pg_repack_safe` back
    > in `shared_preload_libraries`, restart, and start this procedure again
    > from step 1. Do not just drop the extension in that state: without the
@@ -950,10 +962,10 @@ Steps 1 to 4 remove the extension without exposing any snapshot or
 breaking any standby, and need no backup to have expired.
 
 A superuser can skip step 3 by setting
-`pg_repack_safe.allow_unprotected_drop` in the session that runs the drop:
+`pg_repack_safe.allow_unprotected_removal` in the session that runs the drop:
 
 ```sql
-SET pg_repack_safe.allow_unprotected_drop = on;
+SET pg_repack_safe.allow_unprotected_removal = on;
 DROP EXTENSION pg_repack_safe;
 ```
 

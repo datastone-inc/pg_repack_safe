@@ -30,7 +30,7 @@ LANGUAGE C STRICT;
 -- This test truncates, renames, moves and drops the record table to reach
 -- the reader's lookup failures. protection.sql tests the refusals of those
 -- operations, so the superuser override is on here.
-SET pg_repack_safe.allow_unprotected_drop = on;
+SET pg_repack_safe.allow_unprotected_removal = on;
 -- Extension absent: no verdict is needed, the query passes.
 SELECT 1 AS passes;
  passes 
@@ -49,7 +49,7 @@ SELECT 1 AS passes;
 CREATE TABLE rc_t (id int PRIMARY KEY);
 -- Records this session's snapshots all see: queries pass.
 -- The bootstrap XID precedes every snapshot.
-SELECT test_insert_record('pg_repack_safe_rewrites', 'pg_class'::regclass, '1');
+SELECT test_insert_record('repack_safe.rewrites', 'pg_class'::regclass, '1');
  test_insert_record 
 --------------------
  
@@ -65,7 +65,7 @@ SELECT count(*) > 0 AS passes FROM pg_class;
 BEGIN;
 SELECT pg_current_xact_id() AS committed_xid \gset
 COMMIT;
-SELECT test_insert_record('pg_repack_safe_rewrites', 'rc_t'::regclass,
+SELECT test_insert_record('repack_safe.rewrites', 'rc_t'::regclass,
                           :'committed_xid');
  test_insert_record 
 --------------------
@@ -82,7 +82,7 @@ SELECT count(*) AS passes FROM rc_t;
 BEGIN;
 SELECT pg_current_xact_id() AS aborted_xid \gset
 ROLLBACK;
-SELECT test_insert_record('pg_repack_safe_rewrites', 'rc_t'::regclass,
+SELECT test_insert_record('repack_safe.rewrites', 'rc_t'::regclass,
                           :'aborted_xid');
  test_insert_record 
 --------------------
@@ -103,7 +103,7 @@ SELECT count(*) AS passes FROM rc_t;
       0
 (1 row)
 
-SELECT test_insert_record('pg_repack_safe_rewrites', 'rc_t'::regclass,
+SELECT test_insert_record('repack_safe.rewrites', 'rc_t'::regclass,
                           pg_current_xact_id());
  test_insert_record 
 --------------------
@@ -117,14 +117,14 @@ SELECT count(*) AS passes FROM rc_t;
 (1 row)
 
 COMMIT;
-SELECT count(*) AS records FROM pg_repack_safe_rewrites;
+SELECT count(*) AS records FROM repack_safe.rewrites;
  records 
 ---------
        4
 (1 row)
 
 -- TRUNCATE is a utility statement and gives the table zero blocks again.
-TRUNCATE pg_repack_safe_rewrites;
+TRUNCATE repack_safe.rewrites;
 SELECT 1 AS passes;
  passes 
 --------
@@ -136,21 +136,21 @@ REPACK (CONCURRENTLY) rc_t;
 -- Record table renamed: it cannot be found, so the query is refused, and so
 -- is REPACK (CONCURRENTLY), which would have nowhere to record the rewrite.
 -- The MVCC-safe REPACK is a utility statement and still runs.
-ALTER TABLE pg_repack_safe_rewrites RENAME TO rc_renamed;
+ALTER TABLE repack_safe.rewrites RENAME TO rc_renamed;
 SELECT 1 AS refused;
 ERROR:  pg_repack_safe cannot find its record table
-DETAIL:  The extension "pg_repack_safe" exists in this database, but the table "pg_repack_safe_rewrites" is not in its schema.
+DETAIL:  The extension "pg_repack_safe" exists in this database, but the table "rewrites" is not in its schema.
 HINT:  Restore the table's name and schema, or drop and re-create the extension, which discards its records.
 REPACK (CONCURRENTLY) rc_t;
 ERROR:  pg_repack_safe cannot find its record table
-DETAIL:  The extension "pg_repack_safe" exists in this database, but the table "pg_repack_safe_rewrites" is not in its schema.
+DETAIL:  The extension "pg_repack_safe" exists in this database, but the table "rewrites" is not in its schema.
 HINT:  Restore the table's name and schema, or drop and re-create the extension, which discards its records.
 REPACK (CONCURRENTLY true, VERBOSE false) rc_t;
 ERROR:  pg_repack_safe cannot find its record table
-DETAIL:  The extension "pg_repack_safe" exists in this database, but the table "pg_repack_safe_rewrites" is not in its schema.
+DETAIL:  The extension "pg_repack_safe" exists in this database, but the table "rewrites" is not in its schema.
 HINT:  Restore the table's name and schema, or drop and re-create the extension, which discards its records.
 REPACK rc_t;
-ALTER TABLE rc_renamed RENAME TO pg_repack_safe_rewrites;
+ALTER TABLE repack_safe.rc_renamed RENAME TO rewrites;
 SELECT 1 AS passes;
  passes 
 --------
@@ -159,12 +159,12 @@ SELECT 1 AS passes;
 
 -- Record table in another schema than the extension's: refused.
 CREATE SCHEMA rc_other;
-ALTER TABLE pg_repack_safe_rewrites SET SCHEMA rc_other;
+ALTER TABLE repack_safe.rewrites SET SCHEMA rc_other;
 SELECT 1 AS refused;
 ERROR:  pg_repack_safe cannot find its record table
-DETAIL:  The extension "pg_repack_safe" exists in this database, but the table "pg_repack_safe_rewrites" is not in its schema.
+DETAIL:  The extension "pg_repack_safe" exists in this database, but the table "rewrites" is not in its schema.
 HINT:  Restore the table's name and schema, or drop and re-create the extension, which discards its records.
-ALTER TABLE rc_other.pg_repack_safe_rewrites SET SCHEMA public;
+ALTER TABLE rc_other.rewrites SET SCHEMA repack_safe;
 SELECT 1 AS passes;
  passes 
 --------
@@ -172,11 +172,11 @@ SELECT 1 AS passes;
 (1 row)
 
 -- Record table detached from the extension and dropped: refused.
-ALTER EXTENSION pg_repack_safe DROP TABLE pg_repack_safe_rewrites;
-DROP TABLE pg_repack_safe_rewrites;
+ALTER EXTENSION pg_repack_safe DROP TABLE repack_safe.rewrites;
+DROP TABLE repack_safe.rewrites;
 SELECT 1 AS refused;
 ERROR:  pg_repack_safe cannot find its record table
-DETAIL:  The extension "pg_repack_safe" exists in this database, but the table "pg_repack_safe_rewrites" is not in its schema.
+DETAIL:  The extension "pg_repack_safe" exists in this database, but the table "rewrites" is not in its schema.
 HINT:  Restore the table's name and schema, or drop and re-create the extension, which discards its records.
 -- Dropping the extension is a utility statement and ends the refusal.
 DROP EXTENSION pg_repack_safe;
@@ -198,20 +198,20 @@ SELECT 1 AS passes;
       1
 (1 row)
 
-ALTER EXTENSION pg_repack_safe DROP TABLE pg_repack_safe_rewrites;
+ALTER EXTENSION pg_repack_safe DROP TABLE repack_safe.rewrites;
 DROP EXTENSION pg_repack_safe CASCADE;
 NOTICE:  drop cascades to 2 other objects
-DETAIL:  drop cascades to trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites
-drop cascades to trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites
-INSERT INTO pg_repack_safe_rewrites VALUES ('pg_class'::regclass, '1');
+DETAIL:  drop cascades to trigger rewrites_writer_only on table repack_safe.rewrites
+drop cascades to trigger rewrites_protected on table repack_safe.rewrites
+INSERT INTO repack_safe.rewrites VALUES ('pg_class'::regclass, '1');
 SELECT 1 AS passes;
  passes 
 --------
       1
 (1 row)
 
-DROP TABLE pg_repack_safe_rewrites;
+DROP TABLE repack_safe.rewrites;
 DROP SCHEMA rc_other;
 DROP TABLE rc_t;
 DROP FUNCTION test_insert_record(regclass, oid, xid8);
-RESET pg_repack_safe.allow_unprotected_drop;
+RESET pg_repack_safe.allow_unprotected_removal;
