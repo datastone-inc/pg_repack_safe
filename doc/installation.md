@@ -317,12 +317,9 @@ make installcheck
 
 This does not use the server that `PGHOST`/`PGPORT` point at: the test
 suites start their own temporary servers from the installed binaries (see
-[development.md](development.md)). It also installs four test-only modules,
-`custom_scan_provider`, `oat_observer`, `test_record` and `toplevel_worker`,
-into the PostgreSQL library directory;
-`make install` does not. `test_record` can write arbitrary rows into a
-record table, which the extension otherwise refuses, so do not run
-`make installcheck` against the installation of a production server.
+[development.md](development.md)). It installs nothing: the test-only
+modules under `test/modules/` are built there and the temporary servers
+load them from there.
 
 ## Removing the Extension
 

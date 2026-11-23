@@ -81,6 +81,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   column change or an unsafe rewrite of the record table, a change to when
   its triggers fire) has SQLSTATE 0A000, while one that holds only while
   the record table has records keeps 55000.
+- `make installcheck` installs nothing. The test-only modules are built in
+  `test/modules/` and loaded from there; before, they were copied into the
+  server's library directory and left there.
+- `META.json` for PGXN, `make dist` for the release archive, and
+  `make check-version`, which checks that the library, `META.json` and the
+  control file agree on the version.
 - The library has a version of its own (`1.0.0`), which
   `pg_get_loaded_modules()` shows on every server and the postmaster logs at
   start (`pg_repack_safe 1.0.0 loaded`). The extension's version (`1.0`)

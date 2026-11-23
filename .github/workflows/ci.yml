@@ -4,7 +4,8 @@
 # Check the C formatting, build the extension and run its three test suites
 # (pg_regress, isolation, TAP) against PostgreSQL 19.
 #
-# - format: make check-format, with a pinned clang-format.
+# - format: make check-format, with a pinned clang-format, and
+#   make check-version.
 # - packages: PostgreSQL 19 from apt.postgresql.org, built with gcc, on
 #   x86_64 and arm64, with warnings as errors (make WERROR=1).
 # - upstream: the tip of REL_19_STABLE built from source with clang,
@@ -39,12 +40,16 @@ jobs:
 
       # Output differs between clang-format majors, so the version is
       # pinned; the PyPI build is the same program as the LLVM one. The
-      # format targets need no PostgreSQL.
+      # format and version targets need no PostgreSQL.
       - name: Install clang-format
         run: pipx install clang-format==22.1.8
 
       - name: Check
         run: make check-format
+
+      # The library's version constant, META.json and the control file agree.
+      - name: Check the version
+        run: make check-version
 
   packages:
     if: github.event_name != 'schedule'
@@ -66,8 +71,8 @@ jobs:
               libipc-run-perl
           echo /usr/lib/postgresql/19/bin >> "$GITHUB_PATH"
 
-      # make install and make installcheck (which installs three test-only
-      # modules) write into the server's directories.
+      # make install writes into the server's directories. make installcheck
+      # installs nothing: it loads its test-only modules from the build tree.
       - name: Let the runner install into the PostgreSQL directories
         run: |
           sudo chown -R "$USER" "$(pg_config --pkglibdir)" \
