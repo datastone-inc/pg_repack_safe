@@ -92,10 +92,14 @@ binaries.
   an old snapshot, running a statement and collecting its errors, waiting
   for a queued lock request) are in `t/RepackSafeTest.pm`.
 
-`make installcheck` first installs three test-only modules from
+`make installcheck` first installs four test-only modules from
 `test/modules/` into the PostgreSQL library directory; `make install` does
 not install them.
 
+- `custom_scan_provider`: plans every scan of a plain table as a
+  `CustomScan` while `custom_scan_provider.enabled` is on.
+  `specs/unread_relations.spec` loads it to check that the reader check
+  covers every range-table relation when a plan has a `CustomScan`.
 - `oat_observer`: a second `object_access_hook`, loaded next to the library
   by `t/015_oat_hook_chain.pl`.
 - `test_record`: the C function `test_insert_record(record_table regclass,

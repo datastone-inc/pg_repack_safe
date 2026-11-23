@@ -24,8 +24,8 @@ ISOLATION_OPTS = --temp-instance=./tmp_check_iso \
                  --temp-config=$(srcdir)/test/temp_instance.conf
 
 # t/*.pl: cases a spec cannot set up: client programs (pg_dump, pg_upgrade),
-# standbys, logical replication, and other preloaded modules. Each test creates its own temporary clusters from the
-# installed binaries.
+# standbys, logical replication, and other preloaded modules. Each test
+# creates its own temporary clusters from the installed binaries.
 TAP_TESTS = 1
 
 # Compiler flags
@@ -45,6 +45,8 @@ include $(PGXS)
 
 # The tests use test-only modules; install them for the tests. make install
 # does not install them.
+# - test/modules/custom_scan_provider: plans table scans as a CustomScan,
+#   for specs/unread_relations.spec.
 # - test/modules/oat_observer: a second object_access_hook, loaded next to
 #   this library by t/015_oat_hook_chain.pl.
 # - test/modules/test_record: writes a record with a chosen table and
@@ -54,6 +56,7 @@ include $(PGXS)
 #   background worker, for t/009_not_preloaded.pl.
 installcheck: install-test-modules
 install-test-modules:
+	$(MAKE) -C test/modules/custom_scan_provider PG_CONFIG=$(PG_CONFIG) install
 	$(MAKE) -C test/modules/oat_observer PG_CONFIG=$(PG_CONFIG) install
 	$(MAKE) -C test/modules/test_record PG_CONFIG=$(PG_CONFIG) install
 	$(MAKE) -C test/modules/toplevel_worker PG_CONFIG=$(PG_CONFIG) install

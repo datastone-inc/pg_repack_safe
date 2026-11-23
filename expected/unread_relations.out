@@ -85,3 +85,46 @@ step p_repack_p1: REPACK (CONCURRENTLY) p1;
 step r_unpruned: EXECUTE in_p(1);
 ERROR:  cannot read table "p1" with this snapshot
 step r_rollback: ROLLBACK;
+
+starting permutation: r_custom r_begin r_join_plan r_join r_rollback
+step r_custom: SET custom_scan_provider.enabled = on;
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    2
+(1 row)
+
+step r_join_plan: EXPLAIN (COSTS OFF) SELECT count(*) FROM other o LEFT JOIN t ON o.id = t.id;
+QUERY PLAN                                         
+---------------------------------------------------
+Aggregate                                          
+  ->  Custom Scan (custom_scan_provider) on other o
+(2 rows)
+
+step r_join: SELECT count(*) FROM other o LEFT JOIN t ON o.id = t.id;
+count
+-----
+    2
+(1 row)
+
+step r_rollback: ROLLBACK;
+
+starting permutation: r_custom r_begin p_repack r_join_plan r_join r_rollback
+step r_custom: SET custom_scan_provider.enabled = on;
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    2
+(1 row)
+
+step p_repack: REPACK (CONCURRENTLY) t;
+step r_join_plan: EXPLAIN (COSTS OFF) SELECT count(*) FROM other o LEFT JOIN t ON o.id = t.id;
+QUERY PLAN                                         
+---------------------------------------------------
+Aggregate                                          
+  ->  Custom Scan (custom_scan_provider) on other o
+(2 rows)
+
+step r_join: SELECT count(*) FROM other o LEFT JOIN t ON o.id = t.id;
+ERROR:  cannot read table "t" with this snapshot
+step r_rollback: ROLLBACK;

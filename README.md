@@ -384,7 +384,7 @@ of its trigger functions:
   table and moving it to another schema, because the extension finds the
   table by its name in its own schema and would no longer protect it;
   `ALTER EXTENSION pg_repack_safe SET SCHEMA` moves both together and is
-  allowed (`t/023_record_table_rename.pl`). `UPDATE` and `DELETE`
+  allowed (`t/022_record_table_rename.pl`). `UPDATE` and `DELETE`
   of records, rewrites that do not keep every record unchanged (a rewriting
   `ALTER TABLE`, `REPACK (CONCURRENTLY)`), and changes to when its triggers
   fire are always refused. `VACUUM` of it is always allowed.

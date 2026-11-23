@@ -2178,9 +2178,9 @@ refuseUnfindableRecordTable(Oid tableOid)
  *
  * A new schema is allowed under ALTER EXTENSION pg_repack_safe SET SCHEMA
  * (inExtensionSchemaMove): that statement then moves the extension itself,
- * and protectRecordTableFromExtensionMove checks that the table is in the
- * extension's new schema. A row no SnapshotSelf scan finds leaves the new
- * name unknown and is refused.
+ * and protectRecordTableFromExtensionMove checks that no table of this name
+ * stayed in the extension's previous schema. A row no SnapshotSelf scan
+ * finds leaves the new name unknown and is refused.
  */
 static void
 protectRecordTableName(Oid relid)
@@ -2206,9 +2206,16 @@ protectRecordTableName(Oid relid)
  * out of the extension's new schema. The same event is reported for ALTER
  * EXTENSION ... ADD, DROP and UPDATE, which leave the schema as it was.
  *
- * get_extension_schema reads pg_extension with a catalog snapshot, which
- * does not see the current command's update, so it returns the schema
- * before the move.
+ * Invariant: the move is refused if a table of the record table's name is
+ * still in the extension's previous schema and holds records. A member
+ * table has moved by now and is not found there. A table of that name in
+ * the new schema does not make up for one left behind: it is another
+ * table, and the extension would read it in place of the records.
+ *
+ * get_extension_schema returns the schema before the move: the catalog
+ * cache keeps the previous pg_extension row until the command counter
+ * advances, and a reload of the entry reads with a catalog snapshot, which
+ * does not see the current command's update.
  */
 static void
 protectRecordTableFromExtensionMove(Oid extensionOid)
@@ -2223,9 +2230,6 @@ protectRecordTableFromExtensionMove(Oid extensionOid)
   oldSchema = get_extension_schema(extensionOid);
   newSchema = selfVisibleExtensionSchema(extensionOid);
   if (newSchema == oldSchema)
-    return;
-  if (OidIsValid(newSchema) &&
-      OidIsValid(selfVisibleRelationByName(RECORD_TABLE_NAME, newSchema)))
     return;
 
   leftBehind = selfVisibleRelationByName(RECORD_TABLE_NAME, oldSchema);

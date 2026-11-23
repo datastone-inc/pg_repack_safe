@@ -51,8 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CREATE EXTENSION pg_repack_safe`, whose script creates the table and its
   triggers in separate commands: without that, the install failed in a
   database with a DDL event trigger whose function runs a query.
-  `REPACK (CONCURRENTLY)` stays refused in both. `pg_upgrade` carries the records over unchanged; `pg_dump` leaves
-  them behind.
+  `REPACK (CONCURRENTLY)` stays refused in both. `pg_upgrade` carries the
+  records over unchanged; `pg_dump` leaves them behind.
 - The record table is protected. `INSERT` (by any route: `COPY ... FROM`,
   `MERGE`, logical replication), `UPDATE` and `DELETE` of records,
   `REPACK (CONCURRENTLY)` and rewriting `ALTER TABLE` of the table, and

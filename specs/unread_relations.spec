@@ -20,6 +20,12 @@
 # refused: the same join with a column of t in the select list, which keeps
 # the join; a qual that is not constant; and the same prepared statement
 # with a parameter in the repacked partition.
+#
+# With a CustomScan in the plan the reader check does not rely on what the
+# executor opened, because a custom scan provider can open a range-table
+# relation itself: the removed join is then refused. The CustomScan comes
+# from the test-only module test/modules/custom_scan_provider, which scans
+# "other" as a sequential scan would and never opens t.
 
 setup
 {
@@ -40,6 +46,7 @@ teardown
 }
 
 session reader
+setup             { LOAD 'custom_scan_provider'; }
 step r_prepare    { PREPARE in_p(int) AS SELECT count(*) FROM p WHERE id = $1; SET plan_cache_mode = force_generic_plan; }
 step r_begin      { BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other; }
 step r_join       { SELECT count(*) FROM other o LEFT JOIN t ON o.id = t.id; }
@@ -48,8 +55,10 @@ step r_false      { SELECT count(*) FROM t WHERE false; }
 step r_qual_read  { SELECT count(*) FROM t WHERE v < 0; }
 step r_pruned     { EXECUTE in_p(150); }
 step r_unpruned   { EXECUTE in_p(1); }
+step r_custom     { SET custom_scan_provider.enabled = on; }
+step r_join_plan  { EXPLAIN (COSTS OFF) SELECT count(*) FROM other o LEFT JOIN t ON o.id = t.id; }
 step r_rollback   { ROLLBACK; }
-teardown          { DEALLOCATE ALL; RESET plan_cache_mode; }
+teardown          { DEALLOCATE ALL; RESET plan_cache_mode; RESET custom_scan_provider.enabled; }
 
 session repacker
 step p_repack    { REPACK (CONCURRENTLY) t; }
@@ -67,3 +76,9 @@ permutation r_begin p_repack r_qual_read r_rollback
 permutation r_prepare r_begin p_repack_p1 r_pruned r_rollback
 # Control: p1 is not pruned.
 permutation r_prepare r_begin p_repack_p1 r_unpruned r_rollback
+# A CustomScan reads "other" and the join to t is removed, as the plan
+# shows; no table is repacked. 2 rows.
+permutation r_custom r_begin r_join_plan r_join r_rollback
+# The same plan after t is repacked: t is checked although the executor did
+# not open it.
+permutation r_custom r_begin p_repack r_join_plan r_join r_rollback

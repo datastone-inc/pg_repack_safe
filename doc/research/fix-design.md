@@ -300,7 +300,10 @@ table removed as a useless left join (`analyzejoins.c
 empty Result for constant-false quals, and a partition pruned when the
 executor starts (`execPartition.c (ExecDoInitialPruning)`).
 `specs/unread_relations.spec` has the three cases and a control for each
-that reads the table and is still refused.
+that reads the table and is still refused, and the removed join again under
+a plan with a `CustomScan` (from the test-only module
+`test/modules/custom_scan_provider`), where every range-table relation is
+checked and the query is refused.
 
 Why it is acceptable:
 

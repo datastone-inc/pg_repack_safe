@@ -7,12 +7,15 @@
 # schema (isRecordTable). If the table could be renamed or moved out of that
 # schema, DROP EXTENSION would drop it, and its records, unrecognized, with
 # no override, and an old snapshot would then read the repacked table as
-# empty. Three statements make the table unfindable, and each is refused
+# empty. These statements make the table unfindable, and each is refused
 # while the table holds records:
 # - ALTER TABLE ... RENAME TO;
 # - ALTER TABLE ... SET SCHEMA;
 # - ALTER EXTENSION ... SET SCHEMA after the table was detached from the
-#   extension with ALTER EXTENSION ... DROP TABLE.
+#   extension with ALTER EXTENSION ... DROP TABLE;
+# - the same, with a table of the record table's name, columns and triggers
+#   waiting in the new schema: the extension would take that empty table for
+#   its record table.
 # After each attempt DROP EXTENSION is still refused and the old snapshot's
 # read still gets the reader guard's error. sql/protection.sql pins the
 # messages and the superuser override.
@@ -32,6 +35,24 @@ my %attempts = (
     set_schema => 'ALTER TABLE pg_repack_safe_rewrites SET SCHEMA elsewhere',
     detach_and_move => q{
         ALTER EXTENSION pg_repack_safe DROP TABLE pg_repack_safe_rewrites;
+        ALTER EXTENSION pg_repack_safe SET SCHEMA elsewhere},
+    detach_and_move_to_lookalike => q{
+        ALTER EXTENSION pg_repack_safe DROP TABLE pg_repack_safe_rewrites;
+        CREATE TABLE elsewhere.pg_repack_safe_rewrites
+            (LIKE public.pg_repack_safe_rewrites);
+        CREATE TRIGGER pg_repack_safe_rewrites_writer_only
+            BEFORE INSERT ON elsewhere.pg_repack_safe_rewrites
+            FOR EACH ROW
+            EXECUTE FUNCTION pg_repack_safe_records_writer_only();
+        ALTER TABLE elsewhere.pg_repack_safe_rewrites
+            ENABLE ALWAYS TRIGGER pg_repack_safe_rewrites_writer_only;
+        CREATE TRIGGER pg_repack_safe_rewrites_protected
+            BEFORE UPDATE OR DELETE OR TRUNCATE
+            ON elsewhere.pg_repack_safe_rewrites
+            FOR EACH STATEMENT
+            EXECUTE FUNCTION pg_repack_safe_records_protected();
+        ALTER TABLE elsewhere.pg_repack_safe_rewrites
+            ENABLE ALWAYS TRIGGER pg_repack_safe_rewrites_protected;
         ALTER EXTENSION pg_repack_safe SET SCHEMA elsewhere});
 
 foreach my $name (sort keys %attempts)
