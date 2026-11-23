@@ -116,7 +116,7 @@ my ($ret, $stdout, $stderr) = $new->psql('postgres', 'SELECT 1');
 isnt($ret, 0, 'query refused when the record table is missing');
 like(
     $stderr,
-    qr/pg_repack_safe cannot find its record table/,
+    qr/record table "rewrites" of extension "pg_repack_safe" does not exist/,
     'refusal names the missing record table');
 
 $new->stop;
@@ -140,7 +140,7 @@ isnt($ret, 0,
     'REPACK (CONCURRENTLY) refused in binary-upgrade mode with the record table missing');
 like(
     $stderr,
-    qr/pg_repack_safe cannot find its record table/,
+    qr/record table "rewrites" of extension "pg_repack_safe" does not exist/,
     'REPACK refusal names the missing record table');
 $new->safe_psql('postgres',
     'ALTER TABLE repack_safe.renamed RENAME TO rewrites');

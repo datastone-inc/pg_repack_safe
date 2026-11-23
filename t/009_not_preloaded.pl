@@ -53,14 +53,14 @@ my ($ret, $stdout, $stderr) = $node->psql('postgres', q{
 });
 is($stdout, 'f', 'not preloaded: repack_safe.status() returns false');
 like($stderr,
-    qr/WARNING:  pg_repack_safe is not in force: the server did not load it through shared_preload_libraries/,
+    qr/WARNING:  pg_repack_safe is not in force: the server did not load it through "shared_preload_libraries"/,
     'not preloaded: the warning says what is wrong');
 ($ret, $stdout, $stderr) = $node->psql('postgres', q{
     SELECT repack_safe.status();
     REPACK (CONCURRENTLY) t;
 });
 like($stderr,
-    qr/REPACK \(CONCURRENTLY\) requires pg_repack_safe in shared_preload_libraries/,
+    qr/pg_repack_safe must be loaded via "shared_preload_libraries" to run REPACK \(CONCURRENTLY\)/,
     'not preloaded: after the status call, REPACK (CONCURRENTLY) is refused');
 
 # A call that loads the library warns once, not once for the load and once
@@ -79,10 +79,10 @@ is(scalar(@warnings), 1,
 });
 is($ret, 0, 'library loaded with LOAD: the load succeeds');
 like($stderr,
-    qr/WARNING:  pg_repack_safe is not in force: the server did not load it through shared_preload_libraries/,
+    qr/WARNING:  pg_repack_safe is not in force: the server did not load it through "shared_preload_libraries"/,
     'library loaded with LOAD: the load warns');
 like($stderr,
-    qr/HINT:  Add pg_repack_safe to shared_preload_libraries and restart the server\./,
+    qr/HINT:  Add "pg_repack_safe" to "shared_preload_libraries" and restart the server\./,
     'library loaded with LOAD: the hint names shared_preload_libraries');
 unlike($stderr, qr/session_preload_libraries/,
     'library loaded with LOAD: the warning does not blame session_preload_libraries');
@@ -93,7 +93,7 @@ unlike($stderr, qr/session_preload_libraries/,
 });
 isnt($ret, 0, 'library loaded with LOAD: REPACK (CONCURRENTLY) refused');
 like($stderr,
-    qr/REPACK \(CONCURRENTLY\) requires pg_repack_safe in shared_preload_libraries/,
+    qr/pg_repack_safe must be loaded via "shared_preload_libraries" to run REPACK \(CONCURRENTLY\)/,
     'library loaded with LOAD: the error names the setting');
 
 # Firing a trigger of the record table loads the library for its C function.
@@ -108,7 +108,7 @@ like($stderr,
 isnt($ret, 0,
     'library loaded by a trigger function: REPACK (CONCURRENTLY) refused');
 like($stderr,
-    qr/REPACK \(CONCURRENTLY\) requires pg_repack_safe in shared_preload_libraries/,
+    qr/pg_repack_safe must be loaded via "shared_preload_libraries" to run REPACK \(CONCURRENTLY\)/,
     'library loaded by a trigger function: the error names the setting');
 
 $node->append_conf('postgresql.conf',
@@ -119,19 +119,19 @@ $node->reload;
 isnt($ret, 0,
     'library in session_preload_libraries: REPACK (CONCURRENTLY) refused');
 like($stderr,
-    qr/REPACK \(CONCURRENTLY\) requires pg_repack_safe in shared_preload_libraries/,
+    qr/pg_repack_safe must be loaded via "shared_preload_libraries" to run REPACK \(CONCURRENTLY\)/,
     'library in session_preload_libraries: the error names the setting');
 
 # Each connection loads the library at start, and the load warns. The
 # detail names the setting the administrator used and says what it misses.
 like($stderr,
-    qr/WARNING:  pg_repack_safe is not in force: the server did not load it through shared_preload_libraries/,
+    qr/WARNING:  pg_repack_safe is not in force: the server did not load it through "shared_preload_libraries"/,
     'library in session_preload_libraries: the connection warns');
 like($stderr,
-    qr/DETAIL:  pg_repack_safe is listed in session_preload_libraries, which background workers do not load/,
+    qr/DETAIL:  pg_repack_safe is listed in "session_preload_libraries", which background workers do not load/,
     'library in session_preload_libraries: the detail names the setting');
 like($stderr,
-    qr/HINT:  Move pg_repack_safe from session_preload_libraries to shared_preload_libraries and restart the server\./,
+    qr/HINT:  Move "pg_repack_safe" from "session_preload_libraries" to "shared_preload_libraries" and restart the server\./,
     'library in session_preload_libraries: the hint says what to change');
 
 # Not tested: the same for local_preload_libraries (see the header).
@@ -142,7 +142,7 @@ like($stderr,
 });
 is($stdout, 'f',
     'library in session_preload_libraries: repack_safe.status() returns false');
-@warnings = ($stderr =~ /DETAIL:  pg_repack_safe is listed in session_preload_libraries/g);
+@warnings = ($stderr =~ /DETAIL:  pg_repack_safe is listed in "session_preload_libraries"/g);
 is(scalar(@warnings), 2,
     'library in session_preload_libraries: the connection and the status call both name the setting');
 

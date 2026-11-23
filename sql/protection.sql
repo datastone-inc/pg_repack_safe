@@ -250,6 +250,21 @@ SELECT count(*) AS records FROM repack_safe.rewrites;
 DROP EXTENSION pg_repack_safe;
 SELECT count(*) AS passes FROM pr_t;
 
+-- A refusal that no setting lifts is "feature not supported" (0A000); one
+-- that holds only while the table has records is "object not in
+-- prerequisite state" (55000).
+\set VERBOSITY sqlstate
+INSERT INTO repack_safe.rewrites VALUES (0, '1');
+DELETE FROM repack_safe.rewrites;
+CREATE INDEX pr_idx ON repack_safe.rewrites (relid);
+ALTER TABLE repack_safe.rewrites ADD COLUMN x text;
+ALTER TABLE repack_safe.rewrites SET UNLOGGED;
+ALTER TABLE repack_safe.rewrites DISABLE TRIGGER ALL;
+TRUNCATE repack_safe.rewrites;
+DROP EXTENSION pg_repack_safe;
+ALTER TABLE repack_safe.rewrites RENAME TO pr_renamed;
+\set VERBOSITY default
+
 -- The override is for superusers only.
 CREATE ROLE pr_user;
 SET ROLE pr_user;

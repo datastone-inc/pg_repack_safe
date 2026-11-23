@@ -8,7 +8,7 @@ count
 (1 row)
 
 step p_repack: REPACK (CONCURRENTLY) t;
-ERROR:  REPACK (CONCURRENTLY) refused: another session holds a snapshot that has not read table "t"
+ERROR:  cannot execute REPACK (CONCURRENTLY) on table "t" while another session holds an older snapshot
 step r_commit: COMMIT;
 
 starting permutation: r_begin r_touch p_repack r_commit
@@ -44,7 +44,7 @@ count
 
 step b_commit: COMMIT;
 step p_repack: <... completed>
-ERROR:  REPACK (CONCURRENTLY) refused: another session holds a snapshot that has not read table "t"
+ERROR:  cannot execute REPACK (CONCURRENTLY) on table "t" while another session holds an older snapshot
 step r_commit: COMMIT;
 
 starting permutation: p_hour r_begin p_repack r_t r_commit

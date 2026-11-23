@@ -75,6 +75,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after the extension because PostgreSQL reserves the `pg_` prefix. The
   install script runs with that schema as its `search_path`, so a DDL event
   trigger function must name its tables with their schema.
+- Error messages follow PostgreSQL's message style: setting names are
+  quoted, no hint refers to a file of this repository, and a refusal that
+  no setting lifts (an insert, update or delete of records, an index, a
+  column change or an unsafe rewrite of the record table, a change to when
+  its triggers fire) has SQLSTATE 0A000, while one that holds only while
+  the record table has records keeps 55000.
 - The library has a version of its own (`1.0.0`), which
   `pg_get_loaded_modules()` shows on every server and the postmaster logs at
   start (`pg_repack_safe 1.0.0 loaded`). The extension's version (`1.0`)

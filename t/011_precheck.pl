@@ -61,7 +61,7 @@ sub repack
           . 'REPACK (CONCURRENTLY) t;');
 }
 
-my $refusal = qr/REPACK \(CONCURRENTLY\) refused: another session holds a snapshot that has not read table "t"/;
+my $refusal = qr/cannot execute REPACK \(CONCURRENTLY\) on table "t" while another session holds an older snapshot/;
 
 # A single statement in its own transaction.
 my $h = sleeper('SELECT count(*) FROM other, pg_sleep(30)');
@@ -75,7 +75,7 @@ $h = sleeper('BEGIN', 'SELECT 1', 'SELECT count(*) FROM other, pg_sleep(30)',
 ($ret, $stdout, $stderr) = repack(0);
 isnt($ret, 0, 'later statement of a transaction: counted, REPACK refused');
 like($stderr, $refusal, 'later statement of a transaction: the refusal');
-like($stderr, qr/DETAIL:  A session in this database would get a serialization failure/,
+like($stderr, qr/DETAIL:  A session in this database holds a snapshot and no lock on the table, and would get a serialization failure/,
     'the refusal says why');
 unlike($stderr, qr/Process \d+|started at/,
     'the refusal does not identify the session, which pg_stat_activity may hide from this user');

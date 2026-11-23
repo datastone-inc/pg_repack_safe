@@ -138,16 +138,16 @@ REPACK (CONCURRENTLY) rc_t;
 -- The MVCC-safe REPACK is a utility statement and still runs.
 ALTER TABLE repack_safe.rewrites RENAME TO rc_renamed;
 SELECT 1 AS refused;
-ERROR:  pg_repack_safe cannot find its record table
-DETAIL:  The extension "pg_repack_safe" exists in this database, but the table "rewrites" is not in its schema.
+ERROR:  record table "rewrites" of extension "pg_repack_safe" does not exist
+DETAIL:  The extension exists in this database, but no table of that name is in its schema.
 HINT:  Restore the table's name and schema, or drop and re-create the extension, which discards its records.
 REPACK (CONCURRENTLY) rc_t;
-ERROR:  pg_repack_safe cannot find its record table
-DETAIL:  The extension "pg_repack_safe" exists in this database, but the table "rewrites" is not in its schema.
+ERROR:  record table "rewrites" of extension "pg_repack_safe" does not exist
+DETAIL:  The extension exists in this database, but no table of that name is in its schema.
 HINT:  Restore the table's name and schema, or drop and re-create the extension, which discards its records.
 REPACK (CONCURRENTLY true, VERBOSE false) rc_t;
-ERROR:  pg_repack_safe cannot find its record table
-DETAIL:  The extension "pg_repack_safe" exists in this database, but the table "rewrites" is not in its schema.
+ERROR:  record table "rewrites" of extension "pg_repack_safe" does not exist
+DETAIL:  The extension exists in this database, but no table of that name is in its schema.
 HINT:  Restore the table's name and schema, or drop and re-create the extension, which discards its records.
 REPACK rc_t;
 ALTER TABLE repack_safe.rc_renamed RENAME TO rewrites;
@@ -161,8 +161,8 @@ SELECT 1 AS passes;
 CREATE SCHEMA rc_other;
 ALTER TABLE repack_safe.rewrites SET SCHEMA rc_other;
 SELECT 1 AS refused;
-ERROR:  pg_repack_safe cannot find its record table
-DETAIL:  The extension "pg_repack_safe" exists in this database, but the table "rewrites" is not in its schema.
+ERROR:  record table "rewrites" of extension "pg_repack_safe" does not exist
+DETAIL:  The extension exists in this database, but no table of that name is in its schema.
 HINT:  Restore the table's name and schema, or drop and re-create the extension, which discards its records.
 ALTER TABLE rc_other.rewrites SET SCHEMA repack_safe;
 SELECT 1 AS passes;
@@ -175,8 +175,8 @@ SELECT 1 AS passes;
 ALTER EXTENSION pg_repack_safe DROP TABLE repack_safe.rewrites;
 DROP TABLE repack_safe.rewrites;
 SELECT 1 AS refused;
-ERROR:  pg_repack_safe cannot find its record table
-DETAIL:  The extension "pg_repack_safe" exists in this database, but the table "rewrites" is not in its schema.
+ERROR:  record table "rewrites" of extension "pg_repack_safe" does not exist
+DETAIL:  The extension exists in this database, but no table of that name is in its schema.
 HINT:  Restore the table's name and schema, or drop and re-create the extension, which discards its records.
 -- Dropping the extension is a utility statement and ends the refusal.
 DROP EXTENSION pg_repack_safe;
