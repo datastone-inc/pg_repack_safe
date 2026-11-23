@@ -297,9 +297,9 @@ tables unacceptable (2026-11-15). Remaining fail-open cases:
   unrecorded, and an unloaded library cannot check for itself (a backend
   that loaded it other than through `shared_preload_libraries` refuses,
   step 9; `t/009_not_preloaded.pl` pins the rest);
-- library not loaded on a standby: a misconfiguration, which can give wrong
-  results; the WAL record (step 10) stops its replay as a best-effort
-  safeguard, missing the case of research question 17;
+- library not loaded on a standby: user error, which can give wrong
+  results; the WAL record (step 10) stops such a standby's replay, except in
+  the case of research question 17;
 - readers that bypass the executor and COPY;
 - binary-upgrade mode (below).
 
@@ -1084,14 +1084,16 @@ question N".
     live: refused (step 9; DROP and TRUNCATE unless
     `pg_repack_safe.allow_unprotected_drop` is set by a superuser).
 16. REFRESH MATERIALIZED VIEW as a fourth wrong-results path: see 4.
-17. A standby without the library whose replay starts at a checkpoint
-    between the WAL record (I) and the REPACK commit never sees the record
-    and does not stop. **Not a gap in the guarantee: wrong results under
-    misconfiguration** (developer decision, 2026-11-23; recorded as a known
-    gap on 2026-11-16). The guarantee requires the library on every server
-    that replays the WAL; a standby with it checks reads against the
-    records, which reach it as table data wherever its replay starts. The
-    record only makes a misconfigured standby stop, best effort.
+17. A misconfigured standby, one without the library, whose replay starts
+    at a checkpoint between the WAL record (I) and the REPACK commit never
+    sees the record and does not stop. **User error, not a gap in the
+    guarantee** (developer decision, 2026-11-23; recorded as a known gap on
+    2026-11-16). The guarantee requires the library on every server that
+    replays the WAL; a standby with it checks reads against the records,
+    which reach it as table data wherever its replay starts. The record is
+    a check for the misconfiguration: it stops a standby without the
+    library at the first REPACK (CONCURRENTLY) it replays, except in the
+    window this question describes.
     Conditions for a wrong result: a standby without the library, whose
     replay starts at a checkpoint whose redo point lies between a REPACK
     (CONCURRENTLY)'s swap and its commit, reaching consistency before the
@@ -1103,7 +1105,8 @@ question N".
     standby from it without the library, open a REPEATABLE READ snapshot
     there before resuming; resume the REPACK; read the table on that
     standby: 0 rows.
-    Ways to make the safeguard complete, weighed and not built:
+    Ways to make the check catch every misconfigured standby, weighed and
+    not built:
     - `DELAY_CHKPT_START` from the record to the commit: not possible, the
       commit path asserts the flag is clear and clears it
       (`xact.c (RecordTransactionCommit)`; `DELAY_CHKPT_IN_COMMIT` includes

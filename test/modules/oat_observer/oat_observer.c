@@ -21,7 +21,7 @@
 
 PG_MODULE_MAGIC;
 
-void        _PG_init(void);
+void _PG_init(void);
 
 static object_access_hook_type prevObjectAccessHook = NULL;
 
@@ -37,18 +37,17 @@ static void
 observerObjectAccess(ObjectAccessType access, Oid classId, Oid objectId,
                      int subId, void *arg)
 {
-    if (access == OAT_DROP)
-    {
-        ObjectAddress address;
+  if (access == OAT_DROP)
+  {
+    ObjectAddress address;
 
-        ObjectAddressSubSet(address, classId, objectId, subId);
-        ereport(NOTICE,
-                (errmsg("oat_observer: drop of %s",
-                        getObjectDescription(&address, true))));
-    }
+    ObjectAddressSubSet(address, classId, objectId, subId);
+    ereport(NOTICE, (errmsg("oat_observer: drop of %s",
+                            getObjectDescription(&address, true))));
+  }
 
-    if (prevObjectAccessHook != NULL)
-        prevObjectAccessHook(access, classId, objectId, subId, arg);
+  if (prevObjectAccessHook != NULL)
+    prevObjectAccessHook(access, classId, objectId, subId, arg);
 }
 
 /**
@@ -57,6 +56,6 @@ observerObjectAccess(ObjectAccessType access, Oid classId, Oid objectId,
 void
 _PG_init(void)
 {
-    prevObjectAccessHook = object_access_hook;
-    object_access_hook = observerObjectAccess;
+  prevObjectAccessHook = object_access_hook;
+  object_access_hook = observerObjectAccess;
 }

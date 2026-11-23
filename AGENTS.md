@@ -97,18 +97,34 @@ or a PG source citation settles it.
 
 7. **Style.**
 
-   Allman braces, 4-space indent, no tabs. Internal C symbols are camelCase and
-   SQL-callable C functions are snake_case. SQL keywords are UPPERCASE. Every
-   C and SQL file carries the header `Copyright (c) 2026 dataStone Inc.` +
-   `SPDX-License-Identifier: MIT` + a doxygen `@file`/`@brief` block. Function
-   headers use `@brief`/`@param`/`@return`.
+   Allman braces, 2-space indent, no tabs. Declarations and struct members
+   are not column-aligned; a cast has no space after it (`(void)arg`). Lines
+   stay within 79 columns, except user-visible message strings (errmsg,
+   errdetail, errhint), which are never split so they can be found with
+   grep. `.clang-format` encodes these rules: run `make format` after
+   editing C, and `make check-format` (which CI runs) must pass. clang-format
+   leaves comments as written, so keep them within 79 columns by hand.
+   Internal C symbols are camelCase, and C functions that SQL declares
+   (trigger and SQL functions) are snake_case. SQL keywords are UPPERCASE.
+   Every C and SQL file carries the header `Copyright (c) 2026 dataStone
+   Inc.` + `SPDX-License-Identifier: MIT` + a doxygen `@file`/`@brief`
+   block. Function headers use `@brief`/`@param`/`@return`. A C file split
+   into `/* ---- */` sections lists them in its `@file` block, in order, one
+   line each, and that list changes when a section does.
 
    Comments describe the code as it is now, not the change that produced it
-   (no "added for...", "was previously..."). They state the invariant and
-   why. The history of a change goes in the commit message. Deferred work is
-   marked `TODO(owner YYYY-MM-DD): ...`. A reference to PostgreSQL's source
-   names the file and the function, never a line number: line numbers go
-   stale with every release.
+   (no "added for...", "was previously..."). The history of a change goes in
+   the commit message. Comments state the invariant and why, once, next to
+   the code that relies on it; a function header says what the function
+   guarantees, and the reasoning for one branch goes in that branch. Say the
+   fact itself, not a phrase that stands for it. The principles above are
+   rules for the design, not wording for comments: instead of "caught by
+   meaning" or "whatever statement does it", list the statements that reach
+   the check. Leave out hedges ("errs towards", "rather than assumed", "not
+   part of the guarantee") and sentences that repeat the code or the
+   previous sentence. Deferred work is marked `TODO(owner YYYY-MM-DD): ...`.
+   A reference to PostgreSQL's source names the file and the function, never
+   a line number: line numbers go stale with every release.
 
 ## Documentation maintenance
 

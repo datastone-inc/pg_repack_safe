@@ -43,7 +43,13 @@ replays this primary's WAL), in `postgresql.conf`:
 shared_preload_libraries = 'pg_repack_safe'   # add to any existing list
 ```
 
-and restart. Standbys first: once `REPACK (CONCURRENTLY)` runs on the
+and restart. `session_preload_libraries` or `local_preload_libraries`
+will not do: background workers never load them, so a
+`REPACK (CONCURRENTLY)` run from one (a scheduled job, for instance) is
+neither refused nor recorded. Each session that loads the library through
+them gets a `WARNING` that names the setting.
+
+Restart the standbys first: once `REPACK (CONCURRENTLY)` runs on the
 primary, it writes a WAL record of the extension's own, and a standby
 without the library fails on it and shuts down ("resource manager with
 ID 149 not registered"). That is deliberate: such a standby could not check
@@ -72,7 +78,7 @@ It needs a superuser to create. Its settings:
 
 | Setting | Default | Who | Meaning |
 | --- | --- | --- | --- |
-| `pg_repack_safe.precheck_snapshot_age` | `-1` (off) | any user | refuse `REPACK (CONCURRENTLY)` while a session could later read the table with an older snapshot (README, "Optional pre-check") |
+| `pg_repack_safe.precheck_snapshot_age` | `-1` (off) | any user | refuse `REPACK (CONCURRENTLY)` while a session could later read the table with an older snapshot; a time (milliseconds without a unit, or e.g. `'10min'`), `0` for any age (README, "Optional pre-check") |
 | `pg_repack_safe.allow_unprotected_drop` | `off` | superuser | let `DROP` and `TRUNCATE` remove the record table, its triggers or the extension while the record table holds records; old snapshots then read repacked tables as empty (README, "Removing the extension") |
 | `pg_repack_safe.trace_storage_changes` | `off` | superuser | report each detected replacement of a table's storage as a NOTICE (diagnostics) |
 
@@ -207,7 +213,8 @@ SELECT pg_repack_safe_status();
 
 It must return `t`. With `f`, and a `WARNING` that says why, the server did
 not load the library through `shared_preload_libraries`, and the extension
-guards nothing there.
+guards nothing there. If the library is in `session_preload_libraries` or
+`local_preload_libraries`, the `WARNING` names that setting.
 Nothing else reports this state: the extension is still listed by `\dx`,
 and `REPACK (CONCURRENTLY)` runs without an error.
 
@@ -219,8 +226,8 @@ make installcheck
 
 This does not use the server that `PGHOST`/`PGPORT` point at: the test
 suites start their own temporary servers from the installed binaries (see
-[development.md](development.md)). It also installs two test-only modules,
-`oat_observer` and `test_record`, into the PostgreSQL library directory;
+[development.md](development.md)). It also installs three test-only modules,
+`oat_observer`, `test_record` and `toplevel_worker`, into the PostgreSQL library directory;
 `make install` does not. `test_record` can write arbitrary rows into a
 record table, which the extension otherwise refuses, so do not run
 `make installcheck` against the installation of a production server.

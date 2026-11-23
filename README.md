@@ -253,8 +253,12 @@ setting and no database, so each item below is done by hand.
   restart. Add it to any libraries already listed there, such as
   `'pg_stat_statements, pg_repack_safe'`; replacing the list unloads them.
   `REPACK (CONCURRENTLY)` is refused in a session that loaded the library
-  any other way. A standby without it fails on the extension's WAL record
-  and shuts down ("resource manager with ID 149 not registered").
+  any other way. `session_preload_libraries` and `local_preload_libraries`
+  do not count: background workers, which schedulers such as pg_cron can
+  run SQL in, never load them. A standby without it fails on the
+  extension's WAL record and shuts down ("resource manager with ID 149 not
+  registered"), except one whose replay starts between a swap and its
+  commit (see [If the requirements are not met](#if-the-requirements-are-not-met)).
 - `CREATE EXTENSION pg_repack_safe` in every database where
   `REPACK (CONCURRENTLY)` runs; it is refused elsewhere.
 - Recommended: `hot_standby_feedback = on`, ideally with a physical
@@ -617,10 +621,10 @@ standby ([Requirements](#requirements)). Without it:
 
 - **A standby without the library** is misconfigured and can return wrong
   results: it does not check reads, so an old snapshot there reads a
-  repacked table as empty. As a best-effort safeguard, not part of the
-  guarantee, each `REPACK (CONCURRENTLY)` writes a WAL record that such a
-  standby cannot replay, so it usually stops replaying at the first one
-  (`t/010_standby_wal_record.pl`). It misses a standby whose replay starts
+  repacked table as empty. To stop such a standby, each
+  `REPACK (CONCURRENTLY)` writes a WAL record that it cannot replay, so it
+  stops replaying at the first one (`t/010_standby_wal_record.pl`). This
+  check for the misconfiguration misses a standby whose replay starts
   from a checkpoint whose redo point lies between a
   `REPACK (CONCURRENTLY)`'s swap and its commit: that standby never sees the
   record (research question 17 in
@@ -629,9 +633,20 @@ standby ([Requirements](#requirements)). Without it:
   `REPACK (CONCURRENTLY)` runs unrecorded and its reads are not checked.
   Setting `shared_preload_libraries` leaves no such session. Nothing raises
   an error when it is missing, but `SELECT pg_repack_safe_status()` returns
-  `f`, with a `WARNING`. Such a session can also drop the extension while
-  its record table holds records, since the refusal is in the library
-  (`t/009_not_preloaded.pl`).
+  `f`, with a `WARNING`, and each session that loads the library later
+  gets the same `WARNING` when it does. Such a session can also drop the
+  extension while its record table holds records, since the refusal is in
+  the library (`t/009_not_preloaded.pl`).
+- **The library in `session_preload_libraries` instead** looks like a
+  working setup and is not. Every client session loads the library, warns
+  at connection, and refuses `REPACK (CONCURRENTLY)`. A background worker,
+  such as a scheduled job, never loads it, so its `REPACK (CONCURRENTLY)`
+  runs with no check and no record while interactive sessions refuse the
+  same command. The `WARNING` names the setting and says to move the
+  library to `shared_preload_libraries` (`t/009_not_preloaded.pl`).
+  `local_preload_libraries` is loaded under the same condition
+  (`postinit.c`, `InitPostgres`, `INIT_PG_LOAD_SESSION_LIBS`), so it misses
+  background workers the same way.
 
 Covered, for the record: `pg_dump`, `COPY ... TO`, logical replication's
 initial table copy (refused, and the sync worker retries;

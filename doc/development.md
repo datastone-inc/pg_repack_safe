@@ -6,6 +6,7 @@
 - GCC or Clang with C99 support
 - Git
 - Make
+- clang-format 22, for `make check-format` and `make format`
 
 `make installcheck` also needs:
 
@@ -27,6 +28,19 @@ make
 The build enables `-Wall -Wextra`. `make WERROR=1` also turns warnings into
 errors, in the library and in the test modules; use it before sending a
 change.
+
+## Formatting
+
+The C files follow `.clang-format`. `make check-format` changes nothing and
+fails if a file is not formatted; `make format` rewrites the files in
+place. Output differs between clang-format majors, so name the binary if
+the default `clang-format` is another major:
+
+```bash
+make check-format CLANG_FORMAT=clang-format-22
+```
+
+`pipx install clang-format==22.1.8` installs the version the CI uses.
 
 ## Testing
 
@@ -53,6 +67,7 @@ also makes it the one test of what stock PostgreSQL 19 does in these cases.
 
 `.github/workflows/ci.yml` runs on every push and pull request:
 
+- `make check-format`, with clang-format 22.1.8.
 - PostgreSQL 19 from the apt.postgresql.org packages, built with gcc on
   x86_64 and arm64, with `make WERROR=1`, then `make installcheck`.
 
@@ -76,7 +91,7 @@ binaries.
   an old snapshot, running a statement and collecting its errors, waiting
   for a queued lock request) are in `t/RepackSafeTest.pm`.
 
-`make installcheck` first installs two test-only modules from
+`make installcheck` first installs three test-only modules from
 `test/modules/` into the PostgreSQL library directory; `make install` does
 not install them.
 
@@ -95,6 +110,12 @@ not install them.
   to send a record to a subscriber. Also used by `sql/reader_check.sql`,
   `sql/records_prune.sql`, `specs/reader_cache.spec` and
   `t/006_record_xid8.pl`.
+- `toplevel_worker`: the C function `test_run_in_worker(sql text)`, created
+  the same way, which runs a statement at top level in a dynamic background
+  worker and returns NULL, or the error message. `REPACK (CONCURRENTLY)`
+  cannot run through SPI, so the worker runs it as `exec_simple_query`
+  does. A background worker never loads `session_preload_libraries`;
+  `t/009_not_preloaded.pl` uses this to pin that gap.
 
 The `REGRESS` and `ISOLATION` instances get the settings in
 `test/temp_instance.conf`: the library in `shared_preload_libraries`, which

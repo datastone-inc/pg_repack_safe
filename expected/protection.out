@@ -43,7 +43,7 @@ ERROR:  extension "pg_repack_safe" already exists
 -- No record yet: dropping the extension is allowed.
 DROP EXTENSION pg_repack_safe;
 ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
-DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
 HINT:  Delete the records with pg_repack_safe_prune_records() and run VACUUM on the record table until it is empty (see the README, "Removing the extension"). A superuser can set pg_repack_safe.allow_unprotected_drop instead.
 CREATE EXTENSION pg_repack_safe;
 ERROR:  extension "pg_repack_safe" already exists
@@ -121,25 +121,25 @@ SELECT count(*) AS records FROM pg_repack_safe_rewrites;
 
 DROP EXTENSION pg_repack_safe;
 ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
-DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
 HINT:  Delete the records with pg_repack_safe_prune_records() and run VACUUM on the record table until it is empty (see the README, "Removing the extension"). A superuser can set pg_repack_safe.allow_unprotected_drop instead.
 DROP EXTENSION pg_repack_safe CASCADE;
 ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
-DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
 HINT:  Delete the records with pg_repack_safe_prune_records() and run VACUUM on the record table until it is empty (see the README, "Removing the extension"). A superuser can set pg_repack_safe.allow_unprotected_drop instead.
 -- Detached from the extension, then dropped, or the extension dropped:
 -- refused.
 ALTER EXTENSION pg_repack_safe DROP TABLE pg_repack_safe_rewrites;
 DROP TABLE pg_repack_safe_rewrites;
 ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
-DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
 HINT:  Delete the records with pg_repack_safe_prune_records() and run VACUUM on the record table until it is empty (see the README, "Removing the extension"). A superuser can set pg_repack_safe.allow_unprotected_drop instead.
 DROP EXTENSION pg_repack_safe CASCADE;
 NOTICE:  drop cascades to 2 other objects
-DETAIL:  drop cascades to trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites
-drop cascades to trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites
+DETAIL:  drop cascades to trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites
+drop cascades to trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites
 ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
-DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
 HINT:  Delete the records with pg_repack_safe_prune_records() and run VACUUM on the record table until it is empty (see the README, "Removing the extension"). A superuser can set pg_repack_safe.allow_unprotected_drop instead.
 ALTER EXTENSION pg_repack_safe ADD TABLE pg_repack_safe_rewrites;
 -- MVCC-safe rewrites, also database-wide, are allowed and keep every
@@ -332,7 +332,7 @@ NOTICE:  drop cascades to 2 other objects
 DETAIL:  drop cascades to extension pg_repack_safe
 drop cascades to table pr_t
 ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
-DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_writer_only on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_protected on table pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
 HINT:  Delete the records with pg_repack_safe_prune_records() and run VACUUM on the record table until it is empty (see the README, "Removing the extension"). A superuser can set pg_repack_safe.allow_unprotected_drop instead.
 SELECT count(*) AS triggers FROM pg_trigger
 WHERE tgrelid = 'pg_repack_safe_rewrites'::regclass;
@@ -457,7 +457,7 @@ DETAIL:  A snapshot taken before a recorded REPACK (CONCURRENTLY), on this serve
 DROP SCHEMA pr_s CASCADE;
 NOTICE:  drop cascades to extension pg_repack_safe
 ERROR:  cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records
-DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_writer_only on table pr_s.pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
+DETAIL:  The statement would drop trigger pg_repack_safe_rewrites_protected on table pr_s.pg_repack_safe_rewrites. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.
 HINT:  Delete the records with pg_repack_safe_prune_records() and run VACUUM on the record table until it is empty (see the README, "Removing the extension"). A superuser can set pg_repack_safe.allow_unprotected_drop instead.
 SELECT count(*) AS passes FROM pr_t;
  passes 

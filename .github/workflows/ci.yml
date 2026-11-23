@@ -1,9 +1,10 @@
 # Copyright (c) 2026 dataStone Inc.
 # SPDX-License-Identifier: MIT
 #
-# Build the extension and run its three test suites (pg_regress, isolation,
-# TAP) against PostgreSQL 19.
+# Check the C formatting, build the extension and run its three test suites
+# (pg_regress, isolation, TAP) against PostgreSQL 19.
 #
+# - format: make check-format, with a pinned clang-format.
 # - packages: PostgreSQL 19 from apt.postgresql.org, built with gcc, on
 #   x86_64 and arm64, with warnings as errors (make WERROR=1).
 # - upstream: the tip of REL_19_STABLE built from source with clang,
@@ -29,6 +30,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  format:
+    if: github.event_name != 'schedule'
+    name: C formatting
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      # Output differs between clang-format majors, so the version is
+      # pinned; the PyPI build is the same program as the LLVM one. The
+      # format targets need no PostgreSQL.
+      - name: Install clang-format
+        run: pipx install clang-format==22.1.8
+
+      - name: Check
+        run: make check-format
+
   packages:
     if: github.event_name != 'schedule'
     name: PG 19 packages, ${{ matrix.runner }}
@@ -49,7 +66,7 @@ jobs:
               libipc-run-perl
           echo /usr/lib/postgresql/19/bin >> "$GITHUB_PATH"
 
-      # make install and make installcheck (which installs two test-only
+      # make install and make installcheck (which installs three test-only
       # modules) write into the server's directories.
       - name: Let the runner install into the PostgreSQL directories
         run: |

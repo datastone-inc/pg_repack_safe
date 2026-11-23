@@ -59,37 +59,36 @@ PG_FUNCTION_INFO_V1(test_insert_record);
 Datum
 test_insert_record(PG_FUNCTION_ARGS)
 {
-    Oid         recordTable = PG_GETARG_OID(0);
-    Oid         relid = PG_GETARG_OID(1);
-    FullTransactionId rewriteXid = PG_GETARG_FULLTRANSACTIONID(2);
-    Relation    rel;
-    TupleDesc   desc;
-    Datum       values[2];
-    bool        nulls[2] = {false, false};
-    HeapTuple   tuple;
+  Oid recordTable = PG_GETARG_OID(0);
+  Oid relid = PG_GETARG_OID(1);
+  FullTransactionId rewriteXid = PG_GETARG_FULLTRANSACTIONID(2);
+  Relation rel;
+  TupleDesc desc;
+  Datum values[2];
+  bool nulls[2] = {false, false};
+  HeapTuple tuple;
 
-    rel = table_open(recordTable, RowExclusiveLock);
-    desc = RelationGetDescr(rel);
-    if (rel->rd_rel->relkind != RELKIND_RELATION ||
-        rel->rd_tableam != GetHeapamTableAmRoutine() ||
-        desc->natts != 2 ||
-        TupleDescAttr(desc, 0)->attisdropped ||
-        TupleDescAttr(desc, 0)->atttypid != OIDOID ||
-        TupleDescAttr(desc, 1)->attisdropped ||
-        TupleDescAttr(desc, 1)->atttypid != XID8OID)
-        ereport(ERROR,
-                (errcode(ERRCODE_WRONG_OBJECT_TYPE),
-                 errmsg("test_insert_record: \"%s\" is not a heap table with the columns (oid, xid8)",
-                        RelationGetRelationName(rel))));
+  rel = table_open(recordTable, RowExclusiveLock);
+  desc = RelationGetDescr(rel);
+  if (rel->rd_rel->relkind != RELKIND_RELATION ||
+      rel->rd_tableam != GetHeapamTableAmRoutine() || desc->natts != 2 ||
+      TupleDescAttr(desc, 0)->attisdropped ||
+      TupleDescAttr(desc, 0)->atttypid != OIDOID ||
+      TupleDescAttr(desc, 1)->attisdropped ||
+      TupleDescAttr(desc, 1)->atttypid != XID8OID)
+    ereport(ERROR,
+            (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+             errmsg("test_insert_record: \"%s\" is not a heap table with the columns (oid, xid8)",
+                    RelationGetRelationName(rel))));
 
-    values[0] = ObjectIdGetDatum(relid);
-    values[1] = FullTransactionIdGetDatum(rewriteXid);
-    tuple = heap_form_tuple(desc, values, nulls);
-    simple_heap_insert(rel, tuple);
-    heap_freetuple(tuple);
+  values[0] = ObjectIdGetDatum(relid);
+  values[1] = FullTransactionIdGetDatum(rewriteXid);
+  tuple = heap_form_tuple(desc, values, nulls);
+  simple_heap_insert(rel, tuple);
+  heap_freetuple(tuple);
 
-    CacheInvalidateRelcache(rel);
-    table_close(rel, RowExclusiveLock);
+  CacheInvalidateRelcache(rel);
+  table_close(rel, RowExclusiveLock);
 
-    PG_RETURN_VOID();
+  PG_RETURN_VOID();
 }

@@ -85,6 +85,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Without that, the extension is installed but guards nothing, and no error
   says so; the function returns false with a `WARNING`. The extension's
   comment, shown by `\dx`, names the check.
+- On a server that does not preload the library, each session that loads
+  it (through `session_preload_libraries`, `LOAD`, or a call to one of the
+  extension's functions) gets the same `WARNING`. When the library is
+  listed in `session_preload_libraries` or `local_preload_libraries`, the
+  warning names the setting: client sessions then refuse
+  `REPACK (CONCURRENTLY)`, but background workers never load the library,
+  so a `REPACK (CONCURRENTLY)` run from one is neither refused nor recorded.
 - `VACUUM FULL`, `CLUSTER` and `REPACK` of the record table, and the
   database-wide forms when they reach it, are refused while it holds a
   deleted record, with a hint to run `VACUUM` on it first: they would drop
@@ -109,10 +116,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table without an error.
 - Custom WAL resource manager (ID 149, reserved on the PostgreSQL wiki): each
   `REPACK (CONCURRENTLY)` logs a record before its commit, so a standby
-  without the library, which is misconfigured, usually stops replay instead
-  of serving the repacked table to old snapshots. Best effort: a standby
-  whose replay starts from a checkpoint between the swap and the commit
-  never sees the record.
+  without the library, which is misconfigured, stops replay instead of
+  serving the repacked table to old snapshots. A misconfigured standby whose
+  replay starts from a checkpoint between the swap and the commit never sees
+  the record and is not stopped.
 - Optional pre-check, `pg_repack_safe.precheck_snapshot_age` (off by
   default): `REPACK (CONCURRENTLY)` refuses to run, at its start and at the
   swap, while a session in the database holds a snapshot that outlives a

@@ -50,8 +50,24 @@ include $(PGXS)
 # - test/modules/test_record: writes a record with a chosen table and
 #   transaction ID, for the regress, isolation and TAP cases that need a
 #   record no REPACK (CONCURRENTLY) produces.
+# - test/modules/toplevel_worker: runs a statement at top level in a
+#   background worker, for t/009_not_preloaded.pl.
 installcheck: install-test-modules
 install-test-modules:
 	$(MAKE) -C test/modules/oat_observer PG_CONFIG=$(PG_CONFIG) install
 	$(MAKE) -C test/modules/test_record PG_CONFIG=$(PG_CONFIG) install
+	$(MAKE) -C test/modules/toplevel_worker PG_CONFIG=$(PG_CONFIG) install
 .PHONY: install-test-modules
+
+# C formatting, by the rules in .clang-format. check-format changes nothing
+# and fails if a file is not formatted; format rewrites the files in place.
+# Output differs between clang-format majors, so the CI names its binary
+# (make check-format CLANG_FORMAT=clang-format-22).
+CLANG_FORMAT ?= clang-format
+FORMAT_SOURCES = $(wildcard src/*.c src/*.h test/modules/*/*.c \
+                            test/modules/*/*.h)
+format:
+	$(CLANG_FORMAT) -i $(FORMAT_SOURCES)
+check-format:
+	$(CLANG_FORMAT) --dry-run --Werror $(FORMAT_SOURCES)
+.PHONY: format check-format

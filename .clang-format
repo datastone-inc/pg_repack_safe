@@ -1,0 +1,34 @@
+# Copyright (c) 2026 dataStone Inc.
+# SPDX-License-Identifier: MIT
+#
+# C formatting for this repo (AGENTS.md, Style): Allman braces, 2-space
+# indent, no tabs, 79 columns, no column alignment. A message string is
+# never split, and the call holding it is not broken after an opening
+# parenthesis to make room for it, so an errmsg() line may run past 79
+# columns. `make check-format` checks every C file, `make format` rewrites
+# them; the CI pins the clang-format major (CLANG_FORMAT).
+BasedOnStyle: LLVM
+Language: Cpp
+BreakBeforeBraces: Allman
+IndentWidth: 2
+UseTab: Never
+ColumnLimit: 79
+BreakAfterReturnType: TopLevelDefinitions
+BreakStringLiterals: false
+ReflowComments: false
+SortIncludes: Never
+SpaceBeforeParens: ControlStatementsExceptControlMacros
+PenaltyExcessCharacter: 10000
+PenaltyBreakOpenParenthesis: 1000000
+# PostgreSQL's list iteration macros (nodes/pg_list.h), formatted as loops.
+ForEachMacros:
+  - foreach
+  - foreach_ptr
+  - foreach_int
+  - foreach_oid
+  - foreach_xid
+  - foreach_node
+  - forboth
+  - forthree
+  - forfour
+  - forfive
