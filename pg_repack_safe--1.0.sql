@@ -17,6 +17,33 @@
 -- them the same way in every database and the extension cannot be moved
 -- away from its record table.
 
+-- CREATE EXTENSION uses a schema of that name that already exists, whoever
+-- owns it (extension.c, CreateExtensionInternal). A schema's owner can drop
+-- any object in it, so an owner that is not a superuser could drop the
+-- record table once it is empty, after which every query in the database
+-- is refused (lookupRecordTable). The extension is therefore created only
+-- in a schema a superuser owns. The schema CREATE EXTENSION creates is
+-- owned by the superuser running it, which the control file requires.
+DO $$
+DECLARE
+  owner name;
+BEGIN
+  SELECT r.rolname INTO owner
+  FROM pg_catalog.pg_namespace n
+  JOIN pg_catalog.pg_roles r ON r.oid = n.nspowner
+  WHERE n.oid = '@extschema@'::pg_catalog.regnamespace AND NOT r.rolsuper;
+  IF FOUND THEN
+    RAISE EXCEPTION USING
+      ERRCODE = 'object_not_in_prerequisite_state',
+      MESSAGE = pg_catalog.format('schema "%s" must be owned by a superuser',
+                                  '@extschema@'),
+      DETAIL = pg_catalog.format('The schema is owned by role "%s", which could drop the record table of extension "pg_repack_safe" and so make every query in this database fail.',
+                                 owner),
+      HINT = 'Drop the schema or give it to a superuser (ALTER SCHEMA ... OWNER TO), then create the extension again.';
+  END IF;
+END
+$$;
+
 -- CREATE EXTENSION creates the schema without privileges for other roles.
 -- status() is for any role, so any role may look names up in the schema;
 -- the table and the other functions stay revoked from PUBLIC below.

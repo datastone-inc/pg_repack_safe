@@ -98,7 +98,13 @@ They are never installed: the Makefile writes
 directories, and every temporary server gets it (pg_regress and
 pg_isolation_regress as a second `--temp-config`, the TAP clusters through
 `TEMP_CONFIG`). `test_record` can write arbitrary rows into a record table,
-which is why it must not reach a server's library directory.
+which is why it must not reach a server's library directory. A
+`TEMP_CONFIG` set in the environment is included from that file, so its
+settings reach the regress, isolation and TAP servers alike:
+
+```bash
+TEMP_CONFIG=~/debug.conf make installcheck
+```
 
 - `custom_scan_provider`: plans every scan of a plain table as a
   `CustomScan` while `custom_scan_provider.enabled` is on.
@@ -153,8 +159,15 @@ disagree.
   and the extension's version with it, and ships an upgrade script
   (`pg_repack_safe--1.0--1.1.sql`) with a test of the upgrade.
 - The custom WAL record's format (`xl_pg_repack_safe_rewrite`) and its
-  resource manager ID do not change within a major version: during a
-  rolling upgrade the primary and its standbys run different builds.
+  resource manager ID do not change within a major version of the library
+  (its first part): during a rolling upgrade the primary and its standbys
+  run different builds.
+- A library supports every extension version of its major version: it
+  reads and writes the record table of `1.0` as well as that of `1.1`. A
+  rolling upgrade installs the new build on the standbys first and runs
+  `ALTER EXTENSION UPDATE` last, so a standby may meet the SQL objects of
+  any earlier extension version of the major, never a later one. A change
+  that cannot keep this changes the first part.
 
 To release: move the `[Unreleased]` entries of `CHANGELOG.md` under the new
 version and date, set the three versions, commit, then

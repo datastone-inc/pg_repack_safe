@@ -59,11 +59,15 @@ empty (`specs/repack_concurrently_snapshot.spec`, `demo/demo.sh`).
   (`repack.c`, `rebuild_relation_finish_concurrent`), so a reader gets its
   lock either before the swap, in which case the rewriter waits for it, or
   after the commit.
-- `insertRecord` queues a relcache invalidation of the record table. It is
-  sent at commit before the locks are released (`xact.c`,
-  `CommitTransaction`), and a backend processes pending invalidations when
-  it takes a lock (`lmgr.c`, `LockRelationOid`). The reader's cached copy
-  is therefore marked stale before its lock is granted.
+- `insertRecord` queues a relcache invalidation of the record table, which
+  `CommitTransaction` (`xact.c`) sends before it releases the rewriter's
+  locks. `LockRelationOid` (`lmgr.c`) processes pending invalidations once
+  the lock is granted and before it returns, unless this backend already
+  held the lock with its invalidations processed. A reader that gets its
+  lock after the commit therefore has its copy marked stale before the
+  check runs. A reader that already held its lock held it across the swap,
+  which needs `AccessExclusiveLock`, so the rewriter waited for that reader
+  and the first bullet's first case applies.
 - `loadRecordCache` reloads the copy with `SnapshotAny`, so it holds every
   row version, and repeats the load if an invalidation arrived during it
   (`specs/reader_cache.spec`, `t/021_discard_caches.pl`).
@@ -100,10 +104,18 @@ snapshot of a table that has a record is refused.
   the deleting transaction inserted (`deleteOlderRecords`).
 - The deleted row version stays in the table, and in every reader's copy,
   until `VACUUM` removes it, which it does only once the deleting
-  transaction precedes every snapshot of the database
-  (`heapam_visibility.c`, `HeapTupleSatisfiesVacuumHorizon`). A snapshot
-  that does not see the recorded rewrite is older than the deletion
-  (`specs/record_prune.spec`).
+  transaction precedes the database's removal horizon
+  (`heapam_visibility.c`, `HeapTupleSatisfiesVacuumHorizon`). The horizon
+  is at or below the xmin of every backend of the database except those
+  running a lazy `VACUUM` or logical decoding (`procarray.c`,
+  `ComputeXidHorizons`). A lazy `VACUUM` runs no user function that could
+  read a table (`vacuum.c`, `vacuum_rel`), and logical decoding reads only
+  catalogs and user catalog tables, on which `REPACK (CONCURRENTLY)` is
+  refused (`repack.c`, `check_concurrent_repack_requirements`). A snapshot
+  that does not see the recorded rewrite has an xmin at or below the
+  rewrite's transaction, which precedes the deleting one
+  (`deleteOlderRecords`), so the deletion stays above the horizon while
+  that snapshot exists (`specs/record_prune.spec`).
 - On a standby the removal is replayed with a conflict horizon, and replay
   first ends every snapshot that could need the record (`standby.c`,
   `ResolveRecoveryConflictWithSnapshot`; `t/002_standby_record_removal.pl`,
@@ -136,7 +148,7 @@ suites against it, to learn of such a change before it ships.
 | --- | --- | --- |
 | At `OAT_POST_ALTER` of the swap, the catalog cache still holds the old `pg_class` row and a `SnapshotSelf` scan returns the new one | `repack.c`, `swap_relation_files` | `sql/storage_change.sql`, `sql/writer.sql` |
 | The executor opens every relation a plan reads while it starts, into `es_relations` | `execUtils.c`, `ExecGetRangeTableRelation` | `specs/unread_relations.spec` |
-| Invalidations are sent at commit before locks are released, and processed when a lock is taken | `xact.c`, `CommitTransaction`; `lmgr.c`, `LockRelationOid` | `specs/reader_cache.spec` |
+| Invalidations are sent at commit before locks are released, and processed once a lock is granted, before `LockRelationOid` returns | `xact.c`, `CommitTransaction`; `lmgr.c`, `LockRelationOid` | `specs/reader_cache.spec` |
 | `REPACK (CONCURRENTLY)` holds `AccessExclusiveLock` from the swap to its commit | `repack.c`, `rebuild_relation_finish_concurrent` | `specs/repack_concurrently_snapshot.spec` |
 | A `heap_insert` with `HEAP_INSERT_NO_LOGICAL` is not decoded | `decode.c`, `DecodeInsert` | `t/016_publication.pl` |
 | Replaying a row removal ends the standby snapshots older than its conflict horizon | `standby.c`, `ResolveRecoveryConflictWithSnapshot` | `t/017_standby_record_cleanup.pl` |
@@ -144,7 +156,9 @@ suites against it, to learn of such a change before it ships.
 
 ## Known gaps
 
-Each is described, with its reproducer, in [limits.md](limits.md).
+Each is described in [limits.md](limits.md), the first two with a
+reproducer. The third is reasoned but not reproduced, as it requires a
+`REPACK` paused between its swap and its commit.
 
 - Functions of `pgrowlocks` and `amcheck` read a table they take as an
   argument, outside the executor, and return a wrong answer with no error

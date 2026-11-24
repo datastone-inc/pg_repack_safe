@@ -10,11 +10,13 @@
 [![Language](https://img.shields.io/badge/Language-C-orange.svg)](https://en.wikipedia.org/wiki/C_(programming_language))
 [![Extension](https://img.shields.io/badge/Type-PostgreSQL%20Extension-purple.svg)](https://www.postgresql.org/docs/current/extend-extensions.html)
 
-Makes PostgreSQL 19's `REPACK (CONCURRENTLY)` safe: a query whose snapshot
-predates the repack gets a retryable error instead of wrong rows.
+Stock PostgreSQL 19's `REPACK (CONCURRENTLY)` can make a table look empty
+to transactions already running: queries return no rows, updates and
+deletes change nothing, and `pg_dump` silently leaves the table's data out.
+pg_repack_safe turns each of these incorrect results into an error.
 
-`REPACK` is a command built into PostgreSQL 19, and this extension guards
-that command. It is not related to the `pg_repack` extension.
+`REPACK` is new in PostgreSQL 19. pg_repack_safe is not related to the
+`pg_repack` extension.
 
 </div>
 <!-- markdownlint-enable MD033 MD041 -->
@@ -34,15 +36,39 @@ reads or writes. Its reference page carries this warning, under
 > See [Section 13.6](https://www.postgresql.org/docs/19/mvcc-caveats.html)
 > for more details.
 
-In practice, after it commits, a transaction whose snapshot was taken
-before it committed, and which had not yet touched the table, reads the
-table as **empty**. Nothing raises an error. The same happens to `pg_dump`
-(a dump with the table's rows missing), to cursors, and to logical
-replication's initial table copy (a subscriber that never gets the table's
-existing rows).
+In stock PostgreSQL 19, once `REPACK (CONCURRENTLY)` commits, a snapshot
+taken before that commit, in a transaction that had not yet touched the
+table, reads the table as **empty**, however many rows it holds. An `UPDATE`
+or `DELETE` in that transaction finds no rows and changes nothing. No error
+is raised. Snapshots that last beyond one statement are exposed:
+`REPEATABLE READ` and `SERIALIZABLE` transactions, cursors, and `pg_dump`,
+which exits with status 0 and a dump without the table's rows. So is
+logical replication's initial table copy, after which a subscriber never
+gets the table's existing rows.
 
-The warning understates who is affected: a snapshot taken while the repack
-runs, before it commits, also reads the table as empty.
+The reference page's warning says "before repacking started"; Section 13.6,
+which it links to, says "before the command committed", and that is the real
+window: it includes the whole repack and the wait for its final lock, which
+lasts as long as the longest transaction already reading the table. A dump
+that starts while `REPACK (CONCURRENTLY)` waits for its final lock:
+
+```text
+     REPACK (CONCURRENTLY) orders       pg_dump
+     ─────────────────────────────      ──────────────────────────────
+  1  copies the rows into new storage
+  2  asks for its final lock on
+     orders; waits for a report that
+     is still reading orders
+  3                                     takes its snapshot
+  4                                     asks to lock orders; queues
+                                        behind REPACK
+  5  the report ends; REPACK swaps
+     the storage and commits
+  6                                     gets its lock, reads orders
+                                        with the snapshot from step 3:
+                                        no rows, exit status 0
+```
+
 [doc/problem.md](doc/problem.md) has the details, the command's lineage and
 a demo that shows four cases on a throwaway server.
 
@@ -50,7 +76,7 @@ a demo that shows four cases on a throwaway server.
 
 A report reads `customers`, then `orders`, in one transaction, and another
 session repacks `orders` in between. On stock PostgreSQL 19 the report is
-told there are no orders:
+incorrectly told there are no orders:
 
 ```text
 SELECT count(*) AS orders, sum(amount) AS revenue FROM orders;
@@ -68,6 +94,12 @@ ERROR:  cannot read table "orders" with this snapshot
 DETAIL:  REPACK (CONCURRENTLY) rewrote the table after the snapshot was
 taken, and row visibility for older snapshots was not preserved.
 HINT:  Retry the transaction.
+COMMIT;
+SELECT count(*) AS orders, sum(amount) AS revenue FROM orders;
+ orders | revenue
+--------+---------
+    123 |  456789
+
 ```
 
 `pg_dump` is the case most likely to bite: on stock PostgreSQL 19 a dump
@@ -76,8 +108,10 @@ table's rows missing. With the extension it fails and is run again.
 
 ## Installation
 
-On the primary and on every standby, build and install, add the library to
-`shared_preload_libraries`, and restart (standbys first):
+[doc/installation.md](doc/installation.md) has the requirements in full,
+the settings, `pg_upgrade`, logical replication and other extensions. In
+short: on the primary and on every standby, build and install, add the
+library to `shared_preload_libraries`, and restart (standbys first):
 
 ```bash
 make
@@ -105,8 +139,10 @@ server did not load the library through `shared_preload_libraries`: the
 extension is installed but guards nothing. The extension's description in
 `\dx` names this check.
 
-The primary and its standbys must run the same build of the library. On
-each server:
+The primary and its standbys must run the library from the same major
+version (the same first part, `1.x.y`). To upgrade, install the new build
+on the standbys first, then on the primary, and run any `ALTER EXTENSION
+UPDATE` last. On each server:
 
 ```sql
 SELECT module_name, version FROM pg_get_loaded_modules()
@@ -114,9 +150,7 @@ WHERE module_name = 'pg_repack_safe';
 ```
 
 The extension's table and functions are always in the schema
-`repack_safe`. [doc/installation.md](doc/installation.md) has the
-requirements in full, the settings, `pg_upgrade`, logical replication and
-other extensions.
+`repack_safe`.
 
 ## What it costs
 
@@ -204,8 +238,10 @@ when a requirement is not met.
 > `REPACK (CONCURRENTLY)`. That work has not been designed or tested. If it
 > would help you, open an issue and say which commands matter to you.
 
-Three gaps are known within `REPACK (CONCURRENTLY)` itself, each with a
-reproducer in [doc/limits.md](doc/limits.md):
+Three gaps are known within `REPACK (CONCURRENTLY)` itself, each described
+in [doc/limits.md](doc/limits.md), the first two with a reproducer. The
+third is reasoned but not reproduced, as it requires a `REPACK` paused
+between its swap and its commit.
 
 - Functions of the contrib modules `pgrowlocks` and `amcheck` read a table
   outside the executor. With an old snapshot they return a wrong answer and
@@ -216,22 +252,39 @@ reproducer in [doc/limits.md](doc/limits.md):
 - A standby without the library whose replay starts between a repack's swap
   and its commit is not stopped.
 
-## Turning it off
+## Turning pg_repack_safe off
 
-In a hurry, as a superuser, in each database:
+[doc/removal.md](doc/removal.md) has the check for each step, what holds
+the cleanup back, and what to do before taking the library out of
+`shared_preload_libraries`. In short: stop running `REPACK (CONCURRENTLY)`,
+then, as a superuser, in each database that has the extension:
+
+```sql
+SELECT repack_safe.prune_records();
+VACUUM (TRUNCATE) repack_safe.rewrites;
+SELECT pg_relation_size('repack_safe.rewrites') = 0 AS empty;
+DROP EXTENSION pg_repack_safe;
+```
+
+Repeat the `VACUUM` until `empty` is `t`; until then `DROP EXTENSION` is
+refused. The record table empties once no snapshot taken before a recorded
+`REPACK (CONCURRENTLY)` is left, on the primary or on any standby, so no
+snapshot reads a repacked table as empty. With the library still
+preloaded, `REPACK (CONCURRENTLY)` is refused in a database without the
+extension. No restart is needed.
+
+If no such snapshot can exist, a superuser can drop the extension without
+waiting, in one session:
 
 ```sql
 SET pg_repack_safe.allow_unprotected_removal = on;
 DROP EXTENSION pg_repack_safe;
 ```
 
-No read is checked in that database from then on, and a snapshot taken
-before a recorded `REPACK (CONCURRENTLY)` reads the repacked table as
-empty. With the library still preloaded, `REPACK (CONCURRENTLY)` is refused
-in a database without the extension, so no new case arises. No restart is
-needed. [doc/removal.md](doc/removal.md) has the procedure that exposes no
-snapshot, and what to do before taking the library out of
-`shared_preload_libraries`.
+Set it with `SET`, never in a configuration file, so that it ends with the
+session. If a snapshot taken before a recorded `REPACK (CONCURRENTLY)`
+does exist, on the primary or on any standby, it then reads the repacked
+table as empty.
 
 To switch `REPACK (CONCURRENTLY)` off for a whole server, with or without
 the extension, set `max_repack_replication_slots = 0` and restart

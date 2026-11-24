@@ -10,8 +10,11 @@ named:
 - PostgreSQL 19 with `wal_level = replica` or higher, which
   `REPACK (CONCURRENTLY)` itself requires; `replica` is PostgreSQL's
   default.
-- The same build of the library installed on the primary and on every
-  server that replays its WAL ([Building from Source](#building-from-source)).
+- The library, from the same major version (the same first part,
+  `1.x.y`), installed on the primary and on every server that replays its
+  WAL ([Building from Source](#building-from-source)); during an upgrade,
+  the standbys get the new build first
+  ([Verifying the Installation](#verifying-the-installation)).
 - The library in `shared_preload_libraries` on each of those servers, and a
   restart ([Configuring the Servers](#configuring-the-servers)).
 - The extension created in every database where `REPACK (CONCURRENTLY)`
@@ -49,7 +52,7 @@ make install PG_CONFIG=/path/to/bin/pg_config
 ```
 
 Run `make install`, or install the package, on the primary and on every
-physical standby, from the same build.
+physical standby, from the same major version of the library.
 
 ## Configuring the Servers
 
@@ -113,17 +116,29 @@ look names up in it (`USAGE`), which `repack_safe.status()` needs; the table
 and the other functions are for superusers. The extension cannot be created
 in another schema or moved to one.
 
-If a schema `repack_safe` already exists, the extension is created in it as
-it is, so make sure beforehand that a superuser owns it. The schema can be
-renamed afterwards (`ALTER SCHEMA repack_safe RENAME TO ...`) and the guard
-keeps working; the commands in this documentation then need the new name.
+If a schema `repack_safe` already exists, the extension is created in it
+only if a superuser owns it; otherwise `CREATE EXTENSION` fails with
+`schema "repack_safe" must be owned by a superuser`, since the schema's
+owner could drop the record table once it is empty, after which every
+query in the database is refused. The install script makes this check in
+PL/pgSQL, so the extension requires `plpgsql`, which every database has
+unless it was dropped. The schema can be renamed afterwards
+(`ALTER SCHEMA repack_safe RENAME TO ...`) and the guard keeps working; the
+commands in this documentation then need the new name
+(`t/022_record_table_rename.pl`).
 
-PostgreSQL runs the extension's install script with `repack_safe` as the
-`search_path`. In a database with DDL event triggers, their functions run
-for each command of the script, so a function that names a table without
-its schema fails there and `CREATE EXTENSION` fails with it
-(`relation "..." does not exist`); name the table with its schema in the
-function (`t/020_create_with_event_trigger.pl`).
+PostgreSQL runs the extension's install script with `repack_safe` and
+`pg_catalog` as the `search_path`. In a database with DDL event triggers,
+their functions run for each command of the script, so a function that
+names a table without its schema fails there and `CREATE EXTENSION` fails
+with it (`relation "..." does not exist`), leaving nothing behind. Name the
+table with its schema in the function, or give the function a
+`search_path` of its own, then create the extension again
+(`t/020_create_with_event_trigger.pl`):
+
+```sql
+ALTER FUNCTION log_ddl() SET search_path = public;
+```
 
 Its settings:
 
@@ -145,6 +160,17 @@ read the table with an older snapshot:
 ```sql
 SET pg_repack_safe.precheck_snapshot_age = '10min';
 ```
+
+The setting is for superusers, so that a role cannot turn off a check the
+administrator configured. To apply it to the role that runs the repacks, a
+superuser sets it for that role:
+
+```sql
+ALTER ROLE repack_job SET pg_repack_safe.precheck_snapshot_age = '10min';
+```
+
+`GRANT SET ON PARAMETER pg_repack_safe.precheck_snapshot_age TO repack_job`
+instead lets the role choose the value itself, including `-1`.
 
 A session counts when it holds a snapshot that outlives a statement (idle
 in a transaction, or past the first statement of its transaction), holds no
@@ -294,19 +320,25 @@ guards nothing there. If the library is in `session_preload_libraries` or
 Nothing else reports this state: the extension is still listed by `\dx`,
 and `REPACK (CONCURRENTLY)` runs without an error.
 
-The primary and its standbys must run the same build of the library. On
-each server, with or without the extension in the database:
+The primary and its standbys must run the library from the same major
+version (the same first part, `1.x.y`). Both read the WAL record that each
+`REPACK (CONCURRENTLY)` writes and the record table, and the first part
+changes only when the format of either does; a library supports every
+extension version of its major version. To upgrade, install the new build
+on the standbys first, then on the primary, and run any `ALTER EXTENSION
+UPDATE` last: a standby is then never older than the SQL objects it
+replays. On each server, with or without the extension in the database:
 
 ```sql
 SELECT module_name, version FROM pg_get_loaded_modules()
 WHERE module_name = 'pg_repack_safe';
 ```
 
-A server that preloads the library also writes `pg_repack_safe 1.0.0
-loaded` to its log at each start, which shows afterwards which build it ran
-and since when. The library's version (`1.0.0`) names the build; the
-extension's version in `\dx` (`1.0`) names its SQL objects and changes only
-when they do, so a new build of the library needs no `ALTER EXTENSION
+A server that preloads the library also writes
+`pg_repack_safe <version> loaded` to its log at each start, which shows
+afterwards which build it ran and since when. The library's version (three
+parts) names the build; the extension's version in `\dx` (its first two
+parts) names its SQL objects and changes only when they do, so a new build of the library needs no `ALTER EXTENSION
 UPDATE` unless its release notes say so.
 
 To run the test suites:

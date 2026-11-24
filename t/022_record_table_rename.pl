@@ -15,8 +15,9 @@
 # - ALTER EXTENSION ... SET SCHEMA, with the table or after it was detached,
 #   which PostgreSQL refuses for an extension with a fixed schema.
 # After each attempt DROP EXTENSION is still refused and the old snapshot's
-# read still gets the reader guard's error. sql/protection.sql pins the
-# messages and the superuser override.
+# read still gets the reader guard's error. ALTER SCHEMA ... RENAME of the
+# extension's schema is allowed and leaves the guard in force.
+# sql/protection.sql pins the messages and the superuser override.
 
 use strict;
 use warnings FATAL => 'all';
@@ -82,6 +83,57 @@ foreach my $name (sort keys %attempts)
         $err,
         qr/cannot read table "t" with this snapshot/,
         "$name: the old snapshot's read is still refused");
+
+    $reader->quit;
+    $node->stop;
+}
+
+# Renaming the extension's schema keeps the guard working: the extension
+# finds its schema by OID (get_extension_schema) and the record table by its
+# name in that schema, and the rename changes neither the table's name nor
+# the schema it is in.
+{
+    my $node = preloadedNode('schema_rename');
+    $node->start;
+    $node->safe_psql('postgres', q{
+        CREATE EXTENSION pg_repack_safe;
+        CREATE TABLE t (id int PRIMARY KEY);
+        INSERT INTO t SELECT generate_series(1, 5);
+        CREATE TABLE u (id int PRIMARY KEY);
+        INSERT INTO u SELECT generate_series(1, 5);
+        CREATE TABLE other (id int);
+    });
+
+    my $reader = oldSnapshot($node);
+    $node->safe_psql('postgres', 'REPACK (CONCURRENTLY) t');
+
+    my ($ret, $stdout, $stderr) = $node->psql('postgres',
+        'ALTER SCHEMA repack_safe RENAME TO guard', on_error_stop => 1);
+    is($ret, 0, 'schema rename: allowed while the record table holds records')
+      or diag($stderr);
+
+    my ($out, $err) = runIn($reader, 'SELECT count(*) FROM t');
+    like(
+        $err,
+        qr/cannot read table "t" with this snapshot/,
+        "schema rename: the old snapshot's read is still refused");
+
+    ($ret, $stdout, $stderr) =
+      $node->psql('postgres', 'DROP EXTENSION pg_repack_safe');
+    isnt($ret, 0, 'schema rename: DROP EXTENSION is still refused');
+
+    $node->safe_psql('postgres', 'REPACK (CONCURRENTLY) u');
+    ok( $node->safe_psql('postgres', q{
+            SELECT count(*) > 0 FROM guard.rewrites
+            WHERE relid = 'u'::regclass}) eq 't',
+        'schema rename: REPACK (CONCURRENTLY) still writes a record');
+
+    is($node->safe_psql('postgres', 'SELECT guard.status()'),
+        't', 'schema rename: status() runs under the new name');
+    ($ret, $stdout, $stderr) =
+      $node->psql('postgres', 'SELECT guard.prune_records()');
+    is($ret, 0, 'schema rename: prune_records() runs under the new name')
+      or diag($stderr);
 
     $reader->quit;
     $node->stop;

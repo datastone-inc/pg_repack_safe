@@ -64,8 +64,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TRUNCATE`, are refused unless a superuser sets
   `pg_repack_safe.allow_unprotected_removal`. Under the same rule the table
   cannot be renamed or moved to another schema: the drop refusals find the
-  table by its name in the extension's schema. The README describes how to
-  remove the extension safely.
+  table by its name in the extension's schema. `doc/removal.md` describes
+  how to remove the extension safely.
 - The extension's objects are in the fixed schema `repack_safe`:
   `repack_safe.rewrites`, `repack_safe.status()` and
   `repack_safe.prune_records()`. The extension cannot be created in or moved
@@ -74,7 +74,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FOR TABLES IN SCHEMA public` would publish it. The schema is not named
   after the extension because PostgreSQL reserves the `pg_` prefix. The
   install script runs with that schema as its `search_path`, so a DDL event
-  trigger function must name its tables with their schema.
+  trigger function must name its tables with their schema. A schema
+  `repack_safe` that already exists is used only if a superuser owns it;
+  otherwise `CREATE EXTENSION` fails (SQLSTATE 55000). The extension
+  requires `plpgsql` for that check.
 - Error messages follow PostgreSQL's message style: setting names are
   quoted, no hint refers to a file of this repository, and a refusal that
   no setting lifts (an insert, update or delete of records, an index, a
@@ -90,7 +93,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The library has a version of its own (`1.0.0`), which
   `pg_get_loaded_modules()` shows on every server and the postmaster logs at
   start (`pg_repack_safe 1.0.0 loaded`). The extension's version (`1.0`)
-  changes only when its SQL objects do.
+  changes only when its SQL objects do. The primary and its standbys need
+  the same major version of the library (`1.x.y`); an upgrade installs the
+  new build on the standbys first.
 - Only `REPACK (CONCURRENTLY)` writes records. A row-level
   `BEFORE INSERT` trigger on the record table, enabled ALWAYS, refuses every
   other insert with "cannot insert into the pg_repack_safe record table".
@@ -134,8 +139,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the record without ending the standby snapshots that need it.
 - Removing the extension no longer needs the override or a check of every
   standby: delete the records with `repack_safe.prune_records()`, vacuum
-  the record table until it is empty, and `DROP EXTENSION` (README,
-  "Removing the extension"). Each step of the README's procedure ends with
+  the record table until it is empty, and `DROP EXTENSION`
+  (`doc/removal.md`). Each step of the procedure ends with
   a check, and the procedure lists what holds back the vacuum, uses
   `VACUUM (TRUNCATE)` so that `vacuum_truncate = off` cannot stall it, and
   says when the library may be unloaded and the package uninstalled.
@@ -170,11 +175,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation: the README's "Outlook" says why the MVCC-safe fix under
   review for PostgreSQL 20 cannot be delivered as an extension;
   `doc/research/history.md` §6 compares that patch with this extension.
-- Documentation: the README's "The problem" says `REPACK (CONCURRENTLY)`
+- Documentation: `doc/problem.md` says `REPACK (CONCURRENTLY)`
   is built on pg_squeeze, not pg_repack, that both tools share the caveat,
   and that core accepted it as a known trade-off.
-- Documentation: the README's "Standby errors caused by pg_repack_safe
-  (without `hot_standby_feedback`)" says what an operator sees when
+- Documentation: `doc/standbys.md` says what an operator sees when
   cleanup of the record table ends old standby transactions, which
   transactions it affects, when it happens (including the replay stall with
   `max_standby_streaming_delay = -1`), how to tell from the standby's log

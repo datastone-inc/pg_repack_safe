@@ -50,6 +50,10 @@ empty :=
 space := $(empty) $(empty)
 TEST_MODULES_PATH = $(subst $(space),:,$(addprefix \
                         $(CURDIR)/test/modules/,$(TEST_MODULES)))
+# A TEMP_CONFIG from the environment, read here because installcheck sets
+# its own for itself and its prerequisites. The generated file includes it,
+# so its settings reach every temporary server.
+USER_TEMP_CONFIG := $(filter-out $(TEST_MODULES_CONF),$(abspath $(TEMP_CONFIG)))
 
 # Build configuration
 PG_CONFIG = pg_config
@@ -68,7 +72,8 @@ include $(PGXS)
 #   for t/009_not_preloaded.pl.
 # pg_regress and pg_isolation_regress take the generated file as a second
 # --temp-config; the TAP tests' clusters append the file TEMP_CONFIG names
-# (PostgreSQL::Test::Cluster, init).
+# (PostgreSQL::Test::Cluster, init). Each appends the file's text to
+# postgresql.conf, where an include of the developer's TEMP_CONFIG works.
 installcheck: build-test-modules
 installcheck: export TEMP_CONFIG = $(TEST_MODULES_CONF)
 build-test-modules:
@@ -77,6 +82,8 @@ build-test-modules:
 	done
 	printf "dynamic_library_path = '%s:\$$libdir'\n" \
 	    "$(TEST_MODULES_PATH)" > $(TEST_MODULES_CONF)
+	$(if $(USER_TEMP_CONFIG),printf "include '%s'\n" \
+	    "$(USER_TEMP_CONFIG)" >> $(TEST_MODULES_CONF))
 clean: clean-test-modules
 clean-test-modules:
 	for m in $(TEST_MODULES); do \
@@ -87,7 +94,8 @@ clean-test-modules:
 
 # Release. The library's version is the constant in the C file, which
 # pg_get_loaded_modules() reports; META.json carries the same version for
-# PGXN, and the control file's default_version is its first two parts.
+# PGXN, at the top and in its provides entry, and the control file's
+# default_version is its first two parts.
 # check-version fails if they disagree. dist writes the PGXN archive of the
 # committed tree, so uncommitted changes are not in it.
 LIBRARY_VERSION = $(shell sed -n \
@@ -97,6 +105,9 @@ check-version:
 	    { echo "no PG_REPACK_SAFE_VERSION in src/pg_repack_safe.c"; exit 1; }
 	@grep -q '^   "version": "$(LIBRARY_VERSION)",$$' META.json || \
 	    { echo "META.json is not version $(LIBRARY_VERSION)"; exit 1; }
+	@grep -q '^         "version": "$(LIBRARY_VERSION)"$$' META.json || \
+	    { echo "META.json provides another version than $(LIBRARY_VERSION)"; \
+	    exit 1; }
 	@v=$$(sed -n "s/^default_version = '\(.*\)'/\1/p" \
 	    pg_repack_safe.control); \
 	    case "$(LIBRARY_VERSION)" in "$$v".*) ;; *) \

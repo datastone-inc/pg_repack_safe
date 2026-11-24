@@ -6,3 +6,5 @@ relocatable = false
 schema = repack_safe
 superuser = true
 trusted = false
+# The install script checks the owner of the schema in PL/pgSQL.
+requires = 'plpgsql'

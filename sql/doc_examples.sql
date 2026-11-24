@@ -41,10 +41,38 @@ ALTER TABLE repack_safe.rewrites SET (log_autovacuum_min_duration = 0);
 SELECT reloptions FROM pg_class WHERE oid = 'repack_safe.rewrites'::regclass;
 DROP EXTENSION pg_repack_safe;
 
+-- doc/installation.md, Enabling the Extension: an event trigger function
+-- given a search_path of its own. CREATE EXTENSION with the trigger in
+-- place is in t/020_create_with_event_trigger.pl.
+CREATE FUNCTION log_ddl() RETURNS event_trigger LANGUAGE plpgsql
+AS $$ BEGIN END $$;
+ALTER FUNCTION log_ddl() SET search_path = public;
+SELECT proconfig FROM pg_proc WHERE oid = 'log_ddl'::regproc;
+DROP FUNCTION log_ddl();
+
 -- doc/installation.md, Optional pre-check
 SET pg_repack_safe.precheck_snapshot_age = '10min';
 SHOW pg_repack_safe.precheck_snapshot_age;
 RESET pg_repack_safe.precheck_snapshot_age;
+
+-- doc/installation.md, Optional pre-check: the setting for a role that is
+-- not a superuser, fixed by a superuser or granted to the role.
+CREATE ROLE repack_job;
+ALTER ROLE repack_job SET pg_repack_safe.precheck_snapshot_age = '10min';
+SELECT setconfig FROM pg_db_role_setting
+WHERE setrole = 'repack_job'::regrole;
+SET ROLE repack_job;
+SET pg_repack_safe.precheck_snapshot_age = -1;
+RESET ROLE;
+GRANT SET ON PARAMETER pg_repack_safe.precheck_snapshot_age TO repack_job;
+SET ROLE repack_job;
+SET pg_repack_safe.precheck_snapshot_age = -1;
+SHOW pg_repack_safe.precheck_snapshot_age;
+RESET pg_repack_safe.precheck_snapshot_age;
+RESET ROLE;
+REVOKE SET ON PARAMETER pg_repack_safe.precheck_snapshot_age FROM repack_job;
+ALTER ROLE repack_job RESET pg_repack_safe.precheck_snapshot_age;
+DROP ROLE repack_job;
 
 -- doc/installation.md, Logical Replication. wal_level is replica on the
 -- test instance, which is enough to define a publication. The recovery
@@ -81,8 +109,9 @@ SELECT pid, datname, relid, command FROM pg_stat_progress_repack;
 SELECT format('database %I', current_database()) AS found
 FROM pg_extension WHERE extname = 'pg_repack_safe';
 
--- Step 3. vacuum_truncate is turned off for the table first, to show that
--- the TRUNCATE option overrides it.
+-- Step 3, and README.md, Turning pg_repack_safe off. vacuum_truncate is
+-- turned off for the table first, to show that the TRUNCATE option
+-- overrides it.
 SELECT repack_safe.prune_records();
 ALTER TABLE repack_safe.rewrites SET (vacuum_truncate = off);
 VACUUM (TRUNCATE) repack_safe.rewrites;
@@ -103,7 +132,7 @@ UNION ALL
 SELECT 'standby feedback', application_name, backend_xmin
 FROM pg_stat_replication WHERE backend_xmin IS NOT NULL;
 
--- Step 4.
+-- Step 4, and README.md, Turning pg_repack_safe off.
 DROP EXTENSION pg_repack_safe;
 SELECT count(*) = 0 AS dropped FROM pg_extension WHERE extname = 'pg_repack_safe';
 DROP SCHEMA repack_safe;
@@ -126,8 +155,8 @@ ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements';
 ALTER SYSTEM RESET shared_preload_libraries;
 SHOW shared_preload_libraries;
 
--- README.md, Turning it off; doc/removal.md, the override: a drop with a
--- record left, in one session.
+-- README.md, Turning pg_repack_safe off; doc/removal.md, the override: a
+-- drop with a record left, in one session.
 CREATE EXTENSION pg_repack_safe;
 REPACK (CONCURRENTLY) de_t;
 SELECT count(*) > 0 AS has_record FROM repack_safe.rewrites;

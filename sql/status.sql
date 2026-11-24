@@ -18,6 +18,26 @@
 -- The extension's schema is fixed: it cannot be created in another one.
 CREATE EXTENSION pg_repack_safe SCHEMA public;
 
+-- A schema of that name that already exists is used only if a superuser
+-- owns it: its owner could drop the record table once it is empty. An
+-- earlier test that dropped the extension leaves its empty schema behind.
+SET client_min_messages = warning;
+DROP SCHEMA IF EXISTS repack_safe;
+RESET client_min_messages;
+CREATE ROLE status_schema_owner;
+CREATE SCHEMA repack_safe AUTHORIZATION status_schema_owner;
+-- The context would show the install script's text and line number.
+\set SHOW_CONTEXT never
+CREATE EXTENSION pg_repack_safe;
+\set SHOW_CONTEXT errors
+SELECT count(*) AS extensions FROM pg_extension
+WHERE extname = 'pg_repack_safe';
+ALTER SCHEMA repack_safe OWNER TO CURRENT_USER;
+CREATE EXTENSION pg_repack_safe;
+DROP EXTENSION pg_repack_safe;
+DROP SCHEMA repack_safe;
+DROP ROLE status_schema_owner;
+
 CREATE EXTENSION pg_repack_safe;
 
 -- \dx shows the comment, which names the check.
