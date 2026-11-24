@@ -39,7 +39,7 @@
          "type": "git"
       }
    },
-   "release_status": "testing",
+   "release_status": "stable",
    "tags": [
       "repack",
       "mvcc",
