@@ -125,8 +125,11 @@ jobs:
               --enable-tap-tests --enable-injection-points
           make -j"$(nproc)" -s
           make -s install
+          # The contrib modules the tests create (META.json, prereqs.test).
+          make -s -C contrib/amcheck install
           make -s -C contrib/pageinspect install
           make -s -C contrib/pg_stat_statements install
+          make -s -C contrib/pgrowlocks install
           echo "$HOME/pg19/bin" >> "$GITHUB_PATH"
 
       - name: Build
