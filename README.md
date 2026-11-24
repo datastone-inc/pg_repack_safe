@@ -222,7 +222,7 @@ test pins the stock behaviour of each with the extension loaded:
 - **`VACUUM FULL`, `CLUSTER` and plain `REPACK` with hot standbys that run
   without `hot_standby_feedback`**: the primary can drop rows that a
   standby snapshot still needs, and the standby query silently misses
-  them. Reported on pgsql-hackers in 2012 and still unfixed. Turning on
+  them. [Reported on pgsql-hackers in 2012](https://www.postgresql.org/message-id/20120114111719.GA1081%40tornado.leadboat.com) and still unfixed. Turning on
   `hot_standby_feedback` prevents it
   ([Requirements](doc/installation.md#requirements); `t/012_standby_safe_rewrite.pl`).
 

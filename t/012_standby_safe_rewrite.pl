@@ -13,7 +13,9 @@
 # the table (high-availability.sgml, "Handling Query Conflicts"). So a
 # standby REPEATABLE READ snapshot that has not read the table yet reads it
 # with those rows missing. This is stock PostgreSQL behaviour, reported on
-# pgsql-hackers in 2012 and not fixed; it happens without this extension.
+# pgsql-hackers in 2012 ("Disabled features on Hot Standby",
+# <20120114111719.GA1081@tornado.leadboat.com>) and not fixed; it happens
+# without this extension.
 #
 # Expected here: on the standby without feedback, 3 rows instead of 5 (the
 # wrong result, pinned); on the standby with hot_standby_feedback = on, 5,
