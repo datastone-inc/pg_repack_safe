@@ -1,0 +1,67 @@
+doc: REFRESH MATERIALIZED VIEW without CONCURRENTLY is not MVCC-safe
+
+REFRESH MATERIALIZED VIEW without CONCURRENTLY writes the new contents
+with TABLE_INSERT_FROZEN (matview.c, transientrel_startup) and swaps them
+in.  Frozen rows are visible to every snapshot, so a transaction whose
+snapshot was taken before the refresh committed, and which had not yet
+accessed the materialized view, reads the new contents: data from after
+its snapshot.
+
+The "Caveats" section of the MVCC chapter lists the commands that are not
+MVCC-safe and does not include this one, and its description ("the table
+will appear empty") does not fit it.  Document it there and on the
+command's reference page.  REFRESH MATERIALIZED VIEW CONCURRENTLY changes
+the view with ordinary row operations and is not affected.
+
+Reproducer (REL_19_0), two sessions:
+
+    CREATE TABLE t (id int PRIMARY KEY);
+    INSERT INTO t SELECT generate_series(1, 3);
+    CREATE MATERIALIZED VIEW mv AS SELECT id FROM t;
+    INSERT INTO t VALUES (4);
+    CREATE TABLE other (id int);
+
+    s1: BEGIN ISOLATION LEVEL REPEATABLE READ;
+    s1: SELECT count(*) FROM other;      -- takes the snapshot
+    s2: REFRESH MATERIALIZED VIEW mv;
+    s1: SELECT count(*) FROM mv;         -- 4, expected 3
+---
+--- a/doc/src/sgml/mvcc.sgml
++++ b/doc/src/sgml/mvcc.sgml
+@@ -1867,6 +1867,19 @@
+    </para>
+ 
+    <para>
++    <link linkend="sql-refreshmaterializedview"><command>REFRESH
++    MATERIALIZED VIEW</command></link> without
++    the <literal>CONCURRENTLY</literal> option is not MVCC-safe either, in
++    a different way.  After the refresh commits, the materialized view
++    shows its new contents to concurrent transactions that are using a
++    snapshot taken before the refresh committed, provided they did not
++    access the materialized view before the refresh started.  Such a
++    transaction sees data in the materialized view that is newer than its
++    snapshot.  With the <literal>CONCURRENTLY</literal> option the command
++    is MVCC-safe.
++   </para>
++
++   <para>
+     Support for the Serializable transaction isolation level has not yet
+     been added to hot standby replication targets (described in
+     <xref linkend="hot-standby"/>).  The strictest isolation level currently
+--- a/doc/src/sgml/ref/refresh_materialized_view.sgml
++++ b/doc/src/sgml/ref/refresh_materialized_view.sgml
+@@ -101,6 +101,14 @@
+   </para>
+ 
+   <para>
++   <command>REFRESH MATERIALIZED VIEW</command> without
++   the <literal>CONCURRENTLY</literal> option is not MVCC-safe.  After it
++   commits, a concurrent transaction that is using a snapshot taken before
++   that commit, and that had not yet accessed the materialized view, sees
++   the new contents.  See <xref linkend="mvcc-caveats"/> for more details.
++  </para>
++
++  <para>
+    While <command>REFRESH MATERIALIZED VIEW</command> is running, the <xref
+    linkend="guc-search-path"/> is temporarily changed to <literal>pg_catalog,
+    pg_temp</literal>.

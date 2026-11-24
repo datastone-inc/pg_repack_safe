@@ -1,0 +1,62 @@
+doc: REPACK (CONCURRENTLY) affects snapshots taken before it commits
+
+The warning in the REPACK reference page says the table appears empty to
+transactions "using a snapshot taken before repacking started".  The
+affected snapshots are those taken before the repacking transaction
+committed, which is what the "Caveats" section of the MVCC chapter says
+for the same command.  A snapshot taken while REPACK (CONCURRENTLY) runs
+reads the table as empty too: for example, a pg_dump started during the
+repack, which takes its snapshot before it locks the table.
+
+Also say how to disable the option for a whole server:
+max_repack_replication_slots = 0 makes REPACK (CONCURRENTLY) fail with
+"REPACK can only be used if "max_repack_replication_slots" > 0", while
+REPACK without CONCURRENTLY, which needs no slot, still runs.
+
+Reproducer (REL_19_0), two sessions:
+
+    CREATE TABLE t (id int PRIMARY KEY);
+    INSERT INTO t SELECT generate_series(1, 5);
+    CREATE TABLE other (id int);
+
+    s1: REPACK (CONCURRENTLY) t;       -- still running, e.g. waiting for
+                                       -- a transaction that locked t
+    s2: BEGIN ISOLATION LEVEL REPEATABLE READ;
+    s2: SELECT count(*) FROM other;    -- snapshot taken after REPACK started
+    s1: (REPACK commits)
+    s2: SELECT count(*) FROM t;        -- 0, expected 5
+
+Backpatch-through: 19
+---
+--- a/doc/src/sgml/config.sgml
++++ b/doc/src/sgml/config.sgml
+@@ -4832,6 +4832,8 @@
+         <para>
+          Specifies the maximum number of replication slots for use of
+          the <command>REPACK</command> command.  The default is 5.
++         With a value of zero, <command>REPACK</command> cannot be used
++         with the <literal>CONCURRENTLY</literal> option.
+          This parameter can only be set at server start.
+         </para>
+        </listitem>
+--- a/doc/src/sgml/ref/repack.sgml
++++ b/doc/src/sgml/ref/repack.sgml
+@@ -322,9 +322,17 @@
+      <command>REPACK</command> with the <literal>CONCURRENTLY</literal>
+      option is not MVCC-safe.  After the repacking transaction commits,
+      the table will appear empty to concurrent transactions, if they are
+-     using a snapshot taken before repacking started.
++     using a snapshot taken before the repacking transaction committed.
++     That includes a snapshot taken while <command>REPACK</command> was
++     running.
+      See <xref linkend="mvcc-caveats"/> for more details.
+     </para>
++    <para>
++     To prevent the use of the <literal>CONCURRENTLY</literal> option on a
++     server, set <xref linkend="guc-max-repack-replication-slots"/> to
++     zero.  <command>REPACK</command> without
++     <literal>CONCURRENTLY</literal> remains available.
++    </para>
+    </warning>
+ 
+    <para>
