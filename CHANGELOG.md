@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-24
+
 ### Added
 
 - The `pg_repack_safe` extension and library for PostgreSQL 19, built with
@@ -105,3 +107,6 @@ Each is described in `doc/limits.md`:
   with 23503, not 40001.
 - A standby without the library whose replay starts between a repack's
   swap and its commit is not stopped.
+
+[Unreleased]: https://github.com/datastone-inc/pg_repack_safe/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/datastone-inc/pg_repack_safe/releases/tag/v1.0.0
