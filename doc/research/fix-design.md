@@ -1148,8 +1148,13 @@ question N".
    with queries holding a lock on the table (`high-availability.sgml`).
    `max_standby_streaming_delay = -1` does not help; `hot_standby_feedback`
    does, and one feedback standby protects every standby of that primary.
-   Reported on pgsql-hackers by Noah Misch in 2012-01 with this reproducer;
-   no fix found. `t/012_standby_safe_rewrite.pl`. Closed as a known gap
+   Reported on pgsql-hackers by Noah Misch on 2012-01-14, with this
+   reproducer, in the thread "Disabled features on Hot Standby"
+   ([Mailing-list sources](#mailing-list-sources)). The fix agreed there, a
+   conflict record at the end of `CLUSTER`, was never committed: on
+   `master` at `9ebc9a458c3`, `rewriteheap.c` and `repack.c` log no
+   conflict horizon.
+   `t/012_standby_safe_rewrite.pl`. Closed as a known gap
    outside the extension's scope (developer decision, 2026-11-23), like 4.
    Option kept, if users ask: record these rewrites too and check the
    records only during recovery. The existing rule is enough there: a
@@ -1322,4 +1327,9 @@ numbers are cited by step 5 and the specs. Each one but 10 is a test.
 - [Re: RFC (Noah Misch)](https://postgresql.org/message-id/20120210114205.GA23917%40tornado.leadboat.com)
 - [Re: RFC (Robert Haas)](https://www.postgresql.org/message-id/CA%2BTgmobtjc4edN5MY6Z6jzQLp_xsB3gJYAJCB4sqKsg%2BazztJQ%40mail.gmail.com)
 - [Re: TRUNCATE SERIALIZABLE and frozen COPY (Simon Riggs)](https://www.postgresql.org/message-id/CA%2BU5nMKX7D6NR%2BVwmkxaueu7Ud-m3y_sy9VkUNhtrgeA6eTt3w%40mail.gmail.com)
+- [Re: Disabled features on Hot Standby (Noah Misch, 2012-01-14)](https://www.postgresql.org/message-id/20120114111719.GA1081%40tornado.leadboat.com):
+  `VACUUM FULL` on the primary makes a hot standby query miss rows
+  (research question 1)
+- [Re: Disabled features on Hot Standby (Simon Riggs, 2012-01-14)](https://www.postgresql.org/message-id/CA%2BU5nM%2BAajL%3DMYEYq6LZJT9-wnfxZA71CeCKiS_PP1PU2ZgwXA%40mail.gmail.com):
+  the proposed fix, a conflict record at the end of `CLUSTER`
 - snapshot-too-old removal: commit f691f5b80a8
