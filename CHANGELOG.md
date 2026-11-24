@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The release archive leaves out the instructions for coding agents
+  (`AGENTS.md`, `CLAUDE.md`, `.claude/`), and PGXN no longer lists
+  `doc/research/` among the extension's documentation.
+
 ## [1.0.0] - 2026-11-24
 
 ### Added

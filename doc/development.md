@@ -178,8 +178,16 @@ git tag -s v1.0.0 -m 'pg_repack_safe 1.0.0'
 make dist                # pg_repack_safe-1.0.0.zip, from the committed tree
 ```
 
-and upload the archive to PGXN. Until the first release the install script
-is edited in place.
+and upload the archive to PGXN. A released install script
+(`pg_repack_safe--1.0.sql`) is never edited: a change to the SQL objects
+goes into the next extension version's script and its upgrade script.
+
+The archive is `git archive` of the committed tree, less the files
+`.gitattributes` marks `export-ignore`: the instructions for coding agents
+(`AGENTS.md`, `CLAUDE.md`, `.claude/`). PGXN lists every Markdown file in
+the archive as documentation, except those under `no_index` in
+`META.json`: `doc/research/` stays in the archive, because the user docs
+link to it, but not in that list.
 
 ## Documentation layout
 

@@ -40,6 +40,11 @@
       }
    },
    "release_status": "stable",
+   "no_index": {
+      "directory": [
+         "doc/research"
+      ]
+   },
    "tags": [
       "repack",
       "mvcc",
