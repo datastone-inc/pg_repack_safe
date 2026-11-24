@@ -1,15 +1,15 @@
-# Test-only module for specs/unread_relations.spec; installed by the top-level
-# make installcheck, not by make install.
+# Test-only module for specs/unread_relations.spec; built by the top-level
+# make installcheck and loaded from this directory, never installed.
 
 MODULES = custom_scan_provider
 
 # PostgreSQL's release-build headers have inline functions whose parameters
 # are used only under assertions, so unused parameters are not errors.
-PG_CPPFLAGS = -Wall -Wextra -Wno-unused-parameter
+PG_CFLAGS = -Wall -Wextra -Wno-unused-parameter
 # Warnings are errors only on request (make WERROR=1), so that a compiler
 # with warnings this code has not met still builds it.
 ifdef WERROR
-PG_CPPFLAGS += -Werror
+PG_CFLAGS += -Werror
 endif
 
 PG_CONFIG = pg_config

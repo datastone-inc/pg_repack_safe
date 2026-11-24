@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hooks, each chained to the previous one. It detects replacement of a
   table's storage and classifies `REPACK (CONCURRENTLY)` as the unsafe
   rewriter. It builds against PostgreSQL with or without assertions.
-- `pg_repack_safe_rewrites` record table, created by the extension, always
+- `repack_safe.rewrites` record table, created by the extension, always
   with the `heap` access method. `REPACK (CONCURRENTLY)` of a table whose
   storage has blocks records the table and its post-swap TOAST relation
   there, with the rewriting transaction's full ID (`xid8`), so a record
@@ -62,14 +62,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which would make every query in the database fail, are refused too. While
   it holds records, `DROP` of the table, its triggers or the extension, and
   `TRUNCATE`, are refused unless a superuser sets
-  `pg_repack_safe.allow_unprotected_drop`. Under the same rule the table
-  cannot be renamed or moved to another schema, and the extension cannot be
-  moved to another schema without it: the drop refusals find the table by
-  its name in the extension's schema, and after
-  `ALTER TABLE pg_repack_safe_rewrites RENAME TO ...` a `DROP EXTENSION`
-  dropped the records with no override. `ALTER EXTENSION pg_repack_safe SET
-  SCHEMA` still moves the extension and the table together. The README
-  describes how to remove the extension safely.
+  `pg_repack_safe.allow_unprotected_removal`. Under the same rule the table
+  cannot be renamed or moved to another schema: the drop refusals find the
+  table by its name in the extension's schema. `doc/removal.md` describes
+  how to remove the extension safely.
+- The extension's objects are in the fixed schema `repack_safe`:
+  `repack_safe.rewrites`, `repack_safe.status()` and
+  `repack_safe.prune_records()`. The extension cannot be created in or moved
+  to another schema (`relocatable = false`), so the documented commands are
+  the same in every database and the record table is not in `public`, where
+  `FOR TABLES IN SCHEMA public` would publish it. The schema is not named
+  after the extension because PostgreSQL reserves the `pg_` prefix. The
+  install script runs with that schema as its `search_path`, so a DDL event
+  trigger function must name its tables with their schema. A schema
+  `repack_safe` that already exists is used only if a superuser owns it;
+  otherwise `CREATE EXTENSION` fails (SQLSTATE 55000). The extension
+  requires `plpgsql` for that check.
+- Error messages follow PostgreSQL's message style: setting names are
+  quoted, no hint refers to a file of this repository, and a refusal that
+  no setting lifts (an insert, update or delete of records, an index, a
+  column change or an unsafe rewrite of the record table, a change to when
+  its triggers fire) has SQLSTATE 0A000, while one that holds only while
+  the record table has records keeps 55000.
+- `make installcheck` installs nothing. The test-only modules are built in
+  `test/modules/` and loaded from there; before, they were copied into the
+  server's library directory and left there.
+- `META.json` for PGXN, `make dist` for the release archive, and
+  `make check-version`, which checks that the library, `META.json` and the
+  control file agree on the version.
+- The library has a version of its own (`1.0.0`), which
+  `pg_get_loaded_modules()` shows on every server and the postmaster logs at
+  start (`pg_repack_safe 1.0.0 loaded`). The extension's version (`1.0`)
+  changes only when its SQL objects do. The primary and its standbys need
+  the same major version of the library (`1.x.y`); an upgrade installs the
+  new build on the standbys first.
 - Only `REPACK (CONCURRENTLY)` writes records. A row-level
   `BEFORE INSERT` trigger on the record table, enabled ALWAYS, refuses every
   other insert with "cannot insert into the pg_repack_safe record table".
@@ -91,11 +117,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshots then read its repacked tables as empty. It now stops the
   subscription like a replicated record.
 - Records are bounded. Each `REPACK (CONCURRENTLY)` deletes every record
-  older than its own, and `pg_repack_safe_prune_records()` does the same on
+  older than its own, and `repack_safe.prune_records()` does the same on
   request. A deleted record stays in the table, and readers still obey it,
   until `VACUUM` finds that no snapshot can need it; on a hot standby,
   replaying its removal ends the snapshots that still did.
-- `pg_repack_safe_status()` returns true only where the guard is in force:
+- `repack_safe.status()` returns true only where the guard is in force:
   where the server loaded the library through `shared_preload_libraries`.
   Without that, the extension is installed but guards nothing, and no error
   says so; the function returns false with a `WARNING`. The extension's
@@ -112,9 +138,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deleted record, with a hint to run `VACUUM` on it first: they would drop
   the record without ending the standby snapshots that need it.
 - Removing the extension no longer needs the override or a check of every
-  standby: delete the records with `pg_repack_safe_prune_records()`, vacuum
-  the record table until it is empty, and `DROP EXTENSION` (README,
-  "Removing the extension"). Each step of the README's procedure ends with
+  standby: delete the records with `repack_safe.prune_records()`, vacuum
+  the record table until it is empty, and `DROP EXTENSION`
+  (`doc/removal.md`). Each step of the procedure ends with
   a check, and the procedure lists what holds back the vacuum, uses
   `VACUUM (TRUNCATE)` so that `vacuum_truncate = off` cannot stall it, and
   says when the library may be unloaded and the package uninstalled.
@@ -136,7 +162,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replay starts from a checkpoint between the swap and the commit never sees
   the record and is not stopped.
 - Optional pre-check, `pg_repack_safe.precheck_snapshot_age` (off by
-  default): `REPACK (CONCURRENTLY)` refuses to run, at its start and at the
+  default, set by superusers): `REPACK (CONCURRENTLY)` refuses to run, at its start and at the
   swap, while a session in the database holds a snapshot that outlives a
   statement, has not locked the table, and is at least that old.
 - `pg_repack_safe.trace_storage_changes` setting (superuser), which reports
@@ -149,11 +175,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation: the README's "Outlook" says why the MVCC-safe fix under
   review for PostgreSQL 20 cannot be delivered as an extension;
   `doc/research/history.md` §6 compares that patch with this extension.
-- Documentation: the README's "The problem" says `REPACK (CONCURRENTLY)`
+- Documentation: `doc/problem.md` says `REPACK (CONCURRENTLY)`
   is built on pg_squeeze, not pg_repack, that both tools share the caveat,
   and that core accepted it as a known trade-off.
-- Documentation: the README's "Standby errors caused by pg_repack_safe
-  (without `hot_standby_feedback`)" says what an operator sees when
+- Documentation: `doc/standbys.md` says what an operator sees when
   cleanup of the record table ends old standby transactions, which
   transactions it affects, when it happens (including the replay stall with
   `max_standby_streaming_delay = -1`), how to tell from the standby's log

@@ -91,7 +91,8 @@ is($subscriber->safe_psql('postgres', q{SELECT 'victim'::regclass::oid}),
 $publisher->safe_psql('postgres', 'CREATE PUBLICATION pub FOR ALL TABLES');
 is($publisher->safe_psql('postgres', q{
         SELECT count(*) FROM pg_publication_tables
-        WHERE pubname = 'pub' AND tablename = 'pg_repack_safe_rewrites'}),
+        WHERE pubname = 'pub' AND schemaname = 'repack_safe'
+          AND tablename = 'rewrites'}),
     '1', 'FOR ALL TABLES publishes the record table');
 
 my $connstr = $publisher->connstr . ' dbname=postgres';
@@ -120,14 +121,14 @@ my $errorCount = q{(SELECT apply_error_count FROM pg_stat_subscription_stats
 # did so without an error and without storing anything.
 $publisher->safe_psql('postgres', 'REPACK (CONCURRENTLY) t');
 is($publisher->safe_psql('postgres',
-        "SELECT count(*) FROM pg_repack_safe_rewrites WHERE relid = $tOid"),
+        "SELECT count(*) FROM repack_safe.rewrites WHERE relid = $tOid"),
     '1', 'the publisher recorded the REPACK');
 $publisher->safe_psql('postgres', 'INSERT INTO progress VALUES (1)');
 $publisher->wait_for_catchup('sub');
 is($subscriber->safe_psql('postgres', 'SELECT count(*) FROM progress'),
     '1', "a REPACK (CONCURRENTLY) on the publisher does not stop the subscription");
 is($subscriber->safe_psql('postgres',
-        'SELECT count(*) FROM pg_repack_safe_rewrites'),
+        'SELECT count(*) FROM repack_safe.rewrites'),
     '0', "the writer's record does not reach the subscriber");
 is($subscriber->safe_psql('postgres', "SELECT $errorCount"),
     '0', 'the apply worker reported no error');
@@ -137,10 +138,10 @@ is($subscriber->safe_psql('postgres', "SELECT $errorCount"),
 # as a record from any other source would be.
 my $logOffset = -s $subscriber->logfile;
 $publisher->safe_psql('postgres', qq{
-    SELECT test_insert_record('pg_repack_safe_rewrites', $tOid,
+    SELECT test_insert_record('repack_safe.rewrites', $tOid,
                               pg_current_xact_id())});
 is($publisher->safe_psql('postgres',
-        "SELECT count(*) FROM pg_repack_safe_rewrites WHERE relid = $tOid"),
+        "SELECT count(*) FROM repack_safe.rewrites WHERE relid = $tOid"),
     '2', 'the publisher holds a record that logical decoding sees');
 # A change to another published table, committed after that record.
 $publisher->safe_psql('postgres', 'INSERT INTO other VALUES (1)');
@@ -149,11 +150,11 @@ $publisher->safe_psql('postgres', 'INSERT INTO other VALUES (1)');
 # refused it at least twice (an error and a retry), or stored it.
 $subscriber->poll_query_until('postgres', qq{
     SELECT $errorCount >= 2
-        OR EXISTS (SELECT 1 FROM pg_repack_safe_rewrites)
+        OR EXISTS (SELECT 1 FROM repack_safe.rewrites)
 }) or die 'the subscriber neither refused nor stored the record';
 
 is($subscriber->safe_psql('postgres',
-        'SELECT count(*) FROM pg_repack_safe_rewrites'),
+        'SELECT count(*) FROM repack_safe.rewrites'),
     '0', "the subscriber's record table holds no record");
 my ($ret, $stdout, $stderr) =
   $subscriber->psql('postgres', 'SELECT count(*) FROM victim');
@@ -170,7 +171,7 @@ like($log,
     qr/ERROR:  cannot insert into the pg_repack_safe record table/,
     'the apply worker reports the refused record');
 like($log,
-    qr/CONTEXT:  processing remote data for replication origin "[^"]+" during message type "INSERT" for replication target relation "public\.pg_repack_safe_rewrites"/,
+    qr/CONTEXT:  processing remote data for replication origin "[^"]+" during message type "INSERT" for replication target relation "repack_safe\.rewrites"/,
     'the report names the record table as the replication target');
 
 # The subscription is stopped at the refused transaction: the later change
@@ -180,11 +181,12 @@ is($subscriber->safe_psql('postgres', 'SELECT count(*) FROM other'),
 
 # Recovery, step 1, on the publisher: stop publishing the record table.
 $publisher->safe_psql('postgres', q{
-    ALTER PUBLICATION pub SET ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites)
+    ALTER PUBLICATION pub SET ALL TABLES EXCEPT (TABLE repack_safe.rewrites)
 });
 is($publisher->safe_psql('postgres', q{
         SELECT count(*) FROM pg_publication_tables
-        WHERE pubname = 'pub' AND tablename = 'pg_repack_safe_rewrites'}),
+        WHERE pubname = 'pub' AND schemaname = 'repack_safe'
+          AND tablename = 'rewrites'}),
     '0', 'the record table is excluded from the publication');
 
 # The exclusion does not release the transaction already refused: the apply
@@ -206,7 +208,7 @@ $publisher->wait_for_catchup('sub');
 is($subscriber->safe_psql('postgres', 'SELECT count(*) FROM other'),
     '1', 'after the refresh, the later change arrives');
 is($subscriber->safe_psql('postgres',
-        'SELECT count(*) FROM pg_repack_safe_rewrites'),
+        'SELECT count(*) FROM repack_safe.rewrites'),
     '0', "after the refresh, the subscriber's record table holds no record");
 
 # With the record table excluded, a REPACK (CONCURRENTLY) on the publisher
@@ -225,7 +227,7 @@ is($subscriber->safe_psql('postgres', 'SELECT count(*) FROM other'),
 is($subscriber->safe_psql('postgres', "SELECT $errorCount"),
     $before, 'record table excluded: the apply worker reports no error');
 is($subscriber->safe_psql('postgres',
-        'SELECT count(*) FROM pg_repack_safe_rewrites'),
+        'SELECT count(*) FROM repack_safe.rewrites'),
     '0', "record table excluded: the subscriber's record table stays empty");
 is($subscriber->safe_psql('postgres', 'SELECT count(*) FROM victim'),
     '4', 'the table with the same OID on the subscriber is still readable');
@@ -262,16 +264,16 @@ like($log,
     qr/logical replication tablesync worker\[\d+\] ERROR:  cannot insert into the pg_repack_safe record table/,
     'the table synchronization worker reports the refused record');
 like($log,
-    qr/logical replication tablesync worker\[\d+\] CONTEXT:  COPY pg_repack_safe_rewrites, line 1/,
+    qr/logical replication tablesync worker\[\d+\] CONTEXT:  COPY rewrites, line 1/,
     "the report names the record table's COPY");
 is($subscriber->safe_psql('sync',
-        'SELECT count(*) FROM pg_repack_safe_rewrites'),
+        'SELECT count(*) FROM repack_safe.rewrites'),
     '0', "initial synchronization: the subscriber's record table stays empty");
 is($subscriber->safe_psql('sync', 'SELECT count(*) FROM t'),
     '6', 'initial synchronization: the other tables are copied');
 is($subscriber->safe_psql('sync', q{
         SELECT srsubstate FROM pg_subscription_rel
-        WHERE srrelid = 'pg_repack_safe_rewrites'::regclass}),
+        WHERE srrelid = 'repack_safe.rewrites'::regclass}),
     'd', 'initial synchronization: the record table is not synchronized');
 $publisher->safe_psql('postgres', 'INSERT INTO other VALUES (3)');
 $publisher->wait_for_catchup('sub_sync');
@@ -281,14 +283,14 @@ is($subscriber->safe_psql('sync', 'SELECT count(*) FROM other'),
 # The same two recovery steps end the retries.
 $publisher->safe_psql('postgres', q{
     ALTER PUBLICATION pub_sync
-        SET ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites)
+        SET ALL TABLES EXCEPT (TABLE repack_safe.rewrites)
 });
 $subscriber->safe_psql('sync',
     'ALTER SUBSCRIPTION sub_sync REFRESH PUBLICATION');
 $subscriber->wait_for_subscription_sync($publisher, 'sub_sync', 'sync');
 is($subscriber->safe_psql('sync', q{
         SELECT count(*) FROM pg_subscription_rel
-        WHERE srrelid = 'pg_repack_safe_rewrites'::regclass}),
+        WHERE srrelid = 'repack_safe.rewrites'::regclass}),
     '0', 'after the refresh, the record table is not in the subscription');
 
 # A replicated TRUNCATE. The apply worker truncates without the TRUNCATE
@@ -311,7 +313,7 @@ $subscriber->safe_psql('truncated', q{
 });
 $subscriber->safe_psql('truncated', 'REPACK (CONCURRENTLY) local');
 is($subscriber->safe_psql('truncated',
-        'SELECT count(*) FROM pg_repack_safe_rewrites'),
+        'SELECT count(*) FROM repack_safe.rewrites'),
     '1', 'replicated TRUNCATE: the subscriber has a record of its own');
 $subscriber->safe_psql('truncated', qq{
     CREATE SUBSCRIPTION sub_truncate CONNECTION '$connstr'
@@ -319,8 +321,8 @@ $subscriber->safe_psql('truncated', qq{
 });
 $logOffset = -s $subscriber->logfile;
 $publisher->safe_psql('postgres', q{
-    SET pg_repack_safe.allow_unprotected_drop = on;
-    TRUNCATE pg_repack_safe_rewrites;
+    SET pg_repack_safe.allow_unprotected_removal = on;
+    TRUNCATE repack_safe.rewrites;
 });
 $publisher->safe_psql('postgres', 'INSERT INTO other VALUES (4)');
 
@@ -329,10 +331,10 @@ my $truncateErrors = q{(SELECT apply_error_count
                         WHERE subname = 'sub_truncate')};
 $subscriber->poll_query_until('truncated', qq{
     SELECT $truncateErrors >= 2
-        OR NOT EXISTS (SELECT 1 FROM pg_repack_safe_rewrites)
+        OR NOT EXISTS (SELECT 1 FROM repack_safe.rewrites)
 }) or die 'the subscriber neither refused nor applied the TRUNCATE';
 is($subscriber->safe_psql('truncated',
-        'SELECT count(*) FROM pg_repack_safe_rewrites'),
+        'SELECT count(*) FROM repack_safe.rewrites'),
     '1', "replicated TRUNCATE: the subscriber's record survives");
 $log = slurp_file($subscriber->logfile, $logOffset);
 like($log,
@@ -350,7 +352,7 @@ is($subscriber->safe_psql('truncated', 'SELECT count(*) FROM other'),
 # The same two recovery steps release the subscription.
 $publisher->safe_psql('postgres', q{
     ALTER PUBLICATION pub_truncate
-        SET ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites)
+        SET ALL TABLES EXCEPT (TABLE repack_safe.rewrites)
 });
 $subscriber->safe_psql('truncated',
     'ALTER SUBSCRIPTION sub_truncate REFRESH PUBLICATION WITH (copy_data = false)');
@@ -358,7 +360,7 @@ $publisher->wait_for_catchup('sub_truncate');
 is($subscriber->safe_psql('truncated', 'SELECT count(*) FROM other'),
     '1', 'replicated TRUNCATE: after the refresh, the later change arrives');
 is($subscriber->safe_psql('truncated',
-        'SELECT count(*) FROM pg_repack_safe_rewrites'),
+        'SELECT count(*) FROM repack_safe.rewrites'),
     '1', 'replicated TRUNCATE: after the refresh, the record is still there');
 
 $subscriber->stop;

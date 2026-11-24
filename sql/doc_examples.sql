@@ -16,29 +16,63 @@ CREATE EXTENSION pg_repack_safe;
 SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_repack_safe';
 
 -- README.md, Installation; doc/installation.md, Verifying the Installation
-SELECT pg_repack_safe_status();
+SELECT repack_safe.status();
+
+-- The same two sections: the library's version, which varies from release
+-- to release, so only its form is shown.
+SELECT module_name, version ~ '^[0-9]+\.[0-9]+\.[0-9]+$' AS has_version
+FROM pg_get_loaded_modules()
+WHERE module_name = 'pg_repack_safe';
 
 DROP EXTENSION pg_repack_safe;
 
--- README.md, Standby errors caused by pg_repack_safe. The database OID and
+-- doc/standbys.md, How to tell it was the record table. The database OID and
 -- the filenode vary from run to run, so the lookups take them from the
 -- catalogs; 1663 is pg_default. The log line they come from is checked in
 -- t/017_standby_record_cleanup.pl.
 CREATE EXTENSION pg_repack_safe;
 SELECT oid AS db_oid FROM pg_database WHERE datname = current_database() \gset
-SELECT pg_relation_filenode('pg_repack_safe_rewrites') AS rec_filenode \gset
+SELECT pg_relation_filenode('repack_safe.rewrites') AS rec_filenode \gset
 SELECT datname = current_database() AS is_this_database FROM pg_database WHERE oid = :db_oid;
 SELECT pg_filenode_relation(1663, :rec_filenode);
 
 -- The storage parameter that logs every autovacuum of the record table.
-ALTER TABLE pg_repack_safe_rewrites SET (log_autovacuum_min_duration = 0);
-SELECT reloptions FROM pg_class WHERE oid = 'pg_repack_safe_rewrites'::regclass;
+ALTER TABLE repack_safe.rewrites SET (log_autovacuum_min_duration = 0);
+SELECT reloptions FROM pg_class WHERE oid = 'repack_safe.rewrites'::regclass;
 DROP EXTENSION pg_repack_safe;
 
--- README.md, Optional pre-check
+-- doc/installation.md, Enabling the Extension: an event trigger function
+-- given a search_path of its own. CREATE EXTENSION with the trigger in
+-- place is in t/020_create_with_event_trigger.pl.
+CREATE FUNCTION log_ddl() RETURNS event_trigger LANGUAGE plpgsql
+AS $$ BEGIN END $$;
+ALTER FUNCTION log_ddl() SET search_path = public;
+SELECT proconfig FROM pg_proc WHERE oid = 'log_ddl'::regproc;
+DROP FUNCTION log_ddl();
+
+-- doc/installation.md, Optional pre-check
 SET pg_repack_safe.precheck_snapshot_age = '10min';
 SHOW pg_repack_safe.precheck_snapshot_age;
 RESET pg_repack_safe.precheck_snapshot_age;
+
+-- doc/installation.md, Optional pre-check: the setting for a role that is
+-- not a superuser, fixed by a superuser or granted to the role.
+CREATE ROLE repack_job;
+ALTER ROLE repack_job SET pg_repack_safe.precheck_snapshot_age = '10min';
+SELECT setconfig FROM pg_db_role_setting
+WHERE setrole = 'repack_job'::regrole;
+SET ROLE repack_job;
+SET pg_repack_safe.precheck_snapshot_age = -1;
+RESET ROLE;
+GRANT SET ON PARAMETER pg_repack_safe.precheck_snapshot_age TO repack_job;
+SET ROLE repack_job;
+SET pg_repack_safe.precheck_snapshot_age = -1;
+SHOW pg_repack_safe.precheck_snapshot_age;
+RESET pg_repack_safe.precheck_snapshot_age;
+RESET ROLE;
+REVOKE SET ON PARAMETER pg_repack_safe.precheck_snapshot_age FROM repack_job;
+ALTER ROLE repack_job RESET pg_repack_safe.precheck_snapshot_age;
+DROP ROLE repack_job;
 
 -- doc/installation.md, Logical Replication. wal_level is replica on the
 -- test instance, which is enough to define a publication. The recovery
@@ -46,20 +80,23 @@ RESET pg_repack_safe.precheck_snapshot_age;
 -- needs two servers and runs in t/016_publication.pl.
 CREATE EXTENSION pg_repack_safe;
 CREATE PUBLICATION my_publication
-    FOR ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites);
+    FOR ALL TABLES EXCEPT (TABLE repack_safe.rewrites);
 SELECT count(*) AS published FROM pg_publication_tables
-WHERE pubname = 'my_publication' AND tablename = 'pg_repack_safe_rewrites';
+WHERE pubname = 'my_publication' AND schemaname = 'repack_safe'
+  AND tablename = 'rewrites';
 ALTER PUBLICATION my_publication SET ALL TABLES;
 SELECT count(*) AS published FROM pg_publication_tables
-WHERE pubname = 'my_publication' AND tablename = 'pg_repack_safe_rewrites';
+WHERE pubname = 'my_publication' AND schemaname = 'repack_safe'
+  AND tablename = 'rewrites';
 ALTER PUBLICATION my_publication
-    SET ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites);
+    SET ALL TABLES EXCEPT (TABLE repack_safe.rewrites);
 SELECT count(*) AS published FROM pg_publication_tables
-WHERE pubname = 'my_publication' AND tablename = 'pg_repack_safe_rewrites';
+WHERE pubname = 'my_publication' AND schemaname = 'repack_safe'
+  AND tablename = 'rewrites';
 DROP PUBLICATION my_publication;
 DROP EXTENSION pg_repack_safe;
 
--- README.md, Removing the extension
+-- doc/removal.md
 CREATE EXTENSION pg_repack_safe;
 CREATE TABLE de_t (id int PRIMARY KEY);
 INSERT INTO de_t SELECT generate_series(1, 3);
@@ -69,27 +106,16 @@ REPACK (CONCURRENTLY) de_t;
 SELECT pid, datname, relid, command FROM pg_stat_progress_repack;
 
 -- Step 2: the query run in each database by the shell loop.
-SELECT format('database %I: schema %s', current_database(), extnamespace::regnamespace) AS found
+SELECT format('database %I', current_database()) AS found
 FROM pg_extension WHERE extname = 'pg_repack_safe';
 
--- Step 2, an extension in another schema: without the search_path the
--- record table is not found; with it, it is.
-CREATE SCHEMA ext;
-ALTER EXTENSION pg_repack_safe SET SCHEMA ext;
-SELECT extnamespace::regnamespace FROM pg_extension WHERE extname = 'pg_repack_safe';
-SELECT pg_relation_size('pg_repack_safe_rewrites') > 0 AS has_blocks;
-SET search_path = ext, public;
-SELECT pg_relation_size('pg_repack_safe_rewrites') > 0 AS has_blocks;
-RESET search_path;
-ALTER EXTENSION pg_repack_safe SET SCHEMA public;
-DROP SCHEMA ext;
-
--- Step 3. vacuum_truncate is turned off for the table first, to show that
--- the TRUNCATE option overrides it.
-SELECT pg_repack_safe_prune_records();
-ALTER TABLE pg_repack_safe_rewrites SET (vacuum_truncate = off);
-VACUUM (TRUNCATE) pg_repack_safe_rewrites;
-SELECT pg_relation_size('pg_repack_safe_rewrites') = 0 AS empty;
+-- Step 3, and README.md, Turning pg_repack_safe off. vacuum_truncate is
+-- turned off for the table first, to show that the TRUNCATE option
+-- overrides it.
+SELECT repack_safe.prune_records();
+ALTER TABLE repack_safe.rewrites SET (vacuum_truncate = off);
+VACUUM (TRUNCATE) repack_safe.rewrites;
+SELECT pg_relation_size('repack_safe.rewrites') = 0 AS empty;
 
 -- Step 3, what holds back the cleanup: nothing here.
 SELECT 'session' AS holder, pid::text AS id, backend_xmin AS xmin
@@ -106,9 +132,10 @@ UNION ALL
 SELECT 'standby feedback', application_name, backend_xmin
 FROM pg_stat_replication WHERE backend_xmin IS NOT NULL;
 
--- Step 4.
+-- Step 4, and README.md, Turning pg_repack_safe off.
 DROP EXTENSION pg_repack_safe;
 SELECT count(*) = 0 AS dropped FROM pg_extension WHERE extname = 'pg_repack_safe';
+DROP SCHEMA repack_safe;
 
 -- Step 5. The WAL position varies from run to run, so only its presence is
 -- shown here. This instance is not a standby, so the standby's check
@@ -128,12 +155,13 @@ ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements';
 ALTER SYSTEM RESET shared_preload_libraries;
 SHOW shared_preload_libraries;
 
--- The override: a drop with a record left, in one session.
+-- README.md, Turning pg_repack_safe off; doc/removal.md, the override: a
+-- drop with a record left, in one session.
 CREATE EXTENSION pg_repack_safe;
 REPACK (CONCURRENTLY) de_t;
-SELECT count(*) > 0 AS has_record FROM pg_repack_safe_rewrites;
-SET pg_repack_safe.allow_unprotected_drop = on;
+SELECT count(*) > 0 AS has_record FROM repack_safe.rewrites;
+SET pg_repack_safe.allow_unprotected_removal = on;
 DROP EXTENSION pg_repack_safe;
-RESET pg_repack_safe.allow_unprotected_drop;
+RESET pg_repack_safe.allow_unprotected_removal;
 
 DROP TABLE de_t;

@@ -49,24 +49,24 @@ $node->safe_psql('postgres', q{
 # it loads the library in this backend, which then refuses
 # REPACK (CONCURRENTLY) like any late load.
 my ($ret, $stdout, $stderr) = $node->psql('postgres', q{
-    SELECT pg_repack_safe_status();
+    SELECT repack_safe.status();
 });
-is($stdout, 'f', 'not preloaded: pg_repack_safe_status() returns false');
+is($stdout, 'f', 'not preloaded: repack_safe.status() returns false');
 like($stderr,
-    qr/WARNING:  pg_repack_safe is not in force: the server did not load it through shared_preload_libraries/,
+    qr/WARNING:  pg_repack_safe is not in force: the server did not load it through "shared_preload_libraries"/,
     'not preloaded: the warning says what is wrong');
 ($ret, $stdout, $stderr) = $node->psql('postgres', q{
-    SELECT pg_repack_safe_status();
+    SELECT repack_safe.status();
     REPACK (CONCURRENTLY) t;
 });
 like($stderr,
-    qr/REPACK \(CONCURRENTLY\) requires pg_repack_safe in shared_preload_libraries/,
+    qr/pg_repack_safe must be loaded via "shared_preload_libraries" to run REPACK \(CONCURRENTLY\)/,
     'not preloaded: after the status call, REPACK (CONCURRENTLY) is refused');
 
 # A call that loads the library warns once, not once for the load and once
 # for the call.
 ($ret, $stdout, $stderr) = $node->psql('postgres', q{
-    SELECT pg_repack_safe_status();
+    SELECT repack_safe.status();
 });
 my @warnings = ($stderr =~ /WARNING:  pg_repack_safe is not in force/g);
 is(scalar(@warnings), 1,
@@ -79,10 +79,10 @@ is(scalar(@warnings), 1,
 });
 is($ret, 0, 'library loaded with LOAD: the load succeeds');
 like($stderr,
-    qr/WARNING:  pg_repack_safe is not in force: the server did not load it through shared_preload_libraries/,
+    qr/WARNING:  pg_repack_safe is not in force: the server did not load it through "shared_preload_libraries"/,
     'library loaded with LOAD: the load warns');
 like($stderr,
-    qr/HINT:  Add pg_repack_safe to shared_preload_libraries and restart the server\./,
+    qr/HINT:  Add "pg_repack_safe" to "shared_preload_libraries" and restart the server\./,
     'library loaded with LOAD: the hint names shared_preload_libraries');
 unlike($stderr, qr/session_preload_libraries/,
     'library loaded with LOAD: the warning does not blame session_preload_libraries');
@@ -93,7 +93,7 @@ unlike($stderr, qr/session_preload_libraries/,
 });
 isnt($ret, 0, 'library loaded with LOAD: REPACK (CONCURRENTLY) refused');
 like($stderr,
-    qr/REPACK \(CONCURRENTLY\) requires pg_repack_safe in shared_preload_libraries/,
+    qr/pg_repack_safe must be loaded via "shared_preload_libraries" to run REPACK \(CONCURRENTLY\)/,
     'library loaded with LOAD: the error names the setting');
 
 # Firing a trigger of the record table loads the library for its C function.
@@ -101,14 +101,14 @@ like($stderr,
 # table is empty.
 ($ret, $stdout, $stderr) = $node->psql('postgres', q{
     BEGIN;
-    TRUNCATE pg_repack_safe_rewrites;
+    TRUNCATE repack_safe.rewrites;
     ROLLBACK;
     REPACK (CONCURRENTLY) t;
 });
 isnt($ret, 0,
     'library loaded by a trigger function: REPACK (CONCURRENTLY) refused');
 like($stderr,
-    qr/REPACK \(CONCURRENTLY\) requires pg_repack_safe in shared_preload_libraries/,
+    qr/pg_repack_safe must be loaded via "shared_preload_libraries" to run REPACK \(CONCURRENTLY\)/,
     'library loaded by a trigger function: the error names the setting');
 
 $node->append_conf('postgresql.conf',
@@ -119,30 +119,30 @@ $node->reload;
 isnt($ret, 0,
     'library in session_preload_libraries: REPACK (CONCURRENTLY) refused');
 like($stderr,
-    qr/REPACK \(CONCURRENTLY\) requires pg_repack_safe in shared_preload_libraries/,
+    qr/pg_repack_safe must be loaded via "shared_preload_libraries" to run REPACK \(CONCURRENTLY\)/,
     'library in session_preload_libraries: the error names the setting');
 
 # Each connection loads the library at start, and the load warns. The
 # detail names the setting the administrator used and says what it misses.
 like($stderr,
-    qr/WARNING:  pg_repack_safe is not in force: the server did not load it through shared_preload_libraries/,
+    qr/WARNING:  pg_repack_safe is not in force: the server did not load it through "shared_preload_libraries"/,
     'library in session_preload_libraries: the connection warns');
 like($stderr,
-    qr/DETAIL:  pg_repack_safe is listed in session_preload_libraries, which background workers do not load/,
+    qr/DETAIL:  pg_repack_safe is listed in "session_preload_libraries", which background workers do not load/,
     'library in session_preload_libraries: the detail names the setting');
 like($stderr,
-    qr/HINT:  Move pg_repack_safe from session_preload_libraries to shared_preload_libraries and restart the server\./,
+    qr/HINT:  Move "pg_repack_safe" from "session_preload_libraries" to "shared_preload_libraries" and restart the server\./,
     'library in session_preload_libraries: the hint says what to change');
 
 # Not tested: the same for local_preload_libraries (see the header).
 
 # The status function gives the same cause.
 ($ret, $stdout, $stderr) = $node->psql('postgres', q{
-    SELECT pg_repack_safe_status();
+    SELECT repack_safe.status();
 });
 is($stdout, 'f',
-    'library in session_preload_libraries: pg_repack_safe_status() returns false');
-@warnings = ($stderr =~ /DETAIL:  pg_repack_safe is listed in session_preload_libraries/g);
+    'library in session_preload_libraries: repack_safe.status() returns false');
+@warnings = ($stderr =~ /DETAIL:  pg_repack_safe is listed in "session_preload_libraries"/g);
 is(scalar(@warnings), 2,
     'library in session_preload_libraries: the connection and the status call both name the setting');
 
@@ -169,7 +169,7 @@ isnt($node->safe_psql('postgres', q{SELECT pg_relation_filenode('t')}),
     $filenodeBefore,
     'KNOWN GAP: session_preload_libraries, the worker replaced the storage');
 is($node->safe_psql('postgres',
-        'SELECT count(*) FROM pg_repack_safe_rewrites'),
+        'SELECT count(*) FROM repack_safe.rewrites'),
     '0',
     'KNOWN GAP: session_preload_libraries, the worker wrote no record');
 
@@ -181,11 +181,11 @@ $node->reload;
   $node->psql('postgres', 'REPACK (CONCURRENTLY) t');
 is($ret, 0, 'KNOWN GAP: library never loaded, REPACK (CONCURRENTLY) runs');
 is($node->safe_psql('postgres',
-        'SELECT count(*) FROM pg_repack_safe_rewrites'),
+        'SELECT count(*) FROM repack_safe.rewrites'),
     '0', 'KNOWN GAP: library never loaded, no record is written');
 
 # Where the library cannot be installed, PostgreSQL itself can switch
-# REPACK (CONCURRENTLY) off for the whole server (README, "Without the
+# REPACK (CONCURRENTLY) off for the whole server (doc/limits.md, "Without the
 # extension"): it needs a replication slot from a pool of its own, and
 # refuses when that pool is empty. REPACK without CONCURRENTLY, which is
 # MVCC-safe, does not use it.
@@ -226,7 +226,7 @@ $node->stop;
         'completed',
         'preloaded: a background worker runs REPACK (CONCURRENTLY)');
     is($preloaded->safe_psql('postgres',
-            q{SELECT count(*) > 0 FROM pg_repack_safe_rewrites
+            q{SELECT count(*) > 0 FROM repack_safe.rewrites
               WHERE relid = 't'::regclass}),
         't', 'preloaded: the background worker\'s REPACK (CONCURRENTLY) is recorded');
     $preloaded->stop;
@@ -234,8 +234,8 @@ $node->stop;
 
 # Known gap, pinned: the refusal to drop the extension while its record
 # table holds records is in the library's object access hook, so a server
-# that no longer preloads the library drops it anyway (README, "Removing the
-# extension", step 5). The same drop on the same records is refused while
+# that no longer preloads the library drops it anyway (doc/removal.md,
+# step 5). The same drop on the same records is refused while
 # the library is preloaded.
 {
     my $unloaded = PostgreSQL::Test::Cluster->new('unloaded_drop');
@@ -250,7 +250,7 @@ $node->stop;
         REPACK (CONCURRENTLY) t;
     });
     is($unloaded->safe_psql('postgres',
-            'SELECT count(*) > 0 FROM pg_repack_safe_rewrites'),
+            'SELECT count(*) > 0 FROM repack_safe.rewrites'),
         't', 'preloaded: REPACK (CONCURRENTLY) wrote a record');
     ($ret, $stdout, $stderr) =
       $unloaded->psql('postgres', 'DROP EXTENSION pg_repack_safe');
@@ -260,7 +260,7 @@ $node->stop;
         "shared_preload_libraries = ''\n");
     $unloaded->restart;
     is($unloaded->safe_psql('postgres',
-            'SELECT count(*) > 0 FROM pg_repack_safe_rewrites'),
+            'SELECT count(*) > 0 FROM repack_safe.rewrites'),
         't', 'not preloaded: the record is still there');
     ($ret, $stdout, $stderr) =
       $unloaded->psql('postgres', 'DROP EXTENSION pg_repack_safe');

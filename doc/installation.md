@@ -1,23 +1,42 @@
 # Installation Guide
 
-## Prerequisites
+## Requirements
 
-- **PostgreSQL**: version 19, with `wal_level = replica` or higher
-  (`REPACK (CONCURRENTLY)` requires it)
-- **Build tools**: GCC or Clang with C99 support, and `make`
-- **PostgreSQL development headers** (`pg_config --includedir-server` must
-  resolve):
-  - Debian/Ubuntu: `postgresql-server-dev-19`
-  - Red Hat/CentOS: `postgresql19-devel`
-  - Source build: installed with the server
+`make install` only copies the library and the extension's files into the
+PostgreSQL installation on the machine where it runs. It changes no
+setting and no database, so each item below is done by hand, in the section
+named:
 
-```bash
-pg_config --version      # PostgreSQL 19.x
-```
+- PostgreSQL 19 with `wal_level = replica` or higher, which
+  `REPACK (CONCURRENTLY)` itself requires; `replica` is PostgreSQL's
+  default.
+- The library, from the same major version (the same first part,
+  `1.x.y`), installed on the primary and on every server that replays its
+  WAL ([Building from Source](#building-from-source)); during an upgrade,
+  the standbys get the new build first
+  ([Verifying the Installation](#verifying-the-installation)).
+- The library in `shared_preload_libraries` on each of those servers, and a
+  restart ([Configuring the Servers](#configuring-the-servers)).
+- The extension created in every database where `REPACK (CONCURRENTLY)`
+  runs ([Enabling the Extension](#enabling-the-extension)).
+- Recommended: `hot_standby_feedback = on` on every hot standby that runs
+  queries ([Configuring the Servers](#configuring-the-servers)).
+
+What is lost when one of them is not met is in
+[limits.md](limits.md#if-the-requirements-are-not-met).
 
 ## Building from Source
 
+To build you need:
+
+- GCC or Clang with C99 support, and `make`;
+- the PostgreSQL 19 development headers (`pg_config --includedir-server`
+  must resolve): `postgresql-server-dev-19` on Debian and Ubuntu,
+  `postgresql19-devel` on Red Hat and CentOS, and installed with the server
+  for a source build.
+
 ```bash
+pg_config --version      # PostgreSQL 19.x
 git clone https://github.com/datastone-inc/pg_repack_safe.git
 cd pg_repack_safe
 make
@@ -32,34 +51,50 @@ make PG_CONFIG=/path/to/bin/pg_config
 make install PG_CONFIG=/path/to/bin/pg_config
 ```
 
-Install the same build on the primary and on every standby.
+Run `make install`, or install the package, on the primary and on every
+physical standby, from the same major version of the library.
 
 ## Configuring the Servers
 
-On the primary **and on every physical standby** (and any other server that
-replays this primary's WAL), in `postgresql.conf`:
+On the primary and on every physical standby, and on any other server that
+replays this primary's WAL (a restore of a base backup, a clone), in
+`postgresql.conf`:
 
 ```ini
 shared_preload_libraries = 'pg_repack_safe'   # add to any existing list
 ```
 
-and restart. `session_preload_libraries` or `local_preload_libraries`
-will not do: background workers never load them, so a
-`REPACK (CONCURRENTLY)` run from one (a scheduled job, for instance) is
-neither refused nor recorded. Each session that loads the library through
-them gets a `WARNING` that names the setting.
+and restart. Add the library to any libraries already listed there, such as
+`'pg_stat_statements, pg_repack_safe'`; replacing the list unloads them.
+
+`session_preload_libraries` and `local_preload_libraries` will not do.
+Background workers, which schedulers such as pg_cron can run SQL in, never
+load them, so a `REPACK (CONCURRENTLY)` run from one is neither refused nor
+recorded. Each session that loads the library through them gets a `WARNING`
+that names the setting, and `REPACK (CONCURRENTLY)` is refused in a session
+that loaded the library any other way than `shared_preload_libraries`.
 
 Restart the standbys first: once `REPACK (CONCURRENTLY)` runs on the
 primary, it writes a WAL record of the extension's own, and a standby
 without the library fails on it and shuts down ("resource manager with
 ID 149 not registered"). That is deliberate: such a standby could not check
-its reads. Restart it with the library and it resumes replay.
+its reads. Restart it with the library and it resumes replay. The one
+standby this does not stop is one whose replay starts between a repack's
+swap and its commit
+([limits.md](limits.md#if-the-requirements-are-not-met)).
 
 On hot standbys that run queries, also set `hot_standby_feedback = on`,
-ideally with a physical replication slot. It prevents a stock PostgreSQL
-problem the extension does not cover: `VACUUM FULL`, `CLUSTER` and plain
-`REPACK` on the primary can otherwise drop rows a standby query still
-needs (README, "What pg_repack_safe does not guarantee").
+ideally with a physical replication slot. It does two things:
+
+- It prevents a stock PostgreSQL problem the extension does not cover:
+  `VACUUM FULL`, `CLUSTER` and plain `REPACK` on the primary can otherwise
+  drop rows a standby query still needs
+  ([What pg_repack_safe does not guarantee](../README.md#what-pg_repack_safe-does-not-guarantee)).
+- It keeps standby snapshots from being ended when the record table is
+  cleaned up ([standbys.md](standbys.md)).
+
+One standby with feedback holds the primary's cleanup back for every
+standby.
 
 ## Enabling the Extension
 
@@ -73,14 +108,82 @@ CREATE EXTENSION pg_repack_safe;
 and in a session where the library was loaded other than through
 `shared_preload_libraries`.
 
-The extension creates the table `pg_repack_safe_rewrites` in its schema.
-It needs a superuser to create. Its settings:
+The extension needs a superuser to create. Its table, `repack_safe.rewrites`,
+and its functions are always in the schema `repack_safe`: PostgreSQL
+reserves schema names that start with `pg_`, so the schema cannot carry the
+extension's name. `CREATE EXTENSION` creates the schema and lets every role
+look names up in it (`USAGE`), which `repack_safe.status()` needs; the table
+and the other functions are for superusers. The extension cannot be created
+in another schema or moved to one.
+
+If a schema `repack_safe` already exists, the extension is created in it
+only if a superuser owns it; otherwise `CREATE EXTENSION` fails with
+`schema "repack_safe" must be owned by a superuser`, since the schema's
+owner could drop the record table once it is empty, after which every
+query in the database is refused. The install script makes this check in
+PL/pgSQL, so the extension requires `plpgsql`, which every database has
+unless it was dropped. The schema can be renamed afterwards
+(`ALTER SCHEMA repack_safe RENAME TO ...`) and the guard keeps working; the
+commands in this documentation then need the new name
+(`t/022_record_table_rename.pl`).
+
+PostgreSQL runs the extension's install script with `repack_safe` and
+`pg_catalog` as the `search_path`. In a database with DDL event triggers,
+their functions run for each command of the script, so a function that
+names a table without its schema fails there and `CREATE EXTENSION` fails
+with it (`relation "..." does not exist`), leaving nothing behind. Name the
+table with its schema in the function, or give the function a
+`search_path` of its own, then create the extension again
+(`t/020_create_with_event_trigger.pl`):
+
+```sql
+ALTER FUNCTION log_ddl() SET search_path = public;
+```
+
+Its settings:
 
 | Setting | Default | Who | Meaning |
 | --- | --- | --- | --- |
-| `pg_repack_safe.precheck_snapshot_age` | `-1` (off) | any user | refuse `REPACK (CONCURRENTLY)` while a session could later read the table with an older snapshot; a time (milliseconds without a unit, or e.g. `'10min'`), `0` for any age (README, "Optional pre-check") |
-| `pg_repack_safe.allow_unprotected_drop` | `off` | superuser | let `DROP` and `TRUNCATE` remove the record table, its triggers or the extension, and let the record table be renamed or moved to another schema, while the record table holds records; old snapshots then read repacked tables as empty (README, "Removing the extension") |
+| `pg_repack_safe.precheck_snapshot_age` | `-1` (off) | superuser | refuse `REPACK (CONCURRENTLY)` while a session could later read the table with an older snapshot; a time (milliseconds without a unit, or e.g. `'10min'`), `0` for any age ([Optional pre-check](#optional-pre-check)) |
+| `pg_repack_safe.allow_unprotected_removal` | `off` | superuser | let `DROP` and `TRUNCATE` remove the record table, its triggers or the extension, and let the record table be renamed or moved to another schema, while the record table holds records; old snapshots then read repacked tables as empty ([removal.md](removal.md)) |
 | `pg_repack_safe.trace_storage_changes` | `off` | superuser | report each detected replacement of a table's storage as a NOTICE (diagnostics) |
+
+## Optional pre-check
+
+The reader guard turns a wrong result into an error, which a long report or
+transaction may still not want: it fails, and its work is lost. With
+`pg_repack_safe.precheck_snapshot_age` set (off by default, `-1`),
+`REPACK (CONCURRENTLY)` instead refuses to run, at its start and again just
+before it swaps the table, while a session in the same database could later
+read the table with an older snapshot:
+
+```sql
+SET pg_repack_safe.precheck_snapshot_age = '10min';
+```
+
+The setting is for superusers, so that a role cannot turn off a check the
+administrator configured. To apply it to the role that runs the repacks, a
+superuser sets it for that role:
+
+```sql
+ALTER ROLE repack_job SET pg_repack_safe.precheck_snapshot_age = '10min';
+```
+
+`GRANT SET ON PARAMETER pg_repack_safe.precheck_snapshot_age TO repack_job`
+instead lets the role choose the value itself, including `-1`.
+
+A session counts when it holds a snapshot that outlives a statement (idle
+in a transaction, or past the first statement of its transaction), holds no
+lock on the table (`REPACK` waits for those), and its transaction has been
+open at least that long (`0`: any age). A single statement, however long,
+does not count: it locked every table it reads when it started.
+`pg_dump` locks every table it dumps right after taking its snapshot, so a
+running dump is waited for, not counted.
+
+This check is best-effort, not part of the guarantee. It does not see
+standbys, background workers, or snapshots taken after it runs, and since
+it cannot see a session's isolation level, it also counts later statements
+of a `READ COMMITTED` transaction, which would not have been hurt.
 
 ## Upgrading PostgreSQL
 
@@ -106,14 +209,14 @@ would refuse reads of whichever table now has its OID. Nothing is lost by
 leaving the records behind, because no snapshot survives a dump and
 restore.
 
-For the same reason, rows of `pg_repack_safe_rewrites` cannot be copied
+For the same reason, rows of `repack_safe.rewrites` cannot be copied
 from one database to another, even within one cluster, where relation OIDs
 differ between databases: every `INSERT` and `COPY ... FROM` into the table
 is refused, and only `REPACK (CONCURRENTLY)` writes records.
 
 ## Logical Replication
 
-Keep `pg_repack_safe_rewrites` out of every publication. As with a dump, a
+Keep `repack_safe.rewrites` out of every publication. As with a dump, a
 record's relation OID and transaction ID mean something only in the cluster
 that wrote them. On a subscriber the OID belongs to some other table, or to
 none, and the transaction ID may not have been assigned there yet.
@@ -123,19 +226,18 @@ other table. Exclude it when creating the publication:
 
 ```sql
 CREATE PUBLICATION my_publication
-    FOR ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites);
+    FOR ALL TABLES EXCEPT (TABLE repack_safe.rewrites);
 ```
 
 or afterwards (the list replaces any earlier `EXCEPT` list):
 
 ```sql
 ALTER PUBLICATION my_publication
-    SET ALL TABLES EXCEPT (TABLE pg_repack_safe_rewrites);
+    SET ALL TABLES EXCEPT (TABLE repack_safe.rewrites);
 ```
 
-`FOR TABLES IN SCHEMA` has no `EXCEPT`: do not publish the schema the
-extension is installed in, or move the extension to another schema with
-`ALTER EXTENSION pg_repack_safe SET SCHEMA`.
+`FOR TABLES IN SCHEMA` has no `EXCEPT`: do not publish the schema
+`repack_safe`.
 
 If the table is published all the same (`t/016_publication.pl`):
 
@@ -176,7 +278,7 @@ To recover, in this order:
 
 A subscriber without the extension has no such table. Its apply worker
 stops with PostgreSQL's own error, `logical replication target relation
-"public.pg_repack_safe_rewrites" does not exist`, so the exclusion is
+"repack_safe.rewrites" does not exist`, so the exclusion is
 needed there too.
 
 ## Other Extensions
@@ -189,7 +291,7 @@ order (`t/004_hook_chain.pl` with `pg_stat_statements`,
 extension, the optional pre-check, a refused `COPY ... TO`) is not passed on
 to the hooks of libraries loaded before it: it must not run at all.
 Libraries loaded before it also see `COPY partitioned_table TO` in the form
-it is run in, `COPY (SELECT ...) TO` (README, "How it works").
+it is run in, `COPY (SELECT ...) TO` ([design.md](design.md#copy-of-a-partitioned-table)).
 
 A library listed after `pg_repack_safe` in `shared_preload_libraries` sees
 every statement first, the refused ones included. So list `pg_repack_safe`
@@ -208,7 +310,7 @@ It registers a custom WAL resource manager with ID 149, reserved for
 On each server, and in each database with the extension:
 
 ```sql
-SELECT pg_repack_safe_status();
+SELECT repack_safe.status();
 ```
 
 It must return `t`. With `f`, and a `WARNING` that says why, the server did
@@ -218,6 +320,27 @@ guards nothing there. If the library is in `session_preload_libraries` or
 Nothing else reports this state: the extension is still listed by `\dx`,
 and `REPACK (CONCURRENTLY)` runs without an error.
 
+The primary and its standbys must run the library from the same major
+version (the same first part, `1.x.y`). Both read the WAL record that each
+`REPACK (CONCURRENTLY)` writes and the record table, and the first part
+changes only when the format of either does; a library supports every
+extension version of its major version. To upgrade, install the new build
+on the standbys first, then on the primary, and run any `ALTER EXTENSION
+UPDATE` last: a standby is then never older than the SQL objects it
+replays. On each server, with or without the extension in the database:
+
+```sql
+SELECT module_name, version FROM pg_get_loaded_modules()
+WHERE module_name = 'pg_repack_safe';
+```
+
+A server that preloads the library also writes
+`pg_repack_safe <version> loaded` to its log at each start, which shows
+afterwards which build it ran and since when. The library's version (three
+parts) names the build; the extension's version in `\dx` (its first two
+parts) names its SQL objects and changes only when they do, so a new build of the library needs no `ALTER EXTENSION
+UPDATE` unless its release notes say so.
+
 To run the test suites:
 
 ```bash
@@ -226,18 +349,15 @@ make installcheck
 
 This does not use the server that `PGHOST`/`PGPORT` point at: the test
 suites start their own temporary servers from the installed binaries (see
-[development.md](development.md)). It also installs four test-only modules,
-`custom_scan_provider`, `oat_observer`, `test_record` and `toplevel_worker`,
-into the PostgreSQL library directory;
-`make install` does not. `test_record` can write arbitrary rows into a
-record table, which the extension otherwise refuses, so do not run
-`make installcheck` against the installation of a production server.
+[development.md](development.md)). It installs nothing: the test-only
+modules under `test/modules/` are built there and the temporary servers
+load them from there.
 
 ## Removing the Extension
 
-See the README, "Removing the extension": dropping it is refused while its
+See [removal.md](removal.md): dropping it is refused while its
 record table holds records, deleted ones included, and the safe order is to
-delete the records with `pg_repack_safe_prune_records()`, vacuum the record
+delete the records with `repack_safe.prune_records()`, vacuum the record
 table until it is empty, and drop the extension. Removing the library from
 `shared_preload_libraries` afterwards is optional: kept, it refuses
 `REPACK (CONCURRENTLY)` in every database; removed, the command runs

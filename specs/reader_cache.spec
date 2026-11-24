@@ -24,7 +24,7 @@
 #   would fail.
 #
 # - o_truncate: the one SQL statement that can change the records, a
-#   TRUNCATE under pg_repack_safe.allow_unprotected_drop. The reader, whose
+#   TRUNCATE under pg_repack_safe.allow_unprotected_removal. The reader, whose
 #   cache holds the record and whose snapshot needs it, then reads t as
 #   empty: that is what the override gives up. Its cache learns of the
 #   TRUNCATE from the invalidation PostgreSQL sends for the table's new
@@ -64,9 +64,9 @@ step p_repack    { REPACK (CONCURRENTLY) t; }
 session other
 step o_begin     { BEGIN; }
 step o_replica   { SET session_replication_role = replica; BEGIN; }
-step o_record    { SELECT test_insert_record('pg_repack_safe_rewrites', 't'::regclass, pg_current_xact_id()); }
+step o_record    { SELECT test_insert_record('repack_safe.rewrites', 't'::regclass, pg_current_xact_id()); }
 step o_commit    { COMMIT; RESET session_replication_role; }
-step o_truncate  { SET pg_repack_safe.allow_unprotected_drop = on; TRUNCATE pg_repack_safe_rewrites; RESET pg_repack_safe.allow_unprotected_drop; }
+step o_truncate  { SET pg_repack_safe.allow_unprotected_removal = on; TRUNCATE repack_safe.rewrites; RESET pg_repack_safe.allow_unprotected_removal; }
 
 # Cache loaded with no record for t.
 permutation r_warm r_begin p_repack r_t r_commit

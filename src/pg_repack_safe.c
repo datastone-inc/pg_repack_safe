@@ -28,9 +28,7 @@
  *   extension unable to find it.
  * - ProcessUtility_hook: classifies the innermost utility statement. Only
  *   REPACK with the CONCURRENTLY option counts as an unsafe rewriter, and it
- *   is refused unless the record table exists and is locked first. ALTER
- *   EXTENSION pg_repack_safe SET SCHEMA is the one statement that may move
- *   the record table to another schema while it holds records. COPY
+ *   is refused unless the record table exists and is locked first. COPY
  *   relation TO, which reads outside the executor, gets the reader check
  *   here; for a partitioned table it is turned into COPY (query) TO, which
  *   the executor hook checks.
@@ -63,8 +61,8 @@
  *   the server preloaded the library.
  * - Hooks. The three above.
  * - Module load. _PG_init defines the GUCs, registers the WAL resource
- *   manager when loaded through shared_preload_libraries (and warns when
- *   not), and installs the hooks.
+ *   manager and logs the library's version when loaded through
+ *   shared_preload_libraries (and warns when not), and installs the hooks.
  */
 
 #include "postgres.h"
@@ -108,6 +106,7 @@
 #include "storage/proc.h"
 #include "storage/sinval.h"
 #include "utils/backend_status.h"
+#include "utils/builtins.h"
 #include "utils/timestamp.h"
 #include "tcop/utility.h"
 #include "utils/fmgroids.h"
@@ -123,17 +122,32 @@
 #include "utils/varlena.h"
 #include "utils/xid8.h"
 
-PG_MODULE_MAGIC;
+#define EXTENSION_NAME "pg_repack_safe"
+
+/*
+ * The library's version, which pg_get_loaded_modules() reports in every
+ * backend that loaded it and the postmaster logs when it preloads it
+ * (_PG_init). It names the build, so that an operator can compare the
+ * primary with its standbys; the extension's version in pg_extension names
+ * the SQL objects and changes only when they do.
+ */
+#define PG_REPACK_SAFE_VERSION "1.0.0"
+
+PG_MODULE_MAGIC_EXT(.name = EXTENSION_NAME, .version = PG_REPACK_SAFE_VERSION);
 
 PG_FUNCTION_INFO_V1(pg_repack_safe_records_writer_only);
 PG_FUNCTION_INFO_V1(pg_repack_safe_records_protected);
 PG_FUNCTION_INFO_V1(pg_repack_safe_prune_records);
 PG_FUNCTION_INFO_V1(pg_repack_safe_status);
 
-#define EXTENSION_NAME "pg_repack_safe"
-#define RECORD_TABLE_NAME "pg_repack_safe_rewrites"
-#define WRITER_ONLY_TRIGGER_FUNCTION "pg_repack_safe_records_writer_only"
-#define PROTECTED_TRIGGER_FUNCTION "pg_repack_safe_records_protected"
+/*
+ * The names the install script gives the record table and its two trigger
+ * functions, all in the extension's schema. The C functions behind the
+ * trigger functions keep the library's prefix.
+ */
+#define RECORD_TABLE_NAME "rewrites"
+#define WRITER_ONLY_TRIGGER_FUNCTION "records_writer_only"
+#define PROTECTED_TRIGGER_FUNCTION "records_protected"
 
 /*
  * Custom WAL resource manager. The ID is the one reserved for pg_repack_safe
@@ -178,7 +192,7 @@ static bool traceStorageChanges = false;
  * extension, and let the record table be renamed or moved to another
  * schema, while the record table holds records.
  */
-static bool allowUnprotectedDrop = false;
+static bool allowUnprotectedRemoval = false;
 
 /*
  * GUC: refuse REPACK (CONCURRENTLY) while a session holds a snapshot of at
@@ -205,14 +219,6 @@ static Oid rewriterRecordTable = InvalidOid;
  * it.
  */
 static bool inMvccSafeRewriter = false;
-
-/*
- * True while the innermost utility statement is ALTER EXTENSION
- * pg_repack_safe SET SCHEMA, which moves the extension and its member
- * objects together (protectRecordTableName,
- * protectRecordTableFromExtensionMove).
- */
-static bool inExtensionSchemaMove = false;
 
 /**
  * @brief Tell whether the innermost utility statement is an unsafe rewriter
@@ -426,15 +432,13 @@ recordTableCacheCallback(Datum arg, int cacheid, uint32 hashvalue)
  * (CONCURRENTLY) is never exempt, so no unsafe rewrite can happen in either
  * state.
  *
- * - Binary-upgrade mode, decided by the developer (fix-design.md section
- *   6b). pg_dump creates the extension empty (pg_dump.c,
+ * - Binary-upgrade mode. pg_dump creates the extension empty (pg_dump.c,
  *   binary_upgrade_create_empty_extension), adds the record table in a
  *   later statement and its triggers after that, and runs queries in
  *   between (t/003_pg_upgrade.pl fails without the exemption). Only
  *   superusers can connect in that mode (postinit.c).
- * - A script of this extension, decided by the developer (fix-design.md
- *   section 6b), run by CREATE EXTENSION or ALTER EXTENSION UPDATE in this
- *   backend (extension.c, execute_extension_script, sets
+ * - A script of this extension, run by CREATE EXTENSION or ALTER EXTENSION
+ *   UPDATE in this backend (extension.c, execute_extension_script, sets
  *   creating_extension and CurrentExtensionObject for the script and
  *   clears them however it ends). The install script creates the table in
  *   one command and its triggers in later ones, and an event trigger
@@ -513,9 +517,9 @@ lookupRecordTable(RecordTableUse use)
 
       ereport(ERROR,
               (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-               errmsg("pg_repack_safe cannot find its record table"),
-               errdetail("The extension \"%s\" exists in this database, but the table \"%s\" is not in its schema.",
-                         EXTENSION_NAME, RECORD_TABLE_NAME),
+               errmsg("record table \"%s\" of extension \"%s\" does not exist",
+                      RECORD_TABLE_NAME, EXTENSION_NAME),
+               errdetail("The extension exists in this database, but no table of that name is in its schema."),
                errhint("Restore the table's name and schema, or drop and re-create the extension, which discards its records.")));
     }
     recordTableOid = tableOid;
@@ -591,10 +595,12 @@ checkRecordTableDefinition(Relation rel, RecordTableUse use)
                          TRIGGER_TYPE_BEFORE, TRIGGER_TYPE_INSERT)))
     ereport(ERROR,
             (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-             errmsg("pg_repack_safe cannot use its record table"),
-             errdetail("The table \"%s\" does not have both of its triggers, enabled ALWAYS.",
-                       RECORD_TABLE_NAME),
-             errhint("Drop and re-create the extension. That discards its records, so do it when no transaction older than the last REPACK (CONCURRENTLY) remains; while the record table holds records the drop needs pg_repack_safe.allow_unprotected_drop.")));
+             errmsg("cannot use the record table of extension \"%s\"",
+                    EXTENSION_NAME),
+             errdetail("The table \"%s.%s\" does not have both of its triggers, enabled ALWAYS.",
+                       get_namespace_name(RelationGetNamespace(rel)),
+                       RelationGetRelationName(rel)),
+             errhint("Drop and re-create the extension. That discards its records, so do it when no transaction older than the last REPACK (CONCURRENTLY) remains; while the record table holds records the drop needs \"pg_repack_safe.allow_unprotected_removal\".")));
 
   if (rel->rd_rel->relkind != RELKIND_RELATION ||
       rel->rd_tableam != GetHeapamTableAmRoutine() ||
@@ -605,10 +611,12 @@ checkRecordTableDefinition(Relation rel, RecordTableUse use)
       TupleDescAttr(desc, 1)->atttypid != XID8OID)
     ereport(ERROR,
             (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-             errmsg("pg_repack_safe cannot use its record table"),
-             errdetail("The table \"%s\" does not have the definition the extension created.",
-                       RECORD_TABLE_NAME),
-             errhint("Drop and re-create the extension. That discards its records, so do it when no transaction older than the last REPACK (CONCURRENTLY) remains; while the record table holds records the drop needs pg_repack_safe.allow_unprotected_drop.")));
+             errmsg("cannot use the record table of extension \"%s\"",
+                    EXTENSION_NAME),
+             errdetail("The table \"%s.%s\" does not have the definition the extension created.",
+                       get_namespace_name(RelationGetNamespace(rel)),
+                       RelationGetRelationName(rel)),
+             errhint("Drop and re-create the extension. That discards its records, so do it when no transaction older than the last REPACK (CONCURRENTLY) remains; while the record table holds records the drop needs \"pg_repack_safe.allow_unprotected_removal\".")));
 }
 
 /* ----------------------------------------------------------------
@@ -956,8 +964,8 @@ containsCustomScan(PlanState *planstate, void *context)
  * @return True if a range-table relation the started executor has not
  *         opened is not read by the query
  *
- * Checking only the opened relations is the developer's decision
- * (fix-design.md section 6b); the argument for it:
+ * Only the opened relations are checked, so that a query is not refused
+ * for a table it names and does not read. They are all the query reads:
  *
  * A plan node reads a range-table relation through the Relation that
  * ExecGetRangeTableRelation (execUtils.c) opens and stores in
@@ -1256,9 +1264,9 @@ lockRecordTableForWriter(void)
   if (!loadedAtServerStart)
     ereport(ERROR,
             (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-             errmsg("REPACK (CONCURRENTLY) requires pg_repack_safe in shared_preload_libraries"),
+             errmsg("pg_repack_safe must be loaded via \"shared_preload_libraries\" to run REPACK (CONCURRENTLY)"),
              errdetail("The library was loaded in this session only, so other sessions may not check their reads against the rewrite."),
-             errhint("Add pg_repack_safe to shared_preload_libraries and restart the server.")));
+             errhint("Add \"pg_repack_safe\" to \"shared_preload_libraries\" and restart the server.")));
 
   tableOid = lockRecordTableForChange();
   if (!OidIsValid(tableOid))
@@ -1321,8 +1329,8 @@ pidsLockingRelation(Oid relid)
  *
  * The error does not identify the session: pg_stat_activity hides another
  * role's process ID and transaction start from users without
- * pg_read_all_stats, and any table owner can set
- * pg_repack_safe.precheck_snapshot_age.
+ * pg_read_all_stats, and a table's owner, who may run REPACK (CONCURRENTLY)
+ * on it, need not have that role.
  */
 static void
 precheckOldSnapshots(Oid relid, bool atSwap)
@@ -1374,12 +1382,14 @@ precheckOldSnapshots(Oid relid, bool atSwap)
 
     ereport(ERROR,
             (errcode(ERRCODE_OBJECT_IN_USE),
-             errmsg("REPACK (CONCURRENTLY) refused: another session holds a snapshot that has not read table \"%s\"",
-                    OidIsValid(relid) ? get_rel_name(relid) : "?"),
+             OidIsValid(relid)
+                 ? errmsg("cannot execute REPACK (CONCURRENTLY) on table \"%s\" while another session holds an older snapshot",
+                          get_rel_name(relid))
+                 : errmsg("cannot execute REPACK (CONCURRENTLY) while another session holds an older snapshot"),
              atSwap
-                 ? errdetail("A session in this database would get a serialization failure if it read the table after the REPACK. Checked at the swap.")
-                 : errdetail("A session in this database would get a serialization failure if it read the table after the REPACK. Checked before the REPACK started."),
-             errhint("Wait for that session's transaction to end (pg_stat_activity shows the sessions with a backend_xmin and their xact_start), or set pg_repack_safe.precheck_snapshot_age to -1 to skip this check.")));
+                 ? errdetail("A session in this database holds a snapshot and no lock on the table, and would get a serialization failure if it read the table after the REPACK. Checked at the swap.")
+                 : errdetail("A session in this database holds a snapshot and no lock on the table, and would get a serialization failure if it read the table after the REPACK. Checked before the REPACK started."),
+             errhint("Wait for that session's transaction to end, or set \"pg_repack_safe.precheck_snapshot_age\" to -1 to skip this check. pg_stat_activity shows which sessions hold a snapshot (backend_xmin) and when their transactions started (xact_start).")));
   }
   list_free(lockingPids);
 }
@@ -1503,9 +1513,8 @@ insertRecord(Oid relid)
 
   if (!CheckRelationOidLockedByMe(rewriterRecordTable, RowExclusiveLock,
                                   false))
-    ereport(ERROR,
-            (errcode(ERRCODE_INTERNAL_ERROR),
-             errmsg("pg_repack_safe cannot record an unsafe rewrite outside the transaction that locked its record table")));
+    elog(ERROR,
+         "pg_repack_safe cannot record an unsafe rewrite outside the transaction that locked its record table");
 
   rel = table_open(rewriterRecordTable, NoLock);
   values[0] = ObjectIdGetDatum(relid);
@@ -1792,11 +1801,9 @@ noteRelationAltered(Oid relid)
   /* The caller holds the lock under which it replaced the storage. */
   rel = relation_open(relid, NoLock);
   if (rel->rd_locator.relNumber != oldNode)
-    ereport(ERROR,
-            (errcode(ERRCODE_INTERNAL_ERROR),
-             errmsg("pg_repack_safe cannot determine the previous storage of \"%s\"",
-                    NameStr(relname)),
-             errdetail("The relation cache no longer describes the storage being replaced.")));
+    elog(ERROR,
+         "pg_repack_safe cannot determine the previous storage of \"%s\": the relation cache no longer describes the storage being replaced",
+         NameStr(relname));
   oldCreatedHere = storageCreatedInTransaction(rel->rd_locator);
   if (!oldCreatedHere)
     oldBlocks = RelationGetNumberOfBlocks(rel);
@@ -1808,10 +1815,10 @@ noteRelationAltered(Oid relid)
   if (traceStorageChanges)
     ereport(NOTICE,
             (inUnsafeRewriter()
-                 ? errmsg("pg_repack_safe: storage of \"%s\" replaced, old storage has %u blocks, unsafe rewriter: yes",
-                          NameStr(relname), oldBlocks)
-                 : errmsg("pg_repack_safe: storage of \"%s\" replaced, old storage has %u blocks, unsafe rewriter: no",
-                          NameStr(relname), oldBlocks)));
+                 ? errmsg_internal("pg_repack_safe: storage of \"%s\" replaced, old storage has %u blocks, unsafe rewriter: yes",
+                                   NameStr(relname), oldBlocks)
+                 : errmsg_internal("pg_repack_safe: storage of \"%s\" replaced, old storage has %u blocks, unsafe rewriter: no",
+                                   NameStr(relname), oldBlocks)));
 
   if (inUnsafeRewriter() && oldBlocks > 0)
   {
@@ -1854,7 +1861,7 @@ noteRelationAltered(Oid relid)
  * snapshot needs, on this server or on a standby, so any block counts as
  * holding records. VACUUM returns the table to zero blocks once every
  * record is deleted and no snapshot needs one (deleteOlderRecords). A
- * superuser can override with pg_repack_safe.allow_unprotected_drop.
+ * superuser can override with pg_repack_safe.allow_unprotected_removal.
  * TRUNCATE is refused by the same rule in pg_repack_safe_records_protected.
  */
 static void
@@ -1864,7 +1871,7 @@ refuseUnprotectedDrop(const char *objectDescription)
   Relation rel;
   BlockNumber blocks;
 
-  if (allowUnprotectedDrop)
+  if (allowUnprotectedRemoval)
     return;
   tableOid = findRecordTableNoError();
   if (!OidIsValid(tableOid))
@@ -1882,7 +1889,7 @@ refuseUnprotectedDrop(const char *objectDescription)
            errmsg("cannot drop the pg_repack_safe extension, its record table or its triggers while the record table holds records"),
            errdetail("The statement would drop %s. A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.",
                      objectDescription),
-           errhint("Delete the records with pg_repack_safe_prune_records() and run VACUUM on the record table until it is empty (see the README, \"Removing the extension\"). A superuser can set pg_repack_safe.allow_unprotected_drop instead.")));
+           errhint("Delete the records with repack_safe.prune_records() and run VACUUM on the record table until it is empty. A superuser can set \"pg_repack_safe.allow_unprotected_removal\" instead.")));
 }
 
 /**
@@ -2028,7 +2035,7 @@ protectRecordTableFromRewrite(Oid relid)
 
   if (!inMvccSafeRewriter)
     ereport(ERROR,
-            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
              errmsg("cannot rewrite the pg_repack_safe record table with this command"),
              errdetail("Only VACUUM FULL, CLUSTER and REPACK without CONCURRENTLY keep every record unchanged."),
              errhint("Use VACUUM FULL or REPACK.")));
@@ -2039,10 +2046,8 @@ protectRecordTableFromRewrite(Oid relid)
    */
   rel = relation_open(relid, NoLock);
   if (rel->rd_locator.relNumber != oldNode)
-    ereport(ERROR,
-            (errcode(ERRCODE_INTERNAL_ERROR),
-             errmsg("pg_repack_safe cannot determine the previous storage of its record table"),
-             errdetail("The relation cache no longer describes the storage being replaced.")));
+    elog(ERROR,
+         "pg_repack_safe cannot determine the previous storage of its record table: the relation cache no longer describes the storage being replaced");
   deleted = holdsDeletedRecord(rel);
   relation_close(rel, NoLock);
 
@@ -2091,35 +2096,6 @@ selfVisibleRelationByName(const char *name, Oid schemaOid)
 }
 
 /**
- * @brief Find an extension's schema as the current command left it
- * @param extensionOid Extension OID
- * @return extnamespace from the pg_extension row visible to SnapshotSelf, or
- *         InvalidOid when no such row exists
- */
-static Oid
-selfVisibleExtensionSchema(Oid extensionOid)
-{
-  Relation extensionRel;
-  ScanKeyData key;
-  SysScanDesc scan;
-  HeapTuple tuple;
-  Oid result = InvalidOid;
-
-  extensionRel = table_open(ExtensionRelationId, AccessShareLock);
-  ScanKeyInit(&key, Anum_pg_extension_oid, BTEqualStrategyNumber, F_OIDEQ,
-              ObjectIdGetDatum(extensionOid));
-  scan = systable_beginscan(extensionRel, ExtensionOidIndexId, true,
-                            SnapshotSelf, 1, &key);
-  tuple = systable_getnext(scan);
-  if (HeapTupleIsValid(tuple))
-    result = ((Form_pg_extension)GETSTRUCT(tuple))->extnamespace;
-  systable_endscan(scan);
-  table_close(extensionRel, AccessShareLock);
-
-  return result;
-}
-
-/**
  * @brief Refuse a statement that leaves the extension unable to find its
  *        record table while the table holds records
  * @param tableOid The record table
@@ -2129,7 +2105,7 @@ selfVisibleExtensionSchema(Oid extensionOid)
  * other name, or in any other schema, DROP EXTENSION and DROP TABLE drop it
  * and its records as an ordinary table. Any block counts as holding
  * records, and a superuser can override with
- * pg_repack_safe.allow_unprotected_drop, both as for DROP
+ * pg_repack_safe.allow_unprotected_removal, both as for DROP
  * (refuseUnprotectedDrop).
  */
 static void
@@ -2138,7 +2114,7 @@ refuseUnfindableRecordTable(Oid tableOid)
   Relation rel;
   BlockNumber blocks;
 
-  if (allowUnprotectedDrop)
+  if (allowUnprotectedRemoval)
     return;
   rel = try_table_open(tableOid, AccessShareLock);
   if (rel == NULL)
@@ -2151,9 +2127,9 @@ refuseUnfindableRecordTable(Oid tableOid)
   ereport(ERROR,
           (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
            errmsg("cannot rename or move the pg_repack_safe record table while it holds records"),
-           errdetail("The extension finds its record table by the name \"%s\" in its own schema. Under another name or in another schema the table could be dropped with its records, and a snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty.",
+           errdetail("The extension finds its record table by the name \"%s\" in its own schema, and protects no table of another name or in another schema.",
                      RECORD_TABLE_NAME),
-           errhint("Delete the records with pg_repack_safe_prune_records() and run VACUUM on the record table until it is empty (see the README, \"Removing the extension\"). A superuser can set pg_repack_safe.allow_unprotected_drop instead.")));
+           errhint("Delete the records with repack_safe.prune_records() and run VACUUM on the record table until it is empty. A superuser can set \"pg_repack_safe.allow_unprotected_removal\" instead.")));
 }
 
 /**
@@ -2161,8 +2137,8 @@ refuseUnfindableRecordTable(Oid tableOid)
  *        schema
  * @param relid The record table
  *
- * Invariant: while the record table holds records, it keeps its name, and
- * it leaves the extension's schema only together with the extension.
+ * Invariant: while the record table holds records, it keeps its name and
+ * stays in the extension's schema.
  *
  * The statements that change a table's name or schema, and the function in
  * tablecmds.c that reports each, before the command counter advances, so
@@ -2171,16 +2147,17 @@ refuseUnfindableRecordTable(Oid tableOid)
  * - ALTER TABLE ... RENAME TO, also spelled ALTER INDEX, ALTER VIEW,
  *   ALTER SEQUENCE, ALTER MATERIALIZED VIEW or ALTER FOREIGN TABLE:
  *   RenameRelationInternal;
- * - ALTER TABLE ... SET SCHEMA in the same spellings, and ALTER EXTENSION
- *   ... SET SCHEMA for each member table (extension.c,
- *   AlterExtensionNamespace, through AlterObjectNamespace_oid):
+ * - ALTER TABLE ... SET SCHEMA in the same spellings:
  *   AlterRelationNamespaceInternal.
+ * A row no SnapshotSelf scan finds leaves the new name unknown and is
+ * refused.
  *
- * A new schema is allowed under ALTER EXTENSION pg_repack_safe SET SCHEMA
- * (inExtensionSchemaMove): that statement then moves the extension itself,
- * and protectRecordTableFromExtensionMove checks that no table of this name
- * stayed in the extension's previous schema. A row no SnapshotSelf scan
- * finds leaves the new name unknown and is refused.
+ * The extension itself does not move: its control file fixes its schema
+ * (relocatable = false), and ALTER EXTENSION ... SET SCHEMA raises an error
+ * for such an extension before it moves any member (extension.c,
+ * AlterExtensionNamespace). ALTER SCHEMA ... RENAME changes neither the
+ * table's name nor the schema it is in, and the extension finds its schema
+ * by OID.
  */
 static void
 protectRecordTableName(Oid relid)
@@ -2189,52 +2166,7 @@ protectRecordTableName(Oid relid)
 
   if (selfVisibleRelationByName(RECORD_TABLE_NAME, oldSchema) == relid)
     return;
-  if (inExtensionSchemaMove)
-    return;
   refuseUnfindableRecordTable(relid);
-}
-
-/**
- * @brief OAT_POST_ALTER of the extension: refuse a move to another schema
- *        that leaves the record table behind
- * @param extensionOid The altered extension
- *
- * ALTER EXTENSION ... SET SCHEMA moves the extension's member objects and
- * then the extension, and reports the extension once both are done
- * (extension.c, AlterExtensionNamespace). A record table that ALTER
- * EXTENSION ... DROP TABLE detached is not a member and stays where it was,
- * out of the extension's new schema. The same event is reported for ALTER
- * EXTENSION ... ADD, DROP and UPDATE, which leave the schema as it was.
- *
- * Invariant: the move is refused if a table of the record table's name is
- * still in the extension's previous schema and holds records. A member
- * table has moved by now and is not found there. A table of that name in
- * the new schema does not make up for one left behind: it is another
- * table, and the extension would read it in place of the records.
- *
- * get_extension_schema returns the schema before the move: the catalog
- * cache keeps the previous pg_extension row until the command counter
- * advances, and a reload of the entry reads with a catalog snapshot, which
- * does not see the current command's update.
- */
-static void
-protectRecordTableFromExtensionMove(Oid extensionOid)
-{
-  Oid oldSchema;
-  Oid newSchema;
-  Oid leftBehind;
-
-  if (extensionOid != get_extension_oid(EXTENSION_NAME, true))
-    return;
-
-  oldSchema = get_extension_schema(extensionOid);
-  newSchema = selfVisibleExtensionSchema(extensionOid);
-  if (newSchema == oldSchema)
-    return;
-
-  leftBehind = selfVisibleRelationByName(RECORD_TABLE_NAME, oldSchema);
-  if (OidIsValid(leftBehind))
-    refuseUnfindableRecordTable(leftBehind);
 }
 
 /**
@@ -2263,7 +2195,7 @@ protectRecordTrigger(Oid triggerOid)
 
   ObjectAddressSet(address, TriggerRelationId, triggerOid);
   ereport(ERROR,
-          (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+          (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
            errmsg("cannot change when %s fires",
                   getObjectDescription(&address, false)),
            errdetail("The record table's triggers refuse every change to the records but the extension's own, and must fire ALWAYS.")));
@@ -2336,7 +2268,7 @@ protectRecordTableFromIndex(Oid relid)
     return;
 
   ereport(ERROR,
-          (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+          (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
            errmsg("cannot create an index on the pg_repack_safe record table"),
            errdetail("Records are inserted without maintaining indexes, so an index would miss every later record and a query using it would return stale results.")));
 }
@@ -2354,7 +2286,7 @@ protectRecordTableFromIndex(Oid relid)
  * (checkRecordTableDefinition), a state that dropping the column again does
  * not undo, since a dropped column still counts. So the change is refused
  * where it is made, and no setting overrides the refusal:
- * pg_repack_safe.allow_unprotected_drop is for giving up the records, which
+ * pg_repack_safe.allow_unprotected_removal is for giving up the records, which
  * a column change does not do.
  *
  * Column DDL, and the event tablecmds.c reports for each:
@@ -2403,7 +2335,7 @@ protectRecordTableColumns(ObjectAccessType access, Oid classId, Oid objectId,
     return;
 
   ereport(ERROR,
-          (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+          (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
            errmsg("cannot change the columns of the pg_repack_safe record table"),
            errdetail("The extension reads and writes records as the two columns it created. With any other column list, every query in this database would be refused.")));
 }
@@ -2412,6 +2344,19 @@ protectRecordTableColumns(ObjectAccessType access, Oid classId, Oid objectId,
  * Trigger and SQL functions
  * ----------------------------------------------------------------
  */
+
+/**
+ * @brief Name a relation with its schema, quoted as SQL needs
+ * @param rel The relation
+ * @return The name, palloc'd, for a message that shows a statement to run
+ */
+static char *
+qualifiedRelationName(Relation rel)
+{
+  char *schema = get_namespace_name(RelationGetNamespace(rel));
+
+  return quote_qualified_identifier(schema, RelationGetRelationName(rel));
+}
 
 /**
  * @brief Trigger function: refuse every INSERT into the record table
@@ -2455,24 +2400,26 @@ protectRecordTableColumns(ObjectAccessType access, Oid classId, Oid objectId,
  * subscription, after which the worker passes over the table's changes
  * (worker.c, should_apply_changes_for_rel in apply_handle_insert;
  * t/016_publication.pl, doc/installation.md "Logical
- * Replication"). Raising is the developer's decision: returning NULL here
- * would skip the row and keep the subscription running, but would discard
- * rows without telling anyone.
+ * Replication"). The function raises an error where it could return
+ * NULL: that would skip the row and keep the subscription running, and
+ * discard rows without telling anyone.
  */
 Datum
 pg_repack_safe_records_writer_only(PG_FUNCTION_ARGS)
 {
+  TriggerData *trigdata = (TriggerData *)fcinfo->context;
+
   if (!CALLED_AS_TRIGGER(fcinfo))
     ereport(ERROR,
             (errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
-             errmsg("pg_repack_safe_records_writer_only() must be called as a trigger")));
+             errmsg("repack_safe.records_writer_only() must be called as a trigger")));
 
   ereport(ERROR,
-          (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+          (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
            errmsg("cannot insert into the pg_repack_safe record table"),
            errdetail("Only REPACK (CONCURRENTLY) writes records. A record names a table by OID and a transaction by ID, which mean something only in the database cluster that wrote it."),
-           errhint("If logical replication delivered this row: on the publisher, exclude the record table from the publication (ALTER PUBLICATION ... SET ALL TABLES EXCEPT (TABLE %s)); then, on the subscriber, run ALTER SUBSCRIPTION ... REFRESH PUBLICATION. See \"Logical Replication\" in doc/installation.md.",
-                   RECORD_TABLE_NAME)));
+           errhint("If logical replication delivered this row: on the publisher, exclude the record table from the publication (ALTER PUBLICATION ... SET ALL TABLES EXCEPT (TABLE %s)); then, on the subscriber, run ALTER SUBSCRIPTION ... REFRESH PUBLICATION.",
+                   qualifiedRelationName(trigdata->tg_relation))));
 
   PG_RETURN_NULL();
 }
@@ -2488,7 +2435,7 @@ pg_repack_safe_records_writer_only(PG_FUNCTION_ARGS)
  *
  * Invariant for TRUNCATE: while the record table has this trigger, firing
  * ALWAYS, no caller of ExecuteTruncateGuts empties a record table that has
- * any block, unless pg_repack_safe.allow_unprotected_drop is set. Any block
+ * any block, unless pg_repack_safe.allow_unprotected_removal is set. Any block
  * counts, as for DROP (refuseUnprotectedDrop). ExecuteTruncateGuts fires
  * the BEFORE TRUNCATE triggers of every table it is to truncate, those
  * reached by CASCADE included, before it truncates any, and it has two
@@ -2513,11 +2460,11 @@ pg_repack_safe_records_protected(PG_FUNCTION_ARGS)
   if (!CALLED_AS_TRIGGER(fcinfo))
     ereport(ERROR,
             (errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
-             errmsg("pg_repack_safe_records_protected() must be called as a trigger")));
+             errmsg("repack_safe.records_protected() must be called as a trigger")));
 
   if (TRIGGER_FIRED_BY_TRUNCATE(trigdata->tg_event))
   {
-    if (allowUnprotectedDrop ||
+    if (allowUnprotectedRemoval ||
         RelationGetNumberOfBlocks(trigdata->tg_relation) == 0)
       return PointerGetDatum(NULL);
 
@@ -2526,13 +2473,13 @@ pg_repack_safe_records_protected(PG_FUNCTION_ARGS)
              errmsg("cannot truncate the pg_repack_safe record table while it holds records"),
              errdetail("A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on any standby, would then read the rewritten table as empty."),
              IsLogicalWorker()
-                 ? errhint("On the publisher, exclude the record table from the publication (ALTER PUBLICATION ... SET ALL TABLES EXCEPT (TABLE %s)); then, on the subscriber, run ALTER SUBSCRIPTION ... REFRESH PUBLICATION. See \"Logical Replication\" in doc/installation.md.",
-                           RECORD_TABLE_NAME)
-                 : errhint("Delete the records with pg_repack_safe_prune_records() and run VACUUM on the record table until it is empty (see the README, \"Removing the extension\"). A superuser can set pg_repack_safe.allow_unprotected_drop instead.")));
+                 ? errhint("On the publisher, exclude the record table from the publication (ALTER PUBLICATION ... SET ALL TABLES EXCEPT (TABLE %s)); then, on the subscriber, run ALTER SUBSCRIPTION ... REFRESH PUBLICATION.",
+                           qualifiedRelationName(trigdata->tg_relation))
+                 : errhint("Delete the records with repack_safe.prune_records() and run VACUUM on the record table until it is empty. A superuser can set \"pg_repack_safe.allow_unprotected_removal\" instead.")));
   }
 
   ereport(ERROR,
-          (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+          (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
            errmsg("cannot update or delete pg_repack_safe records"),
            errdetail("A snapshot taken before a recorded REPACK (CONCURRENTLY), on this server or on a standby, relies on the record.")));
 
@@ -2557,8 +2504,9 @@ pg_repack_safe_prune_records(PG_FUNCTION_ARGS)
   uint64 deleted;
 
   if (!OidIsValid(tableOid))
-    ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                    errmsg("pg_repack_safe cannot find its record table")));
+    ereport(ERROR,
+            (errcode(ERRCODE_UNDEFINED_OBJECT),
+             errmsg("extension \"%s\" does not exist", EXTENSION_NAME)));
 
   rel = table_open(tableOid, NoLock);
   deleted = deleteOlderRecords(rel);
@@ -2645,17 +2593,17 @@ warnNotInForce(void)
   if (setting != NULL)
     ereport(WARNING,
             (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-             errmsg("pg_repack_safe is not in force: the server did not load it through shared_preload_libraries"),
-             errdetail("pg_repack_safe is listed in %s, which background workers do not load: a REPACK (CONCURRENTLY) run from a background worker is neither refused nor recorded, so snapshots older than it can read the table as empty.",
+             errmsg("pg_repack_safe is not in force: the server did not load it through \"shared_preload_libraries\""),
+             errdetail("pg_repack_safe is listed in \"%s\", which background workers do not load: a REPACK (CONCURRENTLY) run from a background worker is neither refused nor recorded, so snapshots older than it can read the table as empty.",
                        setting),
-             errhint("Move pg_repack_safe from %s to shared_preload_libraries and restart the server.",
+             errhint("Move \"pg_repack_safe\" from \"%s\" to \"shared_preload_libraries\" and restart the server.",
                      setting)));
   else
     ereport(WARNING,
             (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-             errmsg("pg_repack_safe is not in force: the server did not load it through shared_preload_libraries"),
+             errmsg("pg_repack_safe is not in force: the server did not load it through \"shared_preload_libraries\""),
              errdetail("A session that has not loaded the library runs REPACK (CONCURRENTLY) unrecorded and does not check its reads, so snapshots older than a repack can read the table as empty."),
-             errhint("Add pg_repack_safe to shared_preload_libraries and restart the server.")));
+             errhint("Add \"pg_repack_safe\" to \"shared_preload_libraries\" and restart the server.")));
 }
 
 /**
@@ -2703,9 +2651,7 @@ pg_repack_safe_status(PG_FUNCTION_ARGS)
  * A pg_class alteration is first examined for a storage replacement
  * (noteRelationAltered), then, if it is the record table's, refused unless
  * the rewrite keeps its records (protectRecordTableFromRewrite) and the
- * table can still be found (protectRecordTableName). An alteration of the
- * extension is refused if it moves the extension away from its record table
- * (protectRecordTableFromExtensionMove).
+ * table can still be found (protectRecordTableName).
  *
  * A column is reported with its number as subId, by OAT_POST_CREATE,
  * OAT_DROP or OAT_POST_ALTER; protectRecordTableColumns sees all three and
@@ -2746,8 +2692,6 @@ objectAccessHook(ObjectAccessType access, Oid classId, Oid objectId, int subId,
     }
     else if (classId == TriggerRelationId)
       protectRecordTrigger(objectId);
-    else if (classId == ExtensionRelationId)
-      protectRecordTableFromExtensionMove(objectId);
     else
       protectRecordTableColumns(access, classId, objectId, subId);
     break;
@@ -2789,34 +2733,9 @@ isConcurrentRepack(Node *parsetree)
 }
 
 /**
- * @brief Tell whether a utility statement is ALTER EXTENSION pg_repack_safe
- *        SET SCHEMA
- * @param parsetree Utility statement node
- * @return True for that statement
- *
- * The grammar has one form, AlterObjectSchemaStmt with OBJECT_EXTENSION and
- * the extension's name as a String node (gram.y, AlterObjectSchemaStmt),
- * and ExecAlterObjectSchemaStmt (alter.c) is the only caller of
- * AlterExtensionNamespace.
- */
-static bool
-isExtensionSchemaMove(Node *parsetree)
-{
-  AlterObjectSchemaStmt *stmt;
-
-  if (!IsA(parsetree, AlterObjectSchemaStmt))
-    return false;
-
-  stmt = (AlterObjectSchemaStmt *)parsetree;
-  return stmt->objectType == OBJECT_EXTENSION &&
-         strcmp(strVal(stmt->object), EXTENSION_NAME) == 0;
-}
-
-/**
  * @brief Run the rest of the ProcessUtility chain under a classification
  * @param recordTable rewriterRecordTable for the statement
  * @param mvccSafeRewriter inMvccSafeRewriter for the statement
- * @param extensionSchemaMove inExtensionSchemaMove for the statement
  * @param pstmt Planned statement wrapping the utility statement
  * @param queryString Source text
  * @param readOnlyTree Whether the tree must not be modified
@@ -2826,27 +2745,25 @@ isExtensionSchemaMove(Node *parsetree)
  * @param dest Result receiver
  * @param qc Completion tag output
  *
- * Sets the three classification variables for the statement and restores
+ * Sets the two classification variables for the statement and restores
  * the enclosing statement's values however it ends. A function of its own
  * so that nothing it uses after the setjmp in PG_TRY is modified before
  * it (the caller replaces pstmt and readOnlyTree for COPY TO).
  */
 static void
-runUtilityAs(Oid recordTable, bool mvccSafeRewriter, bool extensionSchemaMove,
-             PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
+runUtilityAs(Oid recordTable, bool mvccSafeRewriter, PlannedStmt *pstmt,
+             const char *queryString, bool readOnlyTree,
              ProcessUtilityContext context, ParamListInfo params,
              QueryEnvironment *queryEnv, DestReceiver *dest,
              QueryCompletion *qc)
 {
   Oid savedRewriterRecordTable = rewriterRecordTable;
   bool savedInMvccSafeRewriter = inMvccSafeRewriter;
-  bool savedInExtensionSchemaMove = inExtensionSchemaMove;
 
   Assert(!(OidIsValid(recordTable) && mvccSafeRewriter));
 
   rewriterRecordTable = recordTable;
   inMvccSafeRewriter = mvccSafeRewriter;
-  inExtensionSchemaMove = extensionSchemaMove;
 
   PG_TRY();
   {
@@ -2861,7 +2778,6 @@ runUtilityAs(Oid recordTable, bool mvccSafeRewriter, bool extensionSchemaMove,
   {
     rewriterRecordTable = savedRewriterRecordTable;
     inMvccSafeRewriter = savedInMvccSafeRewriter;
-    inExtensionSchemaMove = savedInExtensionSchemaMove;
   }
   PG_END_TRY();
 }
@@ -2928,9 +2844,8 @@ processUtilityHook(PlannedStmt *pstmt, const char *queryString,
   mvccSafeRewriter = !unsafeRewriter && (IsA(pstmt->utilityStmt, VacuumStmt) ||
                                          IsA(pstmt->utilityStmt, RepackStmt));
 
-  runUtilityAs(recordTable, mvccSafeRewriter,
-               isExtensionSchemaMove(pstmt->utilityStmt), pstmt, queryString,
-               readOnlyTree, context, params, queryEnv, dest, qc);
+  runUtilityAs(recordTable, mvccSafeRewriter, pstmt, queryString, readOnlyTree,
+               context, params, queryEnv, dest, qc);
 }
 
 /**
@@ -2970,7 +2885,18 @@ _PG_init(void)
    * allowed to run (lockRecordTableForWriter).
    */
   if (loadedAtServerStart)
+  {
     RegisterCustomRmgr(PG_REPACK_SAFE_RMGR_ID, &pgRepackSafeRmgr);
+
+    /*
+     * Once per server start, from the postmaster: the server log then
+     * shows which build each server ran and when. Where backends re-run
+     * this function at their own start (EXEC_BACKEND), they stay silent.
+     */
+    if (!IsUnderPostmaster)
+      ereport(LOG,
+              (errmsg("pg_repack_safe %s loaded", PG_REPACK_SAFE_VERSION)));
+  }
   else
   {
     /*
@@ -2994,15 +2920,15 @@ _PG_init(void)
                            "Reports each detected replacement of a table's storage as a NOTICE.",
                            NULL, &traceStorageChanges, false, PGC_SUSET, 0,
                            NULL, NULL, NULL);
-  DefineCustomBoolVariable("pg_repack_safe.allow_unprotected_drop",
+  DefineCustomBoolVariable("pg_repack_safe.allow_unprotected_removal",
                            "Lets DROP and TRUNCATE remove the record table, its triggers or the extension, and lets the record table be renamed or moved, while records exist.",
                            "Snapshots taken before a recorded REPACK (CONCURRENTLY) may then read the rewritten tables as empty.",
-                           &allowUnprotectedDrop, false, PGC_SUSET, 0, NULL,
+                           &allowUnprotectedRemoval, false, PGC_SUSET, 0, NULL,
                            NULL, NULL);
   DefineCustomIntVariable("pg_repack_safe.precheck_snapshot_age",
                           "Refuses REPACK (CONCURRENTLY) while a session holds a snapshot this old that has not read the table.",
                           "-1 turns the check off; 0 counts a snapshot of any age. Best-effort: the reader check protects such sessions either way.",
-                          &precheckSnapshotAge, -1, -1, INT_MAX, PGC_USERSET,
+                          &precheckSnapshotAge, -1, -1, INT_MAX, PGC_SUSET,
                           GUC_UNIT_MS, NULL, NULL, NULL);
   MarkGUCPrefixReserved("pg_repack_safe");
 

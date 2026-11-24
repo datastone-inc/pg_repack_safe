@@ -8,14 +8,14 @@ count
 (1 row)
 
 step w_repack: REPACK (CONCURRENTLY) t;
-step w_prune: SELECT pg_repack_safe_prune_records() > 0 AS deleted_some;
+step w_prune: SELECT repack_safe.prune_records() > 0 AS deleted_some;
 deleted_some
 ------------
 t           
 (1 row)
 
-step w_vacuum: VACUUM pg_repack_safe_rewrites;
-step w_size: SELECT pg_relation_size('pg_repack_safe_rewrites') > 0 AS has_blocks;
+step w_vacuum: VACUUM repack_safe.rewrites;
+step w_size: SELECT pg_relation_size('repack_safe.rewrites') > 0 AS has_blocks;
 has_blocks
 ----------
 t         
@@ -24,8 +24,8 @@ t
 step r_t: SELECT count(*) FROM t;
 ERROR:  cannot read table "t" with this snapshot
 step r_commit: COMMIT;
-step w_vacuum: VACUUM pg_repack_safe_rewrites;
-step w_size: SELECT pg_relation_size('pg_repack_safe_rewrites') > 0 AS has_blocks;
+step w_vacuum: VACUUM repack_safe.rewrites;
+step w_size: SELECT pg_relation_size('repack_safe.rewrites') > 0 AS has_blocks;
 has_blocks
 ----------
 f         
@@ -46,13 +46,13 @@ count
 (1 row)
 
 step w_repack: REPACK (CONCURRENTLY) t;
-step w_prune: SELECT pg_repack_safe_prune_records() > 0 AS deleted_some;
+step w_prune: SELECT repack_safe.prune_records() > 0 AS deleted_some;
 deleted_some
 ------------
 t           
 (1 row)
 
-step w_vacuum: VACUUM pg_repack_safe_rewrites;
+step w_vacuum: VACUUM repack_safe.rewrites;
 step r_t: SELECT count(*) FROM t;
 ERROR:  cannot read table "t" with this snapshot
 step r_t: SELECT count(*) FROM t;
@@ -68,13 +68,13 @@ count
 (1 row)
 
 step w_repack: REPACK (CONCURRENTLY) t;
-step w_prune: SELECT pg_repack_safe_prune_records() > 0 AS deleted_some;
+step w_prune: SELECT repack_safe.prune_records() > 0 AS deleted_some;
 deleted_some
 ------------
 t           
 (1 row)
 
-step w_vacuum: VACUUM pg_repack_safe_rewrites;
+step w_vacuum: VACUUM repack_safe.rewrites;
 step r_t: SELECT count(*) FROM t;
 ERROR:  cannot read table "t" with this snapshot
 step r_commit: COMMIT;
@@ -87,13 +87,13 @@ count
     0
 (1 row)
 
-step w_prune: SELECT pg_repack_safe_prune_records() > 0 AS deleted_some;
+step w_prune: SELECT repack_safe.prune_records() > 0 AS deleted_some;
 deleted_some
 ------------
 t           
 (1 row)
 
-step w_vacuum: VACUUM pg_repack_safe_rewrites;
+step w_vacuum: VACUUM repack_safe.rewrites;
 step r_t: SELECT count(*) FROM t;
 count
 -----
@@ -111,7 +111,7 @@ count
 (1 row)
 
 step w_repack: REPACK (CONCURRENTLY) t;
-step w_vacuum: VACUUM pg_repack_safe_rewrites;
+step w_vacuum: VACUUM repack_safe.rewrites;
 step r_t: SELECT count(*) FROM t;
 ERROR:  cannot read table "t" with this snapshot
 step r_commit: COMMIT;
@@ -125,7 +125,7 @@ count
 
 step w_repack: REPACK (CONCURRENTLY) t;
 step w_repack: REPACK (CONCURRENTLY) t;
-step w_vacuum: VACUUM pg_repack_safe_rewrites;
+step w_vacuum: VACUUM repack_safe.rewrites;
 step r_t: SELECT count(*) FROM t;
 ERROR:  cannot read table "t" with this snapshot
 step r_commit: COMMIT;
@@ -133,7 +133,7 @@ step r_commit: COMMIT;
 starting permutation: w_repack w_begin w_prune o_repack w_commit o_t
 step w_repack: REPACK (CONCURRENTLY) t;
 step w_begin: BEGIN;
-step w_prune: SELECT pg_repack_safe_prune_records() > 0 AS deleted_some;
+step w_prune: SELECT repack_safe.prune_records() > 0 AS deleted_some;
 deleted_some
 ------------
 t           
@@ -152,20 +152,20 @@ count
 starting permutation: w_repack w_begin w_prune o_prune w_commit o_prune
 step w_repack: REPACK (CONCURRENTLY) t;
 step w_begin: BEGIN;
-step w_prune: SELECT pg_repack_safe_prune_records() > 0 AS deleted_some;
+step w_prune: SELECT repack_safe.prune_records() > 0 AS deleted_some;
 deleted_some
 ------------
 t           
 (1 row)
 
-step o_prune: SELECT pg_repack_safe_prune_records() > 0 AS deleted_some;
+step o_prune: SELECT repack_safe.prune_records() > 0 AS deleted_some;
 deleted_some
 ------------
 f           
 (1 row)
 
 step w_commit: COMMIT;
-step o_prune: SELECT pg_repack_safe_prune_records() > 0 AS deleted_some;
+step o_prune: SELECT repack_safe.prune_records() > 0 AS deleted_some;
 deleted_some
 ------------
 f           

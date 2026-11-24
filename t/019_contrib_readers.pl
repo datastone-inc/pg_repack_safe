@@ -1,7 +1,8 @@
 # Copyright (c) 2026 dataStone Inc.
 # SPDX-License-Identifier: MIT
 #
-# Known gap (README "Contrib functions the guard does not see"): functions
+# Known gap (doc/limits.md, "Contrib functions the guard does not see"):
+# functions
 # of two contrib modules read a table with the transaction's snapshot
 # outside the executor, so the reader check does not see the read, and with
 # a snapshot that predates a REPACK (CONCURRENTLY) of the table they return

@@ -33,7 +33,9 @@ $node->safe_psql('postgres', q{
     CREATE TABLE ddl_log (event text, tag text);
     CREATE FUNCTION log_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$
     BEGIN
-        INSERT INTO ddl_log VALUES (tg_event, tg_tag);
+        -- Named with its schema: an extension's script runs with the
+        -- extension's schema as its search_path.
+        INSERT INTO public.ddl_log VALUES (tg_event, tg_tag);
     END $$;
     CREATE EVENT TRIGGER log_ddl_start ON ddl_command_start
         EXECUTE FUNCTION log_ddl();
@@ -70,5 +72,45 @@ like(
     'the old snapshot is refused after the install');
 
 $reader->quit;
+
+# An event trigger function that names its table without a schema finds no
+# table while the install script runs, since the script's search_path holds
+# only the extension's schema and those of the extensions it requires,
+# plpgsql's pg_catalog (extension.c, execute_extension_script), and
+# CREATE EXTENSION fails with nothing left behind. Setting the function's
+# search_path, or naming the table with its schema as above, lets it run.
+$node->safe_psql('postgres', 'CREATE DATABASE unqualified');
+$node->safe_psql('unqualified', q{
+    CREATE TABLE ddl_log (event text, tag text);
+    CREATE FUNCTION log_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        INSERT INTO ddl_log VALUES (tg_event, tg_tag);
+    END $$;
+    CREATE EVENT TRIGGER log_ddl_start ON ddl_command_start
+        EXECUTE FUNCTION log_ddl();
+    TRUNCATE ddl_log;
+});
+
+($ret, $stdout, $stderr) =
+  $node->psql('unqualified', 'CREATE EXTENSION pg_repack_safe');
+isnt($ret, 0, 'CREATE EXTENSION fails with an unqualified table name');
+like(
+    $stderr,
+    qr/relation "ddl_log" does not exist/,
+    'the event trigger function does not find its table');
+is( $node->safe_psql('unqualified', q{
+        SELECT count(*) FROM pg_extension WHERE extname = 'pg_repack_safe'}),
+    '0', 'the failed CREATE EXTENSION leaves no extension');
+
+$node->safe_psql('unqualified',
+    'ALTER FUNCTION log_ddl() SET search_path = public');
+($ret, $stdout, $stderr) =
+  $node->psql('unqualified', 'CREATE EXTENSION pg_repack_safe');
+is($ret, 0, 'CREATE EXTENSION succeeds once the function sets search_path')
+  or diag($stderr);
+isnt(
+    $node->safe_psql('unqualified', 'SELECT count(*) FROM ddl_log'),
+    '0', 'the event trigger ran for the commands of the install script');
+
 $node->stop;
 done_testing();

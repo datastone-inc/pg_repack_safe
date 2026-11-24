@@ -17,6 +17,8 @@
 /log/
 
 # Test Output
+/test/modules/library_path.conf
+/pg_repack_safe-*.zip
 /sql/regression.out
 /expected/regression.out
 
@@ -43,11 +45,6 @@ Thumbs.db
 *.pem
 *.key
 *.crt
-
-# Package Manager
-node_modules/
-npm-debug.log
-yarn-error.log
 
 # Documentation Build
 doc/*.html

@@ -92,9 +92,19 @@ binaries.
   an old snapshot, running a statement and collecting its errors, waiting
   for a queued lock request) are in `t/RepackSafeTest.pm`.
 
-`make installcheck` first installs four test-only modules from
-`test/modules/` into the PostgreSQL library directory; `make install` does
-not install them.
+`make installcheck` first builds four test-only modules in `test/modules/`.
+They are never installed: the Makefile writes
+`test/modules/library_path.conf`, a `dynamic_library_path` that names their
+directories, and every temporary server gets it (pg_regress and
+pg_isolation_regress as a second `--temp-config`, the TAP clusters through
+`TEMP_CONFIG`). `test_record` can write arbitrary rows into a record table,
+which is why it must not reach a server's library directory. A
+`TEMP_CONFIG` set in the environment is included from that file, so its
+settings reach the regress, isolation and TAP servers alike:
+
+```bash
+TEMP_CONFIG=~/debug.conf make installcheck
+```
 
 - `custom_scan_provider`: plans every scan of a plain table as a
   `CustomScan` while `custom_scan_provider.enabled` is on.
@@ -133,6 +143,63 @@ leaves its instance in place for inspection.
 ```bash
 make PG_CONFIG=/path/to/pg19/bin/pg_config install installcheck
 ```
+
+## Releasing
+
+The library's version is `PG_REPACK_SAFE_VERSION` in
+`src/pg_repack_safe.c`, in semantic-versioning form. `META.json` carries
+the same version for PGXN, and the control file's `default_version` is its
+first two parts. `make check-version`, which CI runs, fails when the three
+disagree.
+
+- A release that changes only C code changes the third part (`1.0.1`). The
+  extension's version stays `1.0`, and nobody runs `ALTER EXTENSION
+  UPDATE`.
+- A release that changes the SQL objects changes the second or first part
+  and the extension's version with it, and ships an upgrade script
+  (`pg_repack_safe--1.0--1.1.sql`) with a test of the upgrade.
+- The custom WAL record's format (`xl_pg_repack_safe_rewrite`) and its
+  resource manager ID do not change within a major version of the library
+  (its first part): during a rolling upgrade the primary and its standbys
+  run different builds.
+- A library supports every extension version of its major version: it
+  reads and writes the record table of `1.0` as well as that of `1.1`. A
+  rolling upgrade installs the new build on the standbys first and runs
+  `ALTER EXTENSION UPDATE` last, so a standby may meet the SQL objects of
+  any earlier extension version of the major, never a later one. A change
+  that cannot keep this changes the first part.
+
+To release: move the `[Unreleased]` entries of `CHANGELOG.md` under the new
+version and date, set the three versions, commit, then
+
+```bash
+make check-version
+git tag -s v1.0.0 -m 'pg_repack_safe 1.0.0'
+make dist                # pg_repack_safe-1.0.0.zip, from the committed tree
+```
+
+and upload the archive to PGXN. Until the first release the install script
+is edited in place.
+
+## Documentation layout
+
+`README.md` is the first screen: the problem, what the extension does, how
+to install and verify it, what it costs, what it guarantees and what it
+does not. Everything longer is in `doc/`:
+
+- `problem.md`: the problem in detail and the demo's output;
+- `installation.md`: requirements, settings, upgrades, logical replication;
+- `design.md`: the argument that the guard is sound, with the function, the
+  PostgreSQL source and the test behind each step, and the costs;
+- `limits.md`: errors where a result might have been correct, known gaps,
+  and what is lost when a requirement is not met;
+- `standbys.md`: recovery conflicts on standbys without
+  `hot_standby_feedback`;
+- `removal.md`: removing the extension without exposing a snapshot;
+- `research/`: the notes and history the design came from.
+
+A change to a hook or to what a check covers updates `design.md` in the
+same commit.
 
 Every SQL example in the documentation has a matching test in
 `sql/doc_examples.sql`, headed by the document and section it comes from.

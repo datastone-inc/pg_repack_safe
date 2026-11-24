@@ -45,7 +45,7 @@ count
 (1 row)
 
 step o_begin: BEGIN;
-step o_record: SELECT test_insert_record('pg_repack_safe_rewrites', 't'::regclass, pg_current_xact_id());
+step o_record: SELECT test_insert_record('repack_safe.rewrites', 't'::regclass, pg_current_xact_id());
 test_insert_record
 ------------------
                   
@@ -70,7 +70,7 @@ count
 (1 row)
 
 step o_replica: SET session_replication_role = replica; BEGIN;
-step o_record: SELECT test_insert_record('pg_repack_safe_rewrites', 't'::regclass, pg_current_xact_id());
+step o_record: SELECT test_insert_record('repack_safe.rewrites', 't'::regclass, pg_current_xact_id());
 test_insert_record
 ------------------
                   
@@ -98,7 +98,7 @@ step p_repack: REPACK (CONCURRENTLY) t;
 step r_t: SELECT count(*) FROM t;
 ERROR:  cannot read table "t" with this snapshot
 step r_back: ROLLBACK TO s;
-step o_truncate: SET pg_repack_safe.allow_unprotected_drop = on; TRUNCATE pg_repack_safe_rewrites; RESET pg_repack_safe.allow_unprotected_drop;
+step o_truncate: SET pg_repack_safe.allow_unprotected_removal = on; TRUNCATE repack_safe.rewrites; RESET pg_repack_safe.allow_unprotected_removal;
 step r_t: SELECT count(*) FROM t;
 count
 -----

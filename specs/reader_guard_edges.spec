@@ -48,8 +48,8 @@
 #   ri_FastPathCheck), so the guard does not see the read. The referenced
 #   row is invisible to the old snapshot, and the INSERT fails with a
 #   foreign-key violation (SQLSTATE 23503) instead of a serialization
-#   failure. No wrong rows, but an error a client would not retry (README
-#   "Limits").
+#   failure. No wrong rows, but an error a client would not retry
+#   (doc/limits.md).
 #
 # Stock PostgreSQL 19, same interleavings without the library: every
 # permutation expected to error above returns 0 rows for a table that holds

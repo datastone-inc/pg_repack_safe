@@ -65,6 +65,6 @@ DROP MATERIALIZED VIEW sc_mv;
 DROP TABLE sc_t, sc_empty, public.pg_temp_1;
 -- The REPACKs above left records, so removing the extension takes the
 -- superuser override (protection.sql tests the refusal).
-SET pg_repack_safe.allow_unprotected_drop = on;
+SET pg_repack_safe.allow_unprotected_removal = on;
 DROP EXTENSION pg_repack_safe;
-RESET pg_repack_safe.allow_unprotected_drop;
+RESET pg_repack_safe.allow_unprotected_removal;

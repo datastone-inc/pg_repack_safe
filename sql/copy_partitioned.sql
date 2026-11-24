@@ -20,8 +20,9 @@
  * - a table with row-level security is left to PostgreSQL, which turns it
  *   into a query itself; that query is SELECT *, generated columns
  *   included.
- * One difference is accepted and documented in the README: a partition that
- * is a foreign table is read, where the relation form raises an error.
+ * One difference is accepted and documented in doc/design.md: a partition
+ * that is a foreign table is read, where the relation form raises an
+ * error.
  */
 
 CREATE TABLE cp (id int, gone int, a text,

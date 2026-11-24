@@ -1,0 +1,54 @@
+{
+   "name": "pg_repack_safe",
+   "abstract": "Stops PostgreSQL 19's REPACK (CONCURRENTLY) from making a table look empty to transactions already running: they get an error instead",
+   "description": "PostgreSQL 19's built-in REPACK (CONCURRENTLY) is not MVCC-safe: a snapshot taken before it commits reads the repacked table as empty, with no error. This extension records each such rewrite and makes a read with an older snapshot fail with a serialization failure instead.",
+   "version": "1.0.0",
+   "maintainer": "dataStone Inc. <dave.sharpe@datastone.ca>",
+   "license": "mit",
+   "provides": {
+      "pg_repack_safe": {
+         "abstract": "Guard for the built-in REPACK (CONCURRENTLY)",
+         "file": "pg_repack_safe--1.0.sql",
+         "docfile": "README.md",
+         "version": "1.0.0"
+      }
+   },
+   "prereqs": {
+      "runtime": {
+         "requires": {
+            "PostgreSQL": "19.0.0"
+         }
+      },
+      "test": {
+         "requires": {
+            "amcheck": 0,
+            "pageinspect": 0,
+            "pg_stat_statements": 0,
+            "pgrowlocks": 0
+         }
+      }
+   },
+   "resources": {
+      "homepage": "https://github.com/datastone-inc/pg_repack_safe",
+      "bugtracker": {
+         "web": "https://github.com/datastone-inc/pg_repack_safe/issues"
+      },
+      "repository": {
+         "url": "https://github.com/datastone-inc/pg_repack_safe.git",
+         "web": "https://github.com/datastone-inc/pg_repack_safe",
+         "type": "git"
+      }
+   },
+   "release_status": "testing",
+   "tags": [
+      "repack",
+      "mvcc",
+      "snapshot",
+      "pg_dump",
+      "standby"
+   ],
+   "meta-spec": {
+      "version": "1.0.0",
+      "url": "https://pgxn.org/meta/spec.txt"
+   }
+}

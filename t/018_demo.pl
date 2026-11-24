@@ -1,7 +1,7 @@
 # Copyright (c) 2026 dataStone Inc.
 # SPDX-License-Identifier: MIT
 #
-# demo/demo.sh shows what the README says it shows.
+# demo/demo.sh shows what doc/problem.md says it shows.
 #
 # The demo runs four scenarios on a throwaway server, first without the
 # library and then with the extension. This test runs it and checks both

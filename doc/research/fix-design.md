@@ -717,7 +717,7 @@ order unless noted.
   next writer.** At its swap, after writing its own records, each
   REPACK (CONCURRENTLY) deletes every committed record whose transaction
   precedes its own (`deleteOlderRecords`), with `heap_delete` called
-  directly, not waiting and not decoded; `pg_repack_safe_prune_records()`
+  directly, not waiting and not decoded; `repack_safe.prune_records()`
   does the same on request. The deleter is never the inserter, so the
   removal carries a conflict horizon. Nothing decides whether a record is
   still needed: VACUUM does, on the primary by its horizon and on a standby
@@ -849,7 +849,7 @@ order unless noted.
   - While the record table has any block: OAT_DROP of the record table,
     of either of its triggers or of the extension, by any route, and
     OAT_TRUNCATE of the table, are refused unless a superuser sets
-    `pg_repack_safe.allow_unprotected_drop`; the message names the set
+    `pg_repack_safe.allow_unprotected_removal`; the message names the set
     (extension, record table, triggers) and the DETAIL the object reached,
     since DROP EXTENSION reaches a trigger first, and the HINT points to
     the README's removal procedure, whose standby check `t/007` exercises.
@@ -1110,7 +1110,7 @@ is the main real user of this path.
   from a run.
 - No test reaches the branch of `deleteOlderRecords` where `heap_delete`
   does not return TM_Ok. That happens when another cleaner (a second
-  REPACK (CONCURRENTLY) or `pg_repack_safe_prune_records()`) deletes the
+  REPACK (CONCURRENTLY) or `repack_safe.prune_records()`) deletes the
   same record after this one's scan snapshot was taken. Hitting that window
   needs an injection point, and the local build has none. The branch is
   safe without a test. With `wait = false`, `heap_delete` writes nothing
@@ -1183,7 +1183,7 @@ question N".
    follows the record's; deleting in the rewriter's own transaction gives
    wrong results on standbys (step 6). Each REPACK (CONCURRENTLY) deletes
    the older committed records at its swap, and
-   `pg_repack_safe_prune_records()` does the same on request; VACUUM decides
+   `repack_safe.prune_records()` does the same on request; VACUUM decides
    when they go, by its horizon on the primary and by the recovery conflict
    on a standby (step 6 rulings, 2026-11-22). `t/002`, `t/017`,
    `specs/record_prune.spec`.
@@ -1214,7 +1214,7 @@ question N".
     (`sql/writer.sql`).
 15. REPACK, TRUNCATE or DROP EXTENSION on the record table while records are
     live: refused (step 9; DROP and TRUNCATE unless
-    `pg_repack_safe.allow_unprotected_drop` is set by a superuser).
+    `pg_repack_safe.allow_unprotected_removal` is set by a superuser).
 16. REFRESH MATERIALIZED VIEW as a fourth wrong-results path: see 4.
 17. A misconfigured standby, one without the library, whose replay starts
     at a checkpoint between the WAL record (I) and the REPACK commit never
@@ -1270,7 +1270,7 @@ question N".
       PREPARE leaves no per-transaction state behind.
     - A prepared transaction reads nothing more and holds no snapshot
       (`twophase.c (MarkAsPreparingGuts)`).
-    - `pg_repack_safe_prune_records()` in a transaction that is then
+    - `repack_safe.prune_records()` in a transaction that is then
       prepared is a deleter D whose XID follows the records' it deletes,
       which is all `deleteOlderRecords` relies on, whenever D commits. The
       prepared transaction keeps its XID in the proc array until COMMIT
