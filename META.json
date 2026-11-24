@@ -1,6 +1,6 @@
 {
    "name": "pg_repack_safe",
-   "abstract": "Makes PostgreSQL 19's REPACK (CONCURRENTLY) safe: old snapshots get an error instead of wrong rows",
+   "abstract": "Stops PostgreSQL 19's REPACK (CONCURRENTLY) from making a table look empty to transactions already running: they get an error instead",
    "description": "PostgreSQL 19's built-in REPACK (CONCURRENTLY) is not MVCC-safe: a snapshot taken before it commits reads the repacked table as empty, with no error. This extension records each such rewrite and makes a read with an older snapshot fail with a serialization failure instead.",
    "version": "1.0.0",
    "maintainer": "dataStone Inc. <dave.sharpe@datastone.ca>",
